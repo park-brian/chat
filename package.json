@@ -1,0 +1,24 @@
+{
+  "name": "chat",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/park-brian/chat#readme",
+  "bugs": {
+    "url": "https://github.com/park-brian/chat/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/park-brian/chat.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "test.js",
+  "scripts": {
+    "test": "node --env-file .env test.js",
+    "test:agentcore": "npm test agentcore/index.html"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}
