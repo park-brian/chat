@@ -9,7 +9,7 @@
   "scripts": {
     "build:controller": "node scripts/build-controller.js",
     "csp:sync": "node scripts/sync-csp.js",
-    "test": "node scripts/sync-csp.js --check && node ../test.js index.html",
+    "test": "node scripts/sync-csp.js --check && node scripts/test-controller.js && node ../test.js index.html",
     "test:visual": "node scripts/sync-csp.js --check && node ../test.js index.html --screenshot --viewports desktop,mobile --story shell",
     "test:live": "node scripts/sync-csp.js --check && node ../test.js index.html --story login --live-stack"
   },
