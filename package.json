@@ -15,6 +15,7 @@
   "type": "module",
   "main": "test.js",
   "scripts": {
+    "start": "node server.js",
     "test": "node --env-file .env test.js",
     "test:agentcore": "npm test agentcore/index.html"
   },
