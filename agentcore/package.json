@@ -7,6 +7,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
+    "build:controller": "node scripts/build-controller.js",
     "csp:sync": "node scripts/sync-csp.js",
     "test": "node scripts/sync-csp.js --check && node ../test.js index.html",
     "test:visual": "node scripts/sync-csp.js --check && node ../test.js index.html --screenshot --viewports desktop,mobile --story shell",
@@ -30,6 +31,8 @@
     "@aws-sdk/credential-providers": "^3.1137.0",
     "@aws-sdk/lib-dynamodb": "^3.1137.0",
     "@aws/agentcore": "^0.30.0",
+    "esbuild": "^0.28.2",
+    "fflate": "^0.8.3",
     "solid-js": "^1.9.15"
   }
 }

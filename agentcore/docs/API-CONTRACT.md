@@ -1,5 +1,7 @@
 # AgentCore Chat application API contract
 
+**Backend amendment (2026-09-22):** [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) supersedes the Lambda/API Gateway transport described below. The command names and authorization/accounting invariants remain the target; the new transport is `POST /invocations` on a JWT-protected AgentCore CodeZip Runtime. Secret-body and streaming behavior must be reverified there before migration.
+
 Status: target contract; [STATUS.md](./STATUS.md) lists implemented commands and routes
 Audience: frontend, CloudFormation, broker, harness, and test authors
 Normative language: **must**, **must not**, **should**, and **may** are intentional.
@@ -18,12 +20,12 @@ It does **not** call DynamoDB, Cognito administration, CloudFormation, AgentCore
 
 The application API is one Regional API Gateway REST API backed initially by one Lambda. `/chat` uses a streaming Lambda proxy integration; the other routes return ordinary JSON. Authenticated methods use a Cognito User Pool authorizer with an application access scope so they validate Cognito access tokens. A second Lambda is not required. Routes are separated by data classification, not by implementation:
 
-| Route | Purpose | Body classification |
-|---|---|---|
-| `POST /rpc` | Small authenticated control commands and queries | no raw secrets |
+| Route                      | Purpose                                            | Body classification                                           |
+| -------------------------- | -------------------------------------------------- | ------------------------------------------------------------- |
+| `POST /rpc`                | Small authenticated control commands and queries   | no raw secrets                                                |
 | `POST /credential-secrets` | Create or rotate API keys and OAuth client secrets | secret; never logged, traced, echoed, or persisted by the app |
-| `POST /chat` | Invoke/resume a configured agent and stream events | user content |
-| `GET /health` | Deployment smoke test | public, no account details |
+| `POST /chat`               | Invoke/resume a configured agent and stream events | user content                                                  |
+| `GET /health`              | Deployment smoke test                              | public, no account details                                    |
 
 The separate credential route is important even though it reaches the same function. API Gateway data tracing is disabled for the whole API, request bodies are absent from access logs, and application logging applies an additional hard deny to this route. The handler passes a secret directly to AgentCore Identity and drops the value before returning.
 
@@ -98,11 +100,11 @@ Amounts are integer `microUsd`; token and request counts are integers. Timestamp
 
 Global roles are Cognito groups and exactly one is assigned:
 
-| Role | Account users/models/integrations | Projects and agents | Usage |
-|---|---|---|---|
-| `admin` | manage | all | all |
-| `member` | read active models; no account integration mutation | create project, create agent where owner/editor | own plus authorized projects |
-| `auditor` | read metadata, never secrets | read | all, if granted by policy |
+| Role      | Account users/models/integrations                   | Projects and agents                             | Usage                        |
+| --------- | --------------------------------------------------- | ----------------------------------------------- | ---------------------------- |
+| `admin`   | manage                                              | all                                             | all                          |
+| `member`  | read active models; no account integration mutation | create project, create agent where owner/editor | own plus authorized projects |
+| `auditor` | read metadata, never secrets                        | read                                            | all, if granted by policy    |
 
 Project roles are table records: `owner`, `editor`, `viewer`. Global admin bypasses project membership checks but still has a budget and is blocked by account policy when disabled.
 
@@ -145,19 +147,19 @@ The broker reads the Cognito identity and user control row. On first successful 
 
 ### 4.2 Administration
 
-| Command | Required role | Input | Result / AWS work |
-|---|---|---|---|
-| `users.list` | admin, auditor | `query?`, `status?`, `role?`, `cursor?`, `limit?` | merged Cognito + control projection |
-| `users.get` | admin, auditor, self | `userSub` | profile, policy, memberships, current budget/storage |
-| `users.invite` | admin | `email`, `displayName?`, `role`, optional initial limits | `AdminCreateUser`; snapshot account defaults into control row; group assignment last |
-| `users.resendInvite` | admin | `userSub` | Cognito resend path; idempotent |
-| `users.setRole` | admin | `userSub`, `role` | replace all app groups, update projection, global sign-out |
-| `users.block` | admin | `userSub`, `reason` | table status first, then `AdminDisableUser` and global sign-out |
-| `users.enable` | admin | `userSub` | `AdminEnableUser` first, table status active last |
-| `users.passwordReset` | admin | `userSub` | `AdminResetUserPassword` |
-| `users.signOut` | admin, self | `userSub` (self may name only self) | `AdminUserGlobalSignOut` or token revocation equivalent |
-| `users.deletePlan` | admin | `userSub` | blockers: owned projects, agents, active grants, retained ledger |
-| `users.delete` | admin | `userSub`, `resolution`, `confirmation` | ordered saga; accounting records retained/pseudonymized |
+| Command               | Required role        | Input                                                    | Result / AWS work                                                                    |
+| --------------------- | -------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `users.list`          | admin, auditor       | `query?`, `status?`, `role?`, `cursor?`, `limit?`        | merged Cognito + control projection                                                  |
+| `users.get`           | admin, auditor, self | `userSub`                                                | profile, policy, memberships, current budget/storage                                 |
+| `users.invite`        | admin                | `email`, `displayName?`, `role`, optional initial limits | `AdminCreateUser`; snapshot account defaults into control row; group assignment last |
+| `users.resendInvite`  | admin                | `userSub`                                                | Cognito resend path; idempotent                                                      |
+| `users.setRole`       | admin                | `userSub`, `role`                                        | replace all app groups, update projection, global sign-out                           |
+| `users.block`         | admin                | `userSub`, `reason`                                      | table status first, then `AdminDisableUser` and global sign-out                      |
+| `users.enable`        | admin                | `userSub`                                                | `AdminEnableUser` first, table status active last                                    |
+| `users.passwordReset` | admin                | `userSub`                                                | `AdminResetUserPassword`                                                             |
+| `users.signOut`       | admin, self          | `userSub` (self may name only self)                      | `AdminUserGlobalSignOut` or token revocation equivalent                              |
+| `users.deletePlan`    | admin                | `userSub`                                                | blockers: owned projects, agents, active grants, retained ledger                     |
+| `users.delete`        | admin                | `userSub`, `resolution`, `confirmation`                  | ordered saga; accounting records retained/pseudonymized                              |
 
 `users.invite` returns the Cognito `sub`; email is never used as an immutable identifier. User deletion never deletes usage facts. It replaces display PII with a tombstone subject after the configured retention policy.
 
@@ -173,33 +175,33 @@ There are no monetary reservations or pending-byte reservations. Admission stron
 
 ### 5.1 Read commands
 
-| Command | Input | Output |
-|---|---|---|
-| `usage.summary` | `scope=self|user|all`, `period?` | budget/storage cards, totals, quality, reset, per-user rows for all |
-| `usage.timeseries` | scope, dates, `grain=day|hour` | cost/token/tool buckets |
-| `usage.breakdown` | scope, dates, `groupBy=user|project|agent|model|meter` | ranked aggregates |
-| `usage.requests` | scope, period/date/status/quality filters, cursor | redacted request rows |
-| `usage.request` | `requestId` | request aggregate plus ordered model/tool events |
-| `usage.export` | filters, `format=jsonl|csv` | short-lived scoped S3 URL |
-| `resources.summary` | scope | cost, storage, counts, quality |
-| `storage.list` | scope and filters | managed object metadata |
-| `defaults.get` | none | admin-only account defaults |
-| `prices.list` | filters/effective instant | effective rates and sources |
+| Command             | Input                                             | Output                                           |
+| ------------------- | ------------------------------------------------- | ------------------------------------------------ |
+| `usage.summary`     | `scope=self                                       | user                                             | all`, `period?`           | budget/storage cards, totals, quality, reset, per-user rows for all |
+| `usage.timeseries`  | scope, dates, `grain=day                          | hour`                                            | cost/token/tool buckets   |
+| `usage.breakdown`   | scope, dates, `groupBy=user                       | project                                          | agent                     | model                                                               | meter` | ranked aggregates |
+| `usage.requests`    | scope, period/date/status/quality filters, cursor | redacted request rows                            |
+| `usage.request`     | `requestId`                                       | request aggregate plus ordered model/tool events |
+| `usage.export`      | filters, `format=jsonl                            | csv`                                             | short-lived scoped S3 URL |
+| `resources.summary` | scope                                             | cost, storage, counts, quality                   |
+| `storage.list`      | scope and filters                                 | managed object metadata                          |
+| `defaults.get`      | none                                              | admin-only account defaults                      |
+| `prices.list`       | filters/effective instant                         | effective rates and sources                      |
 
 Normal users are forced to self scope. Administrators use the same response/component shapes for self, a selected user, or all users.
 
 ### 5.2 Mutation commands
 
-| Command | Authorization | Purpose |
-|---|---|---|
-| `defaults.update` | admin | update new-user defaults |
-| `defaults.apply` | admin | apply to users-still-on-defaults or selected users |
-| `users.setLimits` | admin | update budget schedule/limit and storage limit with revision |
-| `users.startNewBudgetPeriod` | admin | increment epoch with reason |
-| `usage.reconcile` | admin | best-effort append-only repair; never an admission dependency |
-| `storage.beginUpload` | owner | bounded presigned POST; no pending quota |
-| `storage.delete` | owner/admin | reference-check and delete a managed object |
-| `prices.upsert` | admin | effective-dated rate |
+| Command                      | Authorization | Purpose                                                       |
+| ---------------------------- | ------------- | ------------------------------------------------------------- |
+| `defaults.update`            | admin         | update new-user defaults                                      |
+| `defaults.apply`             | admin         | apply to users-still-on-defaults or selected users            |
+| `users.setLimits`            | admin         | update budget schedule/limit and storage limit with revision  |
+| `users.startNewBudgetPeriod` | admin         | increment epoch with reason                                   |
+| `usage.reconcile`            | admin         | best-effort append-only repair; never an admission dependency |
+| `storage.beginUpload`        | owner         | bounded presigned POST; no pending quota                      |
+| `storage.delete`             | owner/admin   | reference-check and delete a managed object                   |
+| `prices.upsert`              | admin         | effective-dated rate                                          |
 
 ### 5.3 Usage events
 
@@ -224,34 +226,34 @@ The product vocabulary is intentionally smaller than the AWS vocabulary:
 
 ### 7.1 Credential scopes
 
-| Scope | Appropriate auth | Target shape |
-|---|---|---|
-| user | OAuth authorization code | one shared target; token vault binds token to workload identity + user |
-| project | API key or OAuth client credentials | one target/provider for the project |
-| account | API key or OAuth client credentials | one shared target/provider |
+| Scope   | Appropriate auth                    | Target shape                                                           |
+| ------- | ----------------------------------- | ---------------------------------------------------------------------- |
+| user    | OAuth authorization code            | one shared target; token vault binds token to workload identity + user |
+| project | API key or OAuth client credentials | one target/provider for the project                                    |
+| account | API key or OAuth client credentials | one shared target/provider                                             |
 
 Static per-user API keys are not the default. An AgentCore Gateway target binds a credential provider, so a personal static key generally requires a dedicated provider **and target**. The API may support `scope=user` by creating both and protecting the target with policy, but the UI warns about the extra resource and recommends OAuth when available.
 
 ### 7.2 Metadata commands
 
-| Command | Authorization | Purpose / AWS mapping |
-|---|---|---|
-| `credentials.list` | owner by scope, admin; auditor sees redacted metadata | list app records and verify AgentCore provider existence |
-| `credentials.get` | same | metadata, ARN/name, auth type, health; never a secret |
-| `credentials.deletePlan` | owner/admin | references and affected targets/grants |
-| `credentials.delete` | owner/admin | detach/replace target first, then `DeleteApiKeyCredentialProvider` or `DeleteOauth2CredentialProvider` |
-| `integrations.list` | scope reader | integration/target health and granted agents |
-| `integrations.get` | scope reader | normalized configuration and sync state |
-| `integrations.validate` | creator | parse/fetch schema, validate host/auth/tool names; no mutation |
-| `integrations.create` | project owner/editor or admin | provider dependency, `CreateGatewayTarget`, app binding record |
-| `integrations.update` | owner/admin | `UpdateGatewayTarget` with optimistic revision |
-| `integrations.synchronize` | owner/admin | `SynchronizeGatewayTargets`; poll normalized status |
-| `integrations.test` | authorized user | invoke a read-only selected tool with a timeout; returns redacted diagnostics |
-| `integrations.deletePlan` | owner/admin | grants, agents, credentials, schema objects affected |
-| `integrations.delete` | owner/admin | remove grants/policy, delete target, retain audit tombstone |
-| `grants.list` | project reader | integrations usable by a project or agent |
-| `grants.set` | project owner/editor or admin | update binding plus Gateway policy/rule as one saga |
-| `grants.delete` | project owner/editor or admin | deny first, then remove binding |
+| Command                    | Authorization                                         | Purpose / AWS mapping                                                                                  |
+| -------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `credentials.list`         | owner by scope, admin; auditor sees redacted metadata | list app records and verify AgentCore provider existence                                               |
+| `credentials.get`          | same                                                  | metadata, ARN/name, auth type, health; never a secret                                                  |
+| `credentials.deletePlan`   | owner/admin                                           | references and affected targets/grants                                                                 |
+| `credentials.delete`       | owner/admin                                           | detach/replace target first, then `DeleteApiKeyCredentialProvider` or `DeleteOauth2CredentialProvider` |
+| `integrations.list`        | scope reader                                          | integration/target health and granted agents                                                           |
+| `integrations.get`         | scope reader                                          | normalized configuration and sync state                                                                |
+| `integrations.validate`    | creator                                               | parse/fetch schema, validate host/auth/tool names; no mutation                                         |
+| `integrations.create`      | project owner/editor or admin                         | provider dependency, `CreateGatewayTarget`, app binding record                                         |
+| `integrations.update`      | owner/admin                                           | `UpdateGatewayTarget` with optimistic revision                                                         |
+| `integrations.synchronize` | owner/admin                                           | `SynchronizeGatewayTargets`; poll normalized status                                                    |
+| `integrations.test`        | authorized user                                       | invoke a read-only selected tool with a timeout; returns redacted diagnostics                          |
+| `integrations.deletePlan`  | owner/admin                                           | grants, agents, credentials, schema objects affected                                                   |
+| `integrations.delete`      | owner/admin                                           | remove grants/policy, delete target, retain audit tombstone                                            |
+| `grants.list`              | project reader                                        | integrations usable by a project or agent                                                              |
+| `grants.set`               | project owner/editor or admin                         | update binding plus Gateway policy/rule as one saga                                                    |
+| `grants.delete`            | project owner/editor or admin                         | deny first, then remove binding                                                                        |
 
 `integrations.create` accepts a normalized target, not the full AWS union:
 
@@ -290,12 +292,12 @@ These use `POST /credential-secrets`, not `/rpc`:
 
 Supported operations:
 
-| Operation | Secret fields | AgentCore call |
-|---|---|---|
-| `apiKey.create` | `value` | `CreateApiKeyCredentialProvider` with mandatory ownership tags |
-| `apiKey.rotate` | `value` | `UpdateApiKeyCredentialProvider` |
-| `oauthClient.create` | `clientId`, `clientSecret?`, vendor/config | `CreateOauth2CredentialProvider` |
-| `oauthClient.rotate` | `clientSecret` and allowed config | `UpdateOauth2CredentialProvider` |
+| Operation            | Secret fields                              | AgentCore call                                                 |
+| -------------------- | ------------------------------------------ | -------------------------------------------------------------- |
+| `apiKey.create`      | `value`                                    | `CreateApiKeyCredentialProvider` with mandatory ownership tags |
+| `apiKey.rotate`      | `value`                                    | `UpdateApiKeyCredentialProvider`                               |
+| `oauthClient.create` | `clientId`, `clientSecret?`, vendor/config | `CreateOauth2CredentialProvider`                               |
+| `oauthClient.rotate` | `clientSecret` and allowed config          | `UpdateOauth2CredentialProvider`                               |
 
 The response contains only the application `credentialId`, provider ARN/name, callback URL where supplied by AgentCore, revision, and status. It cannot contain the secret, a hash of the secret, or an AWS SDK request echo.
 
@@ -330,12 +332,12 @@ OAuth application client setup is administrative; user consent is not.
 
 Commands:
 
-| Command | Input | Behavior |
-|---|---|---|
-| `connections.begin` | `integrationId`, `forceAuthentication?` | invokes the configured same-path auth probe; returns connected or authorization URL |
-| `connections.complete` | `sessionUri` | session-binds the current Cognito user through `CompleteResourceTokenAuth` |
-| `connections.test` | `integrationId` | harmless authenticated probe; authoritative connection status |
-| `connections.reauthorize` | `integrationId` | same as begin with forced authentication |
+| Command                   | Input                                   | Behavior                                                                            |
+| ------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------- |
+| `connections.begin`       | `integrationId`, `forceAuthentication?` | invokes the configured same-path auth probe; returns connected or authorization URL |
+| `connections.complete`    | `sessionUri`                            | session-binds the current Cognito user through `CompleteResourceTokenAuth`          |
+| `connections.test`        | `integrationId`                         | harmless authenticated probe; authoritative connection status                       |
+| `connections.reauthorize` | `integrationId`                         | same as begin with forced authentication                                            |
 
 There is no generic `connections.disconnect` promise in v1 because AgentCore exposes provider management but not a universal per-user downstream-token revocation operation. The UI links to the vendor's grant-revocation page where known and can disable the app-side grant immediately. Deleting a shared OAuth provider is an administrative, all-users operation. An AgentCore consent portal is intentionally not created in v1: Cognito already authenticates this app and the modal plus callback flow provides the same product surface with fewer resources.
 
@@ -363,7 +365,9 @@ An agent receives only integration grants resolved for `{user, project, agent}`.
   "actorId": "<escaped-user-sub>/<project-id>",
   "model": { "id": "...", "priceVersion": "..." },
   "usage": { "periodId": "...", "requestId": "...", "priceCatalogRevision": 1 },
-  "integrations": [{ "integrationId": "...", "gatewayTargetId": "...", "allowedTools": [] }],
+  "integrations": [
+    { "integrationId": "...", "gatewayTargetId": "...", "allowedTools": [] }
+  ],
   "configRevision": 1
 }
 ```
@@ -389,38 +393,38 @@ Each completed metered component appends an idempotent usage event immediately. 
 
 One physical table remains sufficient. Add these logical records to the existing user/project/agent/model/usage design:
 
-| PK | SK | Purpose |
-|---|---|---|
-| `CREDENTIAL#<id>` | `CONTROL` | provider ARN/name, scope, kind, status, revision; no secret |
-| `INTEGRATION#<id>` | `CONTROL` | Gateway/target IDs, normalized config, schema reference, status, revision |
-| `PROJECT#<id>` | `INTEGRATION#<id>` | project listing/binding |
-| `AGENT#<id>` | `GRANT#<integrationId>` | allowed tools and grant revision |
-| `ACCOUNT#CONTROL` | `USAGE_DEFAULTS` | $5 daily/5 GB defaults, schedule, revision |
-| `USER#<sub>` | `PERIOD#<periodId>` | committed user cost/quantity projection; no reservation |
-| `REQUEST#<requestId>` | `CONTROL` | immutable attribution plus operational status/aggregate |
-| `REQUEST#<requestId>` | `EVENT#<timestamp>#<eventId>` | immutable component/adjustment event |
-| `USER#<sub>` | `OBJECT#<objectId>` | managed S3 object manifest |
-| `USER#<sub>` | `STORAGE#SUMMARY` | rebuildable committed byte projection |
-| `PRICE#<provider>#<model>` | `EFFECTIVE#<instant>` | immutable/effective-dated rates |
-| `IDEMPOTENCY#<userSub>` | `<command>#<key>` | request hash + retained result |
+| PK                         | SK                            | Purpose                                                                   |
+| -------------------------- | ----------------------------- | ------------------------------------------------------------------------- |
+| `CREDENTIAL#<id>`          | `CONTROL`                     | provider ARN/name, scope, kind, status, revision; no secret               |
+| `INTEGRATION#<id>`         | `CONTROL`                     | Gateway/target IDs, normalized config, schema reference, status, revision |
+| `PROJECT#<id>`             | `INTEGRATION#<id>`            | project listing/binding                                                   |
+| `AGENT#<id>`               | `GRANT#<integrationId>`       | allowed tools and grant revision                                          |
+| `ACCOUNT#CONTROL`          | `USAGE_DEFAULTS`              | $5 daily/5 GB defaults, schedule, revision                                |
+| `USER#<sub>`               | `PERIOD#<periodId>`           | committed user cost/quantity projection; no reservation                   |
+| `REQUEST#<requestId>`      | `CONTROL`                     | immutable attribution plus operational status/aggregate                   |
+| `REQUEST#<requestId>`      | `EVENT#<timestamp>#<eventId>` | immutable component/adjustment event                                      |
+| `USER#<sub>`               | `OBJECT#<objectId>`           | managed S3 object manifest                                                |
+| `USER#<sub>`               | `STORAGE#SUMMARY`             | rebuildable committed byte projection                                     |
+| `PRICE#<provider>#<model>` | `EFFECTIVE#<instant>`         | immutable/effective-dated rates                                           |
+| `IDEMPOTENCY#<userSub>`    | `<command>#<key>`             | request hash + retained result                                            |
 
 The overloaded listing index includes project-to-integrations and scope-to-credentials. High-volume usage events are sharded by a stable scope hash and summarized transactionally so dashboard reads do not scan raw events.
 
 ## 10. AWS operation map
 
-| Product command | Primary AWS operations |
-|---|---|
-| `users.*` | Cognito `AdminCreateUser`, `AdminGetUser`, `ListUsers`, group APIs, enable/disable/reset/sign-out/delete + DynamoDB transactions |
-| `defaults.*` / `users.setLimits` | DynamoDB revisioned writes |
-| `usage.*` | DynamoDB event/projection queries; S3 export; optional CUR/Cost Explorer reconciliation |
-| `storage.*` | DynamoDB ownership/byte projections + bounded S3 presign/delete |
-| secret operations | AgentCore `Create/UpdateApiKeyCredentialProvider`, `Create/UpdateOauth2CredentialProvider` |
-| credential delete | AgentCore provider delete after dependency plan |
-| `integrations.*` | `Create/Get/List/Update/DeleteGatewayTarget`, `SynchronizeGatewayTargets`, S3 schema objects |
-| `connections.complete` | AgentCore data-plane `CompleteResourceTokenAuth` |
-| `connections.begin/test` | same-path probe: authenticated Gateway `tools/call` for Gateway integrations, or harness `GetResourceOauth2Token` for interpreter-only integrations |
-| `grants.*` | DynamoDB + AgentCore Gateway Policy/Rule operations |
-| `/chat` | strongly consistent user spend check + idempotent request + Harness invocation + component usage events |
+| Product command                  | Primary AWS operations                                                                                                                              |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `users.*`                        | Cognito `AdminCreateUser`, `AdminGetUser`, `ListUsers`, group APIs, enable/disable/reset/sign-out/delete + DynamoDB transactions                    |
+| `defaults.*` / `users.setLimits` | DynamoDB revisioned writes                                                                                                                          |
+| `usage.*`                        | DynamoDB event/projection queries; S3 export; optional CUR/Cost Explorer reconciliation                                                             |
+| `storage.*`                      | DynamoDB ownership/byte projections + bounded S3 presign/delete                                                                                     |
+| secret operations                | AgentCore `Create/UpdateApiKeyCredentialProvider`, `Create/UpdateOauth2CredentialProvider`                                                          |
+| credential delete                | AgentCore provider delete after dependency plan                                                                                                     |
+| `integrations.*`                 | `Create/Get/List/Update/DeleteGatewayTarget`, `SynchronizeGatewayTargets`, S3 schema objects                                                        |
+| `connections.complete`           | AgentCore data-plane `CompleteResourceTokenAuth`                                                                                                    |
+| `connections.begin/test`         | same-path probe: authenticated Gateway `tools/call` for Gateway integrations, or harness `GetResourceOauth2Token` for interpreter-only integrations |
+| `grants.*`                       | DynamoDB + AgentCore Gateway Policy/Rule operations                                                                                                 |
+| `/chat`                          | strongly consistent user spend check + idempotent request + Harness invocation + component usage events                                             |
 
 CloudFormation creates stable platform resources: Cognito, API, broker function/role, DynamoDB table, shared S3 bucket, schedules, log groups, and stable AgentCore primitives supported declaratively. Day-to-day users and integrations are application state and use the service APIs above, not CloudFormation stack updates. This avoids one stack operation per user/credential while retaining drift-safe infrastructure.
 

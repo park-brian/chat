@@ -2,6 +2,8 @@
 
 Updated 2026-09-22. This is the implementation ledger; [PLAN.md](./PLAN.md), [API-CONTRACT.md](./API-CONTRACT.md), and [USAGE-RESOURCES.md](./USAGE-RESOURCES.md) describe the target product, not a claim that every route exists today.
 
+The backend target changed after a live CORS preflight and SDK review: [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) chooses one JWT-protected AgentCore CodeZip Runtime for deterministic application control, while managed Harnesses remain the chat workers. **The deployed code below is still Lambda/API Gateway; no Runtime migration or authenticated Runtime POST has been verified yet.** `controller.js` is an isolated migration spike with only `/ping` and `session.get`; `npm run build:controller` bundles it into a single Linux-readable, content-addressed ZIP under `.artifacts/` using dev-only `esbuild` and `fflate`. A local health/anonymous-denial check passed. No controller ZIP has been uploaded or deployed.
+
 ## Product shape now
 
 `index.html` is the buildless SolidJS app. It retains the original Solid reactivity notes in its header and imports `tests.js` only under `?test=1`. The normal browser has no AWS SDK, persistent token store, or application database. It accepts the non-secret `ApplicationEntryUrl` from the stack, completes Cognito authorization-code PKCE, validates the returned token claims, and calls one Cognito-scoped `/rpc` endpoint. One native `<dialog>` hosts every view. The account, users, models, and usage views now call real AWS-backed broker commands; the agent picker reads user/project bindings. Unavailable capabilities are labeled as unavailable instead of simulating success.
@@ -58,7 +60,7 @@ Smoke users and their user-control rows are deleted by the live story. When deve
 
 ## Next slices, in dependency order
 
-1. Move the broker from inline code to a package stored in the **same shared bucket** only when AgentCore Harness SDK code is needed. Bootstrap the bucket with the existing inline broker, then update the same stack to the packaged artifact; do not introduce an extra artifact bucket or copy AWS SDK code into the browser. Keep one source of truth for broker code and make warm code sync fast.
+1. Build the deterministic CodeZip controller and prove authenticated browser invocation, validated-token forwarding, account-control parity, and streaming in a disposable AgentCore Runtime. Keep the current Lambda path until those gates pass. Bundle into the **same shared bucket**, then switch the foundation to CloudFormation-owned Runtime code and remove Lambda/API Gateway without drift.
 2. Add a Harness binding transaction and native create/get/update/delete using the installed AgentCore control SDK. Keep `user/project` as actor and one Harness per durable agent. Model catalog entries must gain versioned rates and explicit active/budget policy before being invokable.
 3. Add one real streamed `/chat` journey with a scripted echo model only for inference, AgentCore Memory, request IDs, and measured/estimated component events. Strongly read committed user spend before admission; never reserve pending cost. Implement daily/weekly/monthly UTC periods and clearly label unpriced meters.
 4. Add skills and large schemas as exact-key objects in the shared S3 bucket, with broker-issued bounded uploads and object-byte projections. Then add AgentCore Identity credential providers, Gateway targets, and Cedar policy/grants. The secret route must never log or echo credential bodies.

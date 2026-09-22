@@ -1,5 +1,7 @@
 # AgentCore Chat: implementation plan
 
+**Backend amendment (2026-09-22):** [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) supersedes this plan's Lambda/API Gateway backend topology. The product contract and AWS resource ownership remain, but the target trusted boundary is one AgentCore CodeZip Runtime. Existing Lambda-specific passages below are migration history until rewritten. [STATUS.md](./STATUS.md) distinguishes deployed behavior from the target.
+
 Status: target architecture; [STATUS.md](./STATUS.md) records the implemented, live-verified slice
 Verified against the AWS SDK and AWS documentation on 2026-09-22
 
@@ -67,16 +69,16 @@ The UI must import only the bare clients and commands it actually uses. Do not u
 
 Direct browser access is feasible. Preflight requests were tested against `us-east-1` with the headers required by SigV4 (`authorization`, `content-type`, `x-amz-date`, `x-amz-security-token`, and `x-amz-user-agent`). The following routes accepted browser preflights:
 
-| Surface | Tested route | Result |
-| --- | --- | --- |
-| Harness invocation | `POST /harnesses/invoke` | allowed |
-| Memory events | `POST /memories/{id}/events` | allowed |
-| Memory retrieval | `POST /memories/{id}/retrieve` | allowed |
+| Surface                 | Tested route                             | Result  |
+| ----------------------- | ---------------------------------------- | ------- |
+| Harness invocation      | `POST /harnesses/invoke`                 | allowed |
+| Memory events           | `POST /memories/{id}/events`             | allowed |
+| Memory retrieval        | `POST /memories/{id}/retrieve`           | allowed |
 | AgentCore control plane | `POST /harnesses` and `/memories/create` | allowed |
-| CloudFormation | regional `POST /` Query API | allowed |
-| IAM | global Query API `POST /` | allowed |
-| STS | regional Query API `POST /` | allowed |
-| Secrets Manager | regional JSON API `POST /` | allowed |
+| CloudFormation          | regional `POST /` Query API              | allowed |
+| IAM                     | global Query API `POST /`                | allowed |
+| STS                     | regional Query API `POST /`              | allowed |
+| Secrets Manager         | regional JSON API `POST /`               | allowed |
 
 The same service tests passed for `Origin: null`, which is the origin Chromium sends when `index.html` is opened from `file://`. This is useful endpoint evidence but no longer makes `file://` a supported authenticated application mode: Cognito requires a registered redirect URL, so production uses the GitHub Pages HTTPS URL and local development uses a registered `http://localhost` URL.
 
@@ -251,8 +253,14 @@ An ordinary browser send is deliberately small:
 fetch(`${accessApi}/chat`, {
   method: "POST",
   headers: { Authorization: idToken, "Content-Type": "application/json" },
-  body: JSON.stringify({ projectKey, harnessId, sessionId, invocationId, text })
-})
+  body: JSON.stringify({
+    projectKey,
+    harnessId,
+    sessionId,
+    invocationId,
+    text,
+  }),
+});
 ```
 
 The Lambda's trusted call is the minimal `InvokeHarness` request shown above: Harness ARN, derived actor, derived runtime user, session, and message. The selected Harness supplies model, prompt, tools, skills, and limits. API Gateway uses a Cognito User Pool authorizer and Lambda proxy response streaming, so the browser still receives the native chat stream without a polling store or WebSocket service.
@@ -445,14 +453,14 @@ If strict all-resource IaC is later required, the UI can generate a change set f
 
 ### 6.1 Choose the narrowest credential path
 
-| Need | Credential mechanism | Enforcement boundary | Recommended use |
-| --- | --- | --- | --- |
-| Google/Jira/other SaaS | AgentCore OAuth or API-key provider attached to a Gateway target | Gateway Policy plus provider scope | default |
-| Authenticated remote MCP | AgentCore provider ARN placeholder in MCP headers, preferably routed through Gateway | Gateway Policy when routed through Gateway | default |
-| Same-account S3/AWS API from code | temporary credentials from a custom Code Interpreter execution role (MMDS) | IAM role and network mode | default for code |
-| Cross-account S3/AWS | scoped `sts:AssumeRole` from the Code Interpreter role | both roles' IAM policies and trust | preferred over access keys |
-| Non-Bedrock model key | credential-provider ARN in the Harness model config | Harness/Identity access permissions | default |
-| Arbitrary external API directly from generated code | project-scoped custom Code Interpreter plus exact secret grants | IAM + network only; not Gateway Policy | advanced/high risk |
+| Need                                                | Credential mechanism                                                                 | Enforcement boundary                       | Recommended use            |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------ | -------------------------- |
+| Google/Jira/other SaaS                              | AgentCore OAuth or API-key provider attached to a Gateway target                     | Gateway Policy plus provider scope         | default                    |
+| Authenticated remote MCP                            | AgentCore provider ARN placeholder in MCP headers, preferably routed through Gateway | Gateway Policy when routed through Gateway | default                    |
+| Same-account S3/AWS API from code                   | temporary credentials from a custom Code Interpreter execution role (MMDS)           | IAM role and network mode                  | default for code           |
+| Cross-account S3/AWS                                | scoped `sts:AssumeRole` from the Code Interpreter role                               | both roles' IAM policies and trust         | preferred over access keys |
+| Non-Bedrock model key                               | credential-provider ARN in the Harness model config                                  | Harness/Identity access permissions        | default                    |
+| Arbitrary external API directly from generated code | project-scoped custom Code Interpreter plus exact secret grants                      | IAM + network only; not Gateway Policy     | advanced/high risk         |
 
 Never place plaintext credentials in Harness environment variables, prompts, skills, Memory events, URLs, tags, or browser storage. Non-secret settings such as API base URLs may be Harness environment variables.
 
@@ -543,22 +551,22 @@ Use exactly one on-demand DynamoDB table. It is not a second application databas
 
 Use generic `PK`/`SK` keys, one overloaded GSI, and no streams:
 
-| Item | `PK` | `SK` | Purpose |
-| --- | --- | --- | --- |
-| Account control | `ACCOUNT` | `CONTROL` | required default-user budget/reset/storage settings and policy revision; no enforced account budget |
-| User control | `USER#<sub>` | `CONTROL` | application access plus snapshotted/overridden budget, reset, and storage limits; no profile or role copy |
-| Project | `PROJECT#<projectKey>` | `META` | immutable owner `sub`, stable actor ID, display name, status |
-| Membership | `PROJECT#<projectKey>` | `MEMBER#<sub>` | `owner`, `editor`, or `viewer`; GSI maps `USER#<sub>` to projects |
-| Model | `CATALOG#MODEL` | `MODEL#<modelKey>` | approved Harness model template, status, safe tuning bounds, credential reference, revision |
-| Model price | `CATALOG#MODEL` | `MODEL#<modelKey>#PRICE#<meter>#<effectiveFrom>` | effective-dated integer rate, region/tier/cache dimensions, currency, source |
-| Agent binding | `AGENT#<harnessId>` | `CONTROL` | authoritative project/model binding, creator `sub`, lifecycle state; no prompt/tool/skill copy |
-| User period | `USER#<sub>` | `PERIOD#<periodId>` | committed application/budget cost, quantities, overdraft-derived fields |
-| Session binding | `SESSION#<sessionId>` | `META` | project, actor, Harness, creator `sub`, timestamps, TTL |
-| Request | `REQUEST#<requestId>` | `CONTROL` | idempotency, stable attribution, rate/config snapshots, aggregate, operational status |
-| Usage event | `REQUEST#<requestId>` | `EVENT#<time>#<eventId>` | immutable component or adjustment event |
-| Managed object | `USER#<sub>` | `OBJECT#<objectId>` | S3 ownership/reference/size manifest |
-| Storage summary | `USER#<sub>` | `STORAGE#SUMMARY` | rebuildable committed byte projection |
-| Usage rollup | `SCOPE#<type>#<id>` | `USAGE#<day>#<meter>` | compact reporting totals; no message content |
+| Item            | `PK`                   | `SK`                                             | Purpose                                                                                                   |
+| --------------- | ---------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| Account control | `ACCOUNT`              | `CONTROL`                                        | required default-user budget/reset/storage settings and policy revision; no enforced account budget       |
+| User control    | `USER#<sub>`           | `CONTROL`                                        | application access plus snapshotted/overridden budget, reset, and storage limits; no profile or role copy |
+| Project         | `PROJECT#<projectKey>` | `META`                                           | immutable owner `sub`, stable actor ID, display name, status                                              |
+| Membership      | `PROJECT#<projectKey>` | `MEMBER#<sub>`                                   | `owner`, `editor`, or `viewer`; GSI maps `USER#<sub>` to projects                                         |
+| Model           | `CATALOG#MODEL`        | `MODEL#<modelKey>`                               | approved Harness model template, status, safe tuning bounds, credential reference, revision               |
+| Model price     | `CATALOG#MODEL`        | `MODEL#<modelKey>#PRICE#<meter>#<effectiveFrom>` | effective-dated integer rate, region/tier/cache dimensions, currency, source                              |
+| Agent binding   | `AGENT#<harnessId>`    | `CONTROL`                                        | authoritative project/model binding, creator `sub`, lifecycle state; no prompt/tool/skill copy            |
+| User period     | `USER#<sub>`           | `PERIOD#<periodId>`                              | committed application/budget cost, quantities, overdraft-derived fields                                   |
+| Session binding | `SESSION#<sessionId>`  | `META`                                           | project, actor, Harness, creator `sub`, timestamps, TTL                                                   |
+| Request         | `REQUEST#<requestId>`  | `CONTROL`                                        | idempotency, stable attribution, rate/config snapshots, aggregate, operational status                     |
+| Usage event     | `REQUEST#<requestId>`  | `EVENT#<time>#<eventId>`                         | immutable component or adjustment event                                                                   |
+| Managed object  | `USER#<sub>`           | `OBJECT#<objectId>`                              | S3 ownership/reference/size manifest                                                                      |
+| Storage summary | `USER#<sub>`           | `STORAGE#SUMMARY`                                | rebuildable committed byte projection                                                                     |
+| Usage rollup    | `SCOPE#<type>#<id>`    | `USAGE#<day>#<meter>`                            | compact reporting totals; no message content                                                              |
 
 `projectKey` is an opaque UUID; its project item holds `<ownerSub>/<projectId>` as the AgentCore actor. Do not copy email, global Cognito role, prompts, messages, secrets, Harness configuration, Gateway schemas, or Cognito profile fields into this table. A User control row exists because immediate application suspension plus user budget/reset/storage limits are application facts that Cognito does not own; Cognito still owns identity, email, status, MFA, and global-group membership. `main` needs only a project and owner-membership item on first use.
 
@@ -574,16 +582,16 @@ The frontend has one product interface: authenticated `POST /rpc` commands plus 
 
 The command groups are deliberately small:
 
-| Group | Representative commands | Authority |
-| --- | --- | --- |
-| Session | `me.get` | any authenticated, active user |
-| Users | `users.list`, `users.invite`, `users.setRole`, `users.setAccess`, `users.setBudget`, `users.delete` | administrator only |
-| Models | `models.list`, `models.create`, `models.update`, `models.setStatus`, `models.addPrice` | list active: any user; mutate: administrator |
-| Projects | `projects.list`, `projects.create`, `projects.update`, membership commands | create: member/admin; membership: owner/admin |
-| Agents | `agents.list/get/create/update/delete/try` | read: project viewer; mutate: owner/editor/admin |
-| Sessions | `sessions.list/get/delete` | project member/admin, with destructive actions owner/editor/admin |
-| Usage | `usage.me`, `usage.project`, `usage.account`, exports | own/project role/admin as appropriate |
-| Chat | streamed send/stop | active user with project access and committed user spend below the finite limit |
+| Group    | Representative commands                                                                             | Authority                                                                       |
+| -------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Session  | `me.get`                                                                                            | any authenticated, active user                                                  |
+| Users    | `users.list`, `users.invite`, `users.setRole`, `users.setAccess`, `users.setBudget`, `users.delete` | administrator only                                                              |
+| Models   | `models.list`, `models.create`, `models.update`, `models.setStatus`, `models.addPrice`              | list active: any user; mutate: administrator                                    |
+| Projects | `projects.list`, `projects.create`, `projects.update`, membership commands                          | create: member/admin; membership: owner/admin                                   |
+| Agents   | `agents.list/get/create/update/delete/try`                                                          | read: project viewer; mutate: owner/editor/admin                                |
+| Sessions | `sessions.list/get/delete`                                                                          | project member/admin, with destructive actions owner/editor/admin               |
+| Usage    | `usage.me`, `usage.project`, `usage.account`, exports                                               | own/project role/admin as appropriate                                           |
+| Chat     | streamed send/stop                                                                                  | active user with project access and committed user spend below the finite limit |
 
 There are two administrator identities with different purposes. Deployment-administrator credentials can create/update/delete the foundation and recover a broken Cognito configuration; they are entered only for that explicit mode. A Cognito `Administrators` user is an application administrator: the token authorizes administrator product commands but does not grant general deployment or AWS control-plane access.
 
@@ -663,25 +671,25 @@ The separate 5 GB user quota covers product-owned S3 attachments, skills, schema
 
 Every control belongs to one visible scope:
 
-| Scope | What it controls | AWS source of truth | Entry point |
-| --- | --- | --- | --- |
-| Account | Cognito session/users/roles, foundation stack, shared Memory/Gateway/Policy engine, global integrations, default user limits, price catalog, diagnostics | Cognito, CloudFormation, AgentCore, and authorization table | account/status button |
-| Project | membership, actor identity, tagged Harnesses/integrations, project memory, and usage attribution | one project/membership record plus Memory actors and native resource tags | project switcher |
-| Agent | thin project/model binding plus one Harness for prompt, model, skills, tools, credential references, code profile, limits, versions, and usage attribution | authorization table + `GetHarness`/`UpdateHarness` | current-agent button or agent row |
-| Chat | one agent-prefixed Memory session, active stream, retry/export/usage | Memory events and `InvokeHarness` | chat title/usage control |
+| Scope   | What it controls                                                                                                                                           | AWS source of truth                                                       | Entry point                       |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------- |
+| Account | Cognito session/users/roles, foundation stack, shared Memory/Gateway/Policy engine, global integrations, default user limits, price catalog, diagnostics   | Cognito, CloudFormation, AgentCore, and authorization table               | account/status button             |
+| Project | membership, actor identity, tagged Harnesses/integrations, project memory, and usage attribution                                                           | one project/membership record plus Memory actors and native resource tags | project switcher                  |
+| Agent   | thin project/model binding plus one Harness for prompt, model, skills, tools, credential references, code profile, limits, versions, and usage attribution | authorization table + `GetHarness`/`UpdateHarness`                        | current-agent button or agent row |
+| Chat    | one agent-prefixed Memory session, active stream, retry/export/usage                                                                                       | Memory events and `InvokeHarness`                                         | chat title/usage control          |
 
 The UI must name the scope in every modal breadcrumb and destructive confirmation. Account resources can be assigned downward; project controls must never silently modify another project; agent Save updates exactly one Harness.
 
 Configurability is a product requirement, not permission to duplicate native AWS state. Every durable setting has one owner and an authorized dialog:
 
-| Scope | Editable settings | Source of truth |
-| --- | --- | --- |
-| Deployment | production/callback URL, allowed origins, Region, Cognito domain, retention, bucket version retention, stack lifecycle | CloudFormation parameters and outputs; defaults target `https://park-brian.github.io/chat/agentcore/` |
-| Account | new-user budget cadence/time zone/amount, storage default, approved models and effective prices, Gateway targets and policies, credential-provider metadata | account/model/price rows in the one table plus native AgentCore resources |
-| User | role/status, individual budget cadence/time zone/amount/reset epoch, storage limit | Cognito group/status plus one User control row; defaults are snapshotted and can be explicitly reapplied |
-| Project | name, members/access when sharing is enabled, agent assignments, integration grants, managed files | project/membership rows and native actor/tags; no second project document |
-| Agent | prompt, model and safe tuning, skills, Browser/Code Interpreter/Gateway tools, credentials by reference, memory behavior, runtime limits | the managed Harness, with only a thin authorization/model binding in the table |
-| Integration | API schema/endpoint, OAuth or API-key provider, target scope, policy, assigned agents | AgentCore Identity, Gateway, Policy, Harness references, and ownership tags |
+| Scope       | Editable settings                                                                                                                                           | Source of truth                                                                                          |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Deployment  | production/callback URL, allowed origins, Region, Cognito domain, retention, bucket version retention, stack lifecycle                                      | CloudFormation parameters and outputs; defaults target `https://park-brian.github.io/chat/agentcore/`    |
+| Account     | new-user budget cadence/time zone/amount, storage default, approved models and effective prices, Gateway targets and policies, credential-provider metadata | account/model/price rows in the one table plus native AgentCore resources                                |
+| User        | role/status, individual budget cadence/time zone/amount/reset epoch, storage limit                                                                          | Cognito group/status plus one User control row; defaults are snapshotted and can be explicitly reapplied |
+| Project     | name, members/access when sharing is enabled, agent assignments, integration grants, managed files                                                          | project/membership rows and native actor/tags; no second project document                                |
+| Agent       | prompt, model and safe tuning, skills, Browser/Code Interpreter/Gateway tools, credentials by reference, memory behavior, runtime limits                    | the managed Harness, with only a thin authorization/model binding in the table                           |
+| Integration | API schema/endpoint, OAuth or API-key provider, target scope, policy, assigned agents                                                                       | AgentCore Identity, Gateway, Policy, Harness references, and ownership tags                              |
 
 The normal chat page stays small while these controls remain discoverable in one routed modal. Show defaults and presets as starting values, never as hidden constants. A configuration change must name its scope and affected users/agents; changing account defaults does not silently rewrite existing user overrides. Stable security and accounting rules—trusted actor derivation, authorization, immutable usage evidence, and no pending-cost lockout—are enforced by the backend rather than offered as unsafe toggles.
 
@@ -701,7 +709,7 @@ Models, skills, tools, credentials, policies, Gateway, Memory, and CloudFormatio
 Use one Bootstrap modal shell controlled by one signal:
 
 ```js
-const [dialog, setDialog] = createSignal(null)
+const [dialog, setDialog] = createSignal(null);
 ```
 
 Its route object is small and serializable except for the in-memory draft:
@@ -782,30 +790,30 @@ Secret values never reappear after submission. Rotation uses the credential-prov
 
 ### 7.9 Control-to-API map
 
-| User control | Read operation | Write operation |
-| --- | --- | --- |
-| Sign in | Cognito authorization/token endpoints, then `session.get` | OAuth redirect/token exchange only |
-| Sign out | current in-memory session | clear clients/tokens, then Cognito `/logout` |
-| Bootstrap/discover | `DescribeStacks` after bootstrap credentials | `CreateStack`, then `AdminCreateUser` |
-| Manage users/roles/budgets | product API composed user view | product API user commands; backend coordinates Cognito + User control |
-| Manage models/prices | product API model catalog view | product API model commands |
-| Update foundation | direct `ValidateTemplate`, `DescribeStackEvents` in deployment-admin mode | direct `UpdateStack` / guarded `DeleteStack` with entered credentials |
-| List projects | access API membership query | none |
-| Create/select project | access API membership query | project + owner membership only on create |
-| List agents | product API Agent-binding query joined to `GetHarness` | none |
-| Create agent | product API active models/project permissions | product API projects bounded draft into `CreateHarness` + Agent binding |
-| Edit agent configuration | product API binding plus `GetHarness`/versions | product API projected `UpdateHarness` and binding transition |
-| Delete agent | product API binding, Harness, prefixed sessions | product API guarded `DeleteHarness(deleteManagedMemory:false)` plus binding/session cleanup |
-| List/open chats | project-authorized access API → `ListSessions`/`ListEvents` | none |
-| Chat/send | access API membership/budget state | streamed access API → `InvokeHarness` |
-| Stop chat | active invocation state | abort and/or `StopRuntimeSession` |
-| Integrations | product API joins targets/tags/assignments | product API Create/Update/Delete/Synchronize target |
-| Credentials | product API metadata/reference counts | product API create/rotate/delete provider after authorization; raw values use only `/credential-secrets` |
-| Policies | product API engine/policy/schema view | product API Create/Update/Delete policy; update Gateway attachment |
-| Code profiles | product API Code Interpreter view | product API Create/Delete custom Code Interpreter |
-| Skills/schemas | product API metadata plus presigned S3 GET | broker-authorized presigned S3 PUT/DELETE |
-| User limits/prices | access API table reads | administrator-only validated access API writes |
-| Usage | access API event/projection reads plus CloudWatch/Cost Explorer reconciliation | idempotent component events, adjustments, and explicit reconciliation only |
+| User control               | Read operation                                                                 | Write operation                                                                                          |
+| -------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| Sign in                    | Cognito authorization/token endpoints, then `session.get`                      | OAuth redirect/token exchange only                                                                       |
+| Sign out                   | current in-memory session                                                      | clear clients/tokens, then Cognito `/logout`                                                             |
+| Bootstrap/discover         | `DescribeStacks` after bootstrap credentials                                   | `CreateStack`, then `AdminCreateUser`                                                                    |
+| Manage users/roles/budgets | product API composed user view                                                 | product API user commands; backend coordinates Cognito + User control                                    |
+| Manage models/prices       | product API model catalog view                                                 | product API model commands                                                                               |
+| Update foundation          | direct `ValidateTemplate`, `DescribeStackEvents` in deployment-admin mode      | direct `UpdateStack` / guarded `DeleteStack` with entered credentials                                    |
+| List projects              | access API membership query                                                    | none                                                                                                     |
+| Create/select project      | access API membership query                                                    | project + owner membership only on create                                                                |
+| List agents                | product API Agent-binding query joined to `GetHarness`                         | none                                                                                                     |
+| Create agent               | product API active models/project permissions                                  | product API projects bounded draft into `CreateHarness` + Agent binding                                  |
+| Edit agent configuration   | product API binding plus `GetHarness`/versions                                 | product API projected `UpdateHarness` and binding transition                                             |
+| Delete agent               | product API binding, Harness, prefixed sessions                                | product API guarded `DeleteHarness(deleteManagedMemory:false)` plus binding/session cleanup              |
+| List/open chats            | project-authorized access API → `ListSessions`/`ListEvents`                    | none                                                                                                     |
+| Chat/send                  | access API membership/budget state                                             | streamed access API → `InvokeHarness`                                                                    |
+| Stop chat                  | active invocation state                                                        | abort and/or `StopRuntimeSession`                                                                        |
+| Integrations               | product API joins targets/tags/assignments                                     | product API Create/Update/Delete/Synchronize target                                                      |
+| Credentials                | product API metadata/reference counts                                          | product API create/rotate/delete provider after authorization; raw values use only `/credential-secrets` |
+| Policies                   | product API engine/policy/schema view                                          | product API Create/Update/Delete policy; update Gateway attachment                                       |
+| Code profiles              | product API Code Interpreter view                                              | product API Create/Delete custom Code Interpreter                                                        |
+| Skills/schemas             | product API metadata plus presigned S3 GET                                     | broker-authorized presigned S3 PUT/DELETE                                                                |
+| User limits/prices         | access API table reads                                                         | administrator-only validated access API writes                                                           |
+| Usage                      | access API event/projection reads plus CloudWatch/Cost Explorer reconciliation | idempotent component events, adjustments, and explicit reconciliation only                               |
 
 ### 7.10 Progressive disclosure rules
 

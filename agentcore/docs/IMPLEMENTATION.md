@@ -1,5 +1,7 @@
 # AgentCore Chat: implementation and test runbook
 
+**Backend amendment (2026-09-22):** Follow [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) for the CodeZip Runtime migration. Lambda/API Gateway steps below document the currently deployed slice and prior live evidence, not the final backend topology.
+
 Status: roadmap/runbook; [STATUS.md](./STATUS.md) has current commands and live results
 Account probe date: 2026-09-22
 Architecture sources: [PLAN.md](./PLAN.md), the exact [API-CONTRACT.md](./API-CONTRACT.md), and the normative [USAGE-RESOURCES.md](./USAGE-RESOURCES.md)
@@ -301,7 +303,10 @@ npm run test:live -- <stack> --profile eaap --region us-east-1 --screenshot
 ```js
 await _screenshot("chat-ready");
 await _screenshot("agent-dialog", document.querySelector('[role="dialog"]'));
-await _screenshot("usage-table", document.querySelector('[data-testid="usage-table"]'));
+await _screenshot(
+  "usage-table",
+  document.querySelector('[data-testid="usage-table"]'),
+);
 ```
 
 Omitting `element` captures the viewport (or full page when `options.fullPage` is true); an `Element` captures that DOM node, including a dialog or message. The helper rejects a missing/detached/hidden node rather than silently taking the whole screen. It awaits `document.fonts.ready`, temporarily marks an element with a unique test-only attribute, calls an awaited Playwright binding with `{name, targetId, fullPage}`, and removes the mark in `finally`. The Node runner verifies the binding came from the exact allowed app origin and path, sanitizes `name` to a filename (never accepts an output path from page code), serializes captures, applies standard secret masks, and uses `page.screenshot()` or `locator.screenshot()` as appropriate. A binding error fails the test. The runner imports/installs this helper only after reaching the app page; production `index.html` never fetches `tests.js` or defines `_screenshot` in normal mode. The bridge must not capture Cognito pages or callback URLs with authorization codes. This gives tests a one-line capture at the meaningful DOM state while keeping filesystem access in Node. [Playwright bindings](https://playwright.dev/docs/api/class-page#page-expose-binding) and [page/element screenshots](https://playwright.dev/docs/screenshots) support this split.
@@ -316,7 +321,7 @@ The browser compatibility gate runs the same local signed story in headed and he
 
 The unit of provisioning is a **development session**, not a test invocation. A cold foundation stack, Cognito domain, shared Memory/Gateway/Policy resources, and one scripted-model Harness take materially longer to create/delete than a targeted test. Create them once with `dev:up`, run as many targeted live test commands and browser reloads as needed, and remove them with `dev:down` when development work ends. CI uses the same lifecycle in one job's `try/finally`; a local developer explicitly ends the session. A full cold create-and-destroy test is a separate release/CI check, never part of the inner loop. A warm test must not call CloudFormation create/update/delete merely to reset application state.
 
-The *development session* and each *test invocation* have different IDs:
+The _development session_ and each _test invocation_ have different IDs:
 
 ```text
 sessionId = chat-dev-YYYYMMDDTHHMMSSZ-<6 random hex>
@@ -330,14 +335,14 @@ All taggable resources receive `ac-chat:managed-by`, `ac-chat:stack`, and `ac-ch
 
 Planned package commands (these do not exist until the test runner is implemented):
 
-| Command | Work | Provisioning boundary |
-| --- | --- | --- |
-| `npm run dev:up -- --profile eaap --region us-east-1` | STS/account preflight, validate the exact existing dev stack or create one, wait for outputs, create session-wide scripted Harness/Identity fixture, register localhost callback/origin | Cold once per development session; idempotent warm no-op afterward |
-| `npm run test:live -- --grep <feature>` | Run only selected real-AWS/browser journeys with a new `runId`; arrange and remove scenario fixtures in `finally` | Reuses stack, Cognito pool, shared AgentCore primitives, and scripted Harness; no CF lifecycle |
-| `npm run dev:sync-code` | Update only the disposable broker Lambda code and wait for `Successful` update; use the observed `RevisionId` | Fast code iteration without stack operation; never allowed for production |
-| `npm run dev:sync-infra` | When template/parameters change, validate a change set, update the exact dev stack, refresh outputs, and reverify fixtures | Deliberate slower infrastructure iteration only |
-| `npm run dev:down` | Stop tests, clean exact direct-created native resources and smoke users, empty the versioned test bucket, delete the exact stack and retained bucket, verify absence | Cold teardown once when work ends; nonzero if anything remains |
-| `npm run dev:gc` | Recover an interrupted session using the exact recorded IDs plus account/Region/tags; list and report unknowns, never delete by prefix | Crash/orphan recovery, not an alternate normal teardown |
+| Command                                               | Work                                                                                                                                                                                    | Provisioning boundary                                                                          |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `npm run dev:up -- --profile eaap --region us-east-1` | STS/account preflight, validate the exact existing dev stack or create one, wait for outputs, create session-wide scripted Harness/Identity fixture, register localhost callback/origin | Cold once per development session; idempotent warm no-op afterward                             |
+| `npm run test:live -- --grep <feature>`               | Run only selected real-AWS/browser journeys with a new `runId`; arrange and remove scenario fixtures in `finally`                                                                       | Reuses stack, Cognito pool, shared AgentCore primitives, and scripted Harness; no CF lifecycle |
+| `npm run dev:sync-code`                               | Update only the disposable broker Lambda code and wait for `Successful` update; use the observed `RevisionId`                                                                           | Fast code iteration without stack operation; never allowed for production                      |
+| `npm run dev:sync-infra`                              | When template/parameters change, validate a change set, update the exact dev stack, refresh outputs, and reverify fixtures                                                              | Deliberate slower infrastructure iteration only                                                |
+| `npm run dev:down`                                    | Stop tests, clean exact direct-created native resources and smoke users, empty the versioned test bucket, delete the exact stack and retained bucket, verify absence                    | Cold teardown once when work ends; nonzero if anything remains                                 |
+| `npm run dev:gc`                                      | Recover an interrupted session using the exact recorded IDs plus account/Region/tags; list and report unknowns, never delete by prefix                                                  | Crash/orphan recovery, not an alternate normal teardown                                        |
 
 `dev:up` must first compare STS account, Region, stack ID/name, `ac-chat:dev-session` tag, expected application origin, and template hash. If all match and the stack is `CREATE_COMPLETE`/`UPDATE_COMPLETE`, reuse it. If the template changed, require `dev:sync-infra`; do not silently update the stack during a test. If the stack is in rollback/failed/deleting state, stop and show the exact state rather than adopting a similarly named stack. If no manifest exists, discovery can present exact tagged candidates, but requires explicit selection before reuse or deletion. The dev stack is isolated from existing `eaap-ac-*` resources and production stacks. No extra cleanup scheduler or always-on service is needed: CI's `finally`, normal `dev:down`, and `dev:gc` cover the lifecycle. If local work is abandoned before teardown, surface a stale-session warning on the next command; time/age alone is never authority to delete.
 
