@@ -265,12 +265,30 @@ export async function createLiveFixture({ stackName, profile, region }) {
         }),
       )
     ).Item;
-  return { entryUrl: entry.href, email, password, cleanup, readUserControl };
+  const controllerUrl = outputs.ControllerArn
+    ? `https://bedrock-agentcore.${region}.amazonaws.com/runtimes/${encodeURIComponent(outputs.ControllerArn)}/invocations?qualifier=DEFAULT`
+    : null;
+  return {
+    entryUrl: entry.href,
+    email,
+    password,
+    cleanup,
+    readUserControl,
+    controllerUrl,
+  };
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && story !== "login")
+  if (story && !["login", "runtime"].includes(story))
     throw new Error("Unknown live story: " + story);
+  if (story === "runtime" && !fixture.controllerUrl)
+    throw new Error("Live stack has no ControllerArn");
+  const tokenResponse =
+    story === "runtime"
+      ? page.waitForResponse((response) =>
+          response.url().includes("/oauth2/token"),
+        )
+      : null;
   await page.locator('input[type="password"]').waitFor({ timeout: 30000 });
   const identity = page.locator('input[type="email"], input[name="username"]');
   await identity.first().fill(fixture.email);
@@ -280,6 +298,35 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .first()
     .click();
   await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+  if (story === "runtime") {
+    const accessToken = (await (await tokenResponse).json()).access_token;
+    if (!accessToken) throw new Error("Cognito access token missing");
+    const result = await page.evaluate(
+      async ({ url, token }) => {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
+          },
+          body: JSON.stringify({ v: 1, command: "session.get", input: {} }),
+        });
+        return { status: response.status, body: await response.json() };
+      },
+      { url: fixture.controllerUrl, token: accessToken },
+    );
+    if (
+      result.status !== 200 ||
+      result.body?.data?.user?.email !== fixture.email
+    )
+      throw new Error(
+        "Authenticated CodeZip Runtime session.get failed: " + result.status,
+      );
+    if ((await fixture.readUserControl())?.budgetMicroUsd?.N !== "5000000")
+      throw new Error("CodeZip Runtime did not persist the default user limit");
+    return;
+  }
   await page.getByRole("button", { name: "Account" }).last().click();
   await page.getByRole("dialog").getByText(fixture.email).waitFor();
   await page.getByRole("dialog").getByText("Administrators").waitFor();

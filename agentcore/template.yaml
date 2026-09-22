@@ -30,6 +30,14 @@ Parameters:
     Type: Number
     Default: 5000000000
     MinValue: 0
+  ControllerCodeKey:
+    Type: String
+    Default: ''
+    Description: Content-addressed CodeZip key in SharedObjects; empty leaves the current Lambda path active.
+    AllowedPattern: '^(|controller/[0-9a-f]{20}\.zip)$'
+
+Conditions:
+  HasControllerCode: !Not [!Equals [!Ref ControllerCodeKey, '']]
 
 Resources:
   UserPool:
@@ -207,6 +215,66 @@ Resources:
           - Effect: Allow
             Principal: {Service: bedrock-agentcore.amazonaws.com}
             Action: sts:AssumeRole
+
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Condition: HasControllerCode
+    Properties:
+      Description: Deterministic AgentCore control boundary; no model or tool permissions.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock-agentcore.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Controller
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !GetAtt Data.Arn
+              - Effect: Allow
+                Action: [cognito-idp:AdminGetUser]
+                Resource: !GetAtt UserPool.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub '${SharedObjects.Arn}/controller/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DescribeLogGroups, logs:DescribeLogStreams, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+
+  Controller:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: HasControllerCode
+    Properties:
+      AgentRuntimeName: !Sub '${ResourcePrefix}_controller'
+      Description: Cognito-scoped deterministic product API; the Harness owns agent execution.
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Code:
+            S3: {Bucket: !Ref SharedObjects, Prefix: !Ref ControllerCodeKey}
+          Runtime: NODE_22
+          EntryPoint: [index.js]
+      NetworkConfiguration: {NetworkMode: PUBLIC}
+      ProtocolConfiguration: HTTP
+      RoleArn: !GetAtt ControllerRole.Arn
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
+          AllowedClients: [!Ref Client]
+          AllowedScopes: [chat-api/access]
+      RequestHeaderConfiguration:
+        RequestHeaderAllowlist: [Authorization]
+      EnvironmentVariables:
+        TABLE: !Ref Data
+        POOL: !Ref UserPool
+        CLIENT: !Ref Client
+        ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+        BUDGET: !Ref DefaultDailyBudgetMicroUsd
+        STORAGE: !Ref DefaultStorageBytes
+      Tags: {app: agentcore-chat, stack: !Ref 'AWS::StackName'}
 
   BrokerRole:
     Type: AWS::IAM::Role
@@ -434,5 +502,6 @@ Outputs:
   GatewayArn: {Value: !GetAtt Gateway.GatewayArn}
   PolicyEngineArn: {Value: !GetAtt PolicyEngine.PolicyEngineArn}
   HarnessRoleArn: {Value: !GetAtt HarnessRole.Arn}
+  ControllerArn: {Value: !If [HasControllerCode, !GetAtt Controller.AgentRuntimeArn, '']}
   ApplicationEntryUrl:
     Value: !Sub '${ApplicationUrl}?region=${AWS::Region}&stack=${AWS::StackName}&pool=${UserPool}&client=${Client}&domain=https%3A%2F%2F${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com&api=https%3A%2F%2F${Api}.execute-api.${AWS::Region}.amazonaws.com%2Fv1&scope=chat-api%2Faccess'

@@ -2,7 +2,9 @@
 
 Updated 2026-09-22. This is the implementation ledger; [PLAN.md](./PLAN.md), [API-CONTRACT.md](./API-CONTRACT.md), and [USAGE-RESOURCES.md](./USAGE-RESOURCES.md) describe the target product, not a claim that every route exists today.
 
-The backend target changed after a live CORS preflight and SDK review: [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) chooses one JWT-protected AgentCore CodeZip Runtime for deterministic application control, while managed Harnesses remain the chat workers. **The deployed code below is still Lambda/API Gateway; no Runtime migration or authenticated Runtime POST has been verified yet.** `controller.js` is an isolated migration spike with only `/ping` and `session.get`; `npm run build:controller` bundles it into a single Linux-readable, content-addressed ZIP under `.artifacts/` using dev-only `esbuild` and `fflate`. A local health/anonymous-denial check passed. No controller ZIP has been uploaded or deployed.
+The backend target changed after a live CORS preflight and SDK review: [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) chooses one JWT-protected AgentCore CodeZip Runtime for deterministic application control, while managed Harnesses remain the chat workers. **The published app still uses Lambda/API Gateway; Runtime parity and migration are not complete.** `controller.js` is an isolated migration slice with only `/ping` and `session.get`; `npm run build:controller` bundles it into a single Linux-readable, content-addressed ZIP under `.artifacts/` using dev-only `esbuild` and `fflate`. `template.yaml` conditionally creates a CloudFormation-owned Runtime when `ControllerCodeKey` names that ZIP in the shared bucket; the default remains the existing Lambda path.
+
+A second disposable stack verified this path live: the Runtime reached `READY`, browser preflight from the GitHub Pages origin returned 200 with authorization/content-type/session headers, anonymous POST returned 401, and `npm run test:runtime -- <stack> --profile eaap --region us-east-1` completed managed Cognito login and a browser POST to the CodeZip Runtime. The Runtime forwarded the validated token to `session.get`; a strongly consistent DynamoDB read confirmed the new $5 default limit. The repeatable story passed twice. Both smoke users/control rows were removed; CloudFormation deleted the exact test stack and Runtime, then its sole retained ZIP version and empty bucket were deleted. This proves the control boundary, **not** chat streaming, Harness invocation, all roles, credential handling, or per-user OAuth.
 
 ## Product shape now
 
@@ -37,6 +39,8 @@ npm run csp:sync                    # after editing index.html, after formatting
 npm test                            # fast no-login browser story
 npm run test:visual                 # desktop/mobile and DOM-node screenshots
 npm run test:live -- <exact-stack-name> --profile eaap --region us-east-1 --screenshot
+npm run build:controller            # deterministic single-file CodeZip under .artifacts/
+npm run test:runtime -- <exact-stack-name> --profile eaap --region us-east-1
 ```
 
 The live test reuses an existing **stable disposable** stack; it does not create/delete CloudFormation per test. It uses the stack's exact `LocalUrl`, starting the parent server when the port is free or reusing the existing parent server after checking that it serves this app. Screenshots are gitignored under `.artifacts/screenshots/`. The test-only `await _screenshot(name, element?, options?)` helper captures the whole page or a visible connected DOM node through the shared Playwright runner. Visual review should inspect actual desktop/mobile images, not just green assertions.
