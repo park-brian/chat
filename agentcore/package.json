@@ -7,6 +7,29 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "node ../test.js index.html"
+    "csp:sync": "node scripts/sync-csp.js",
+    "test": "node scripts/sync-csp.js --check && node ../test.js index.html",
+    "test:visual": "node scripts/sync-csp.js --check && node ../test.js index.html --screenshot --viewports desktop,mobile --story shell",
+    "test:live": "node scripts/sync-csp.js --check && node ../test.js index.html --story login --live-stack"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-bedrock-agentcore": "^3.1137.0",
+    "@aws-sdk/client-bedrock-agentcore-control": "^3.1137.0",
+    "@aws-sdk/client-budgets": "^3.1137.0",
+    "@aws-sdk/client-cloudformation": "^3.1137.0",
+    "@aws-sdk/client-cloudwatch": "^3.1137.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.1137.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.1137.0",
+    "@aws-sdk/client-cost-explorer": "^3.1137.0",
+    "@aws-sdk/client-dynamodb": "^3.1137.0",
+    "@aws-sdk/client-iam": "^3.1137.0",
+    "@aws-sdk/client-pricing": "^3.1137.0",
+    "@aws-sdk/client-s3": "^3.1137.0",
+    "@aws-sdk/client-secrets-manager": "^3.1137.0",
+    "@aws-sdk/client-sts": "^3.1137.0",
+    "@aws-sdk/credential-providers": "^3.1137.0",
+    "@aws-sdk/lib-dynamodb": "^3.1137.0",
+    "@aws/agentcore": "^0.30.0",
+    "solid-js": "^1.9.15"
   }
 }

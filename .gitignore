@@ -1,2 +1,6 @@
 .env
 node_modules
+agentcore/.artifacts/
+docs/
+!agentcore/docs/
+!agentcore/docs/*.md
