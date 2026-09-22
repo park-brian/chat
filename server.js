@@ -36,11 +36,14 @@ function sendText(response, statusCode, message) {
 
 function isInside(root, candidate) {
   const pathFromRoot = relative(root, candidate);
-  return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot));
+  return (
+    pathFromRoot === "" ||
+    (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))
+  );
 }
 
-export async function startServer(port = 8000) {
-  const root = await realpath(process.cwd());
+export async function startServer(port = 8000, directory = process.cwd()) {
+  const root = await realpath(directory);
 
   const server = createServer(async (request, response) => {
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -51,9 +54,21 @@ export async function startServer(port = 8000) {
 
     let pathname;
     try {
-      pathname = decodeURIComponent(new URL(request.url ?? "/", "http://localhost").pathname);
+      pathname = decodeURIComponent(
+        new URL(request.url ?? "/", "http://localhost").pathname,
+      );
     } catch {
       sendText(response, 400, "Bad Request\n");
+      return;
+    }
+
+    const segments = pathname.split(/[\\/]+/).filter(Boolean);
+    if (
+      segments.some(
+        (segment) => segment.startsWith(".") || segment === "node_modules",
+      )
+    ) {
+      sendText(response, 404, "Not Found\n");
       return;
     }
 
@@ -79,7 +94,9 @@ export async function startServer(port = 8000) {
       }
 
       response.writeHead(200, {
-        "Content-Type": MIME_TYPES[extname(canonicalPath).toLowerCase()] ?? "application/octet-stream",
+        "Content-Type":
+          MIME_TYPES[extname(canonicalPath).toLowerCase()] ??
+          "application/octet-stream",
         "Content-Length": fileStats.size,
         "X-Content-Type-Options": "nosniff",
       });
@@ -94,18 +111,27 @@ export async function startServer(port = 8000) {
       stream.pipe(response);
     } catch (error) {
       const statusCode = error?.code === "EACCES" ? 403 : 404;
-      sendText(response, statusCode, statusCode === 403 ? "Forbidden\n" : "Not Found\n");
+      sendText(
+        response,
+        statusCode,
+        statusCode === 403 ? "Forbidden\n" : "Not Found\n",
+      );
     }
   });
 
   await new Promise((ready, reject) => {
     server.once("error", reject);
-    server.listen(port, ready);
+    server.listen(port, "localhost", ready);
   });
   return server;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const server = await startServer();
-  console.log(`Serving ${process.cwd()} at http://localhost:${server.address().port}`);
+  const port = process.argv[2] ? Number(process.argv[2]) : 8000;
+  if (!Number.isInteger(port) || port < 0 || port > 65535)
+    throw new Error("Invalid port");
+  const server = await startServer(port);
+  console.log(
+    `Serving ${process.cwd()} at http://localhost:${server.address().port}`,
+  );
 }

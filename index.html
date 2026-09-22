@@ -3204,8 +3204,8 @@ Be specific. Reference evidence from /explore/ files.`,
           storyCodeExecution,
           storySubAgent,
           storyBranching
-        ]).then(({ failed }) => {
-          window.TESTS_DONE = true;
+        ]).then(({ passed, failed }) => {
+          window.TESTS_DONE = { passed, failed };
           if (failed > 0) console.error(`\n${failed} test(s) failed!`);
         });
       }

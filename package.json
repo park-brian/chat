@@ -16,9 +16,10 @@
   "main": "test.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --env-file .env test.js"
+    "test": "node test.js index.html"
   },
   "devDependencies": {
-    "playwright": "^1.63.0"
+    "playwright": "^1.63.0",
+    "prettier": "^3.9.8"
   }
 }
