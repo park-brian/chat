@@ -16,6 +16,7 @@
     "test:runtime-chat": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-chat --live-stack",
     "test:runtime-ui": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-ui --live-stack",
     "test:runtime-tool": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-tool --live-stack",
+    "test:runtime-web": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-web --live-stack",
     "test:runtime-connections": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-connections --live-stack",
     "test:runtime-model": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-model --live-stack",
     "bench:runtime": "node ../test.js index.html --story runtime-benchmark --live-stack"
@@ -36,9 +37,12 @@
     "@aws-sdk/client-s3": "^3.1137.0",
     "@aws-sdk/client-secrets-manager": "^3.1137.0",
     "@aws-sdk/client-sts": "^3.1137.0",
+    "@aws-sdk/credential-provider-node": "^3.972.84",
     "@aws-sdk/credential-providers": "^3.1137.0",
     "@aws-sdk/lib-dynamodb": "^3.1137.0",
     "@aws/agentcore": "^0.30.0",
+    "@smithy/hash-node": "^4.5.2",
+    "@smithy/signature-v4": "^5.7.3",
     "esbuild": "^0.28.2",
     "fflate": "^0.8.3",
     "solid-js": "^1.9.15"

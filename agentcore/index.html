@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-/CdDmGbqHEhWExz2m5nEPeekkzJJrxiMRaoyNrDWw7k6gZW3RKAg63NchbVRwoDb' https://cdn.jsdelivr.net; style-src 'sha384-FKqynOG3Jn1JdibVR9roPpE1zJat9u7xE7MNP/hXoI5WYwg86sq9gW7dtppjdZPK'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-ljXqCN3U73NmWMR2YoiXO6Od+ROQNIgiO3KpnsAnKMGlXLXsaiKv9g4rK1exDFUQ' https://cdn.jsdelivr.net; style-src 'sha384-Dx7vheeiYJWS4LDJ2DrL7IYlsXqlmsaweKDoNNchVPcynfTX+gZJTMAQHupBvnhd'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -320,6 +320,17 @@
       .message-text {
         white-space: pre-wrap;
         overflow-wrap: anywhere;
+      }
+      .message-text a {
+        color: #176c53;
+        text-decoration-thickness: 1px;
+        text-underline-offset: 2px;
+      }
+      .tool-activity {
+        display: block;
+        margin-top: 8px;
+        color: #718476;
+        font-size: 11px;
       }
       .compose-wrap {
         padding: 15px clamp(20px, 4vw, 56px) 23px;
@@ -940,6 +951,12 @@
                       : item,
                   ),
                 );
+              if (event.type === "tool.done")
+                setMessages((items) => items.map((item, i) =>
+                  i === items.length - 1
+                    ? { ...item, tools: [...(item.tools || []),
+                      { name: event.name, isError: event.isError }] }
+                    : item));
               if (event.type === "message.done") {
                 completed = true;
                 setMessages((items) => items.map((item, i) =>
@@ -1155,6 +1172,10 @@
             modelId: form.get("modelId"),
             systemPrompt: form.get("systemPrompt"),
             codeInterpreter: form.has("codeInterpreter"),
+            webSearch: form.has("webSearch"),
+            browser: form.has("browser"),
+            webSearchMaxResults: Number(form.get("webSearchMaxResults")),
+            browserSessionSeconds: Number(form.get("browserSessionSeconds")),
             connectionIds: form.getAll("connectionId"),
             maxOutputTokens: Number(form.get("maxOutputTokens")),
           });
@@ -1598,9 +1619,10 @@
               <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" name="name" required maxlength="80" value=${() => editingAgent()?.name || ""} /></div>
               <div class="field"><label for="agent-model">Model</label><select id="agent-model" name="modelId" required
                 onChange=${(event) => {
-                  const tool = event.currentTarget.form.elements.codeInterpreter;
-                  tool.disabled = event.currentTarget.value.startsWith("gemini-");
-                  if (tool.disabled) tool.checked = false;
+                  for (const tool of event.currentTarget.form.querySelectorAll("[data-model-tool]")) {
+                    tool.disabled = event.currentTarget.value.startsWith("gemini-");
+                    if (tool.disabled) tool.checked = false;
+                  }
                 }}>
                 <${For} each=${modelCompanies}>${(company) => html`
                   <optgroup label=${company}>
@@ -1612,8 +1634,24 @@
               </select></div>
               <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3" value=${() => editingAgent()?.systemPrompt || ""}></textarea></div>
               <div class="field"><label for="agent-max-output">Maximum output tokens per model turn</label><input id="agent-max-output" name="maxOutputTokens" type="number" min="16" max="4096" step="1" value=${() => editingAgent()?.maxOutputTokens || 4096} required /></div>
-              <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" checked=${() => Boolean(editingAgent()?.codeInterpreter)} /> Enable code workspace</label>
+              <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" data-model-tool
+                disabled=${() => editingAgent()?.modelId?.startsWith("gemini-")}
+                checked=${() => Boolean(editingAgent()?.codeInterpreter)} /> Enable code workspace</label>
                 <p class="help">Python, Node, shell, AWS CLI and internet access in an isolated session. No account credentials are granted automatically. Bedrock models only for now.</p></div>
+              <div class="field"><label class="check"><input type="checkbox" name="webSearch" data-model-tool
+                disabled=${() => editingAgent()?.modelId?.startsWith("gemini-")}
+                checked=${() => Boolean(editingAgent()?.webSearch)} /> Enable web search</label>
+                <p class="help">Current public results through AgentCore Gateway. Source links appear beneath the reply.</p>
+                <label for="agent-search-results">Maximum results per search</label>
+                <input id="agent-search-results" name="webSearchMaxResults" type="number" min="1" max="25"
+                  value=${() => editingAgent()?.webSearchMaxResults || 5} required /></div>
+              <div class="field"><label class="check"><input type="checkbox" name="browser" data-model-tool
+                disabled=${() => editingAgent()?.modelId?.startsWith("gemini-")}
+                checked=${() => Boolean(editingAgent()?.browser)} /> Enable browser</label>
+                <p class="help">An isolated public browser with visual navigation and screenshots. No site logins or saved browser profile. Sessions stop after each turn.</p>
+                <label for="agent-browser-timeout">Session timeout (seconds)</label>
+                <input id="agent-browser-timeout" name="browserSessionSeconds" type="number" min="60" max="900"
+                  value=${() => editingAgent()?.browserSessionSeconds || 300} required /></div>
               <${Show} when=${() => view()?.connections?.length}>
                 <div class="field"><label>Grant connections to this agent</label>
                   <${For} each=${() => view()?.connections || []}>${(item) => html`
@@ -1838,7 +1876,17 @@
                       </div>
                       <div>
                         <b>${item.role === "user" ? "You" : "Agent"}</b>
-                        <div class="message-text">${item.text}</div>
+                        <div class="message-text"><${For} each=${() => item.text.split(/(https:\/\/[^\s<>"']+)/g)}>
+                          ${(part) => /^https:\/\/[^\s<>"']+$/.test(part)
+                            ? html`<a href=${part} target="_blank" rel="noopener noreferrer">${part}</a>`
+                            : part}<//></div>
+                        <${Show} when=${() => item.tools?.length}>
+                          <small class="tool-activity"><${For} each=${() => item.tools || []}>
+                            ${(tool, index) => `${index() ? " · " : ""}${tool.isError ? "Failed: " : "Used "}${{
+                              web_search: "web search", browser: "browser",
+                              execute_code: "code workspace",
+                              execute_command: "command workspace",
+                            }[tool.name] || tool.name}`}<//></small><//>
                         <${Show} when=${() => item.status && item.status !== "complete"}>
                           <small class="message-state">${() =>
                             item.status === "pending" ? "Working…" :

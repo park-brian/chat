@@ -2,6 +2,10 @@
 // AgentCore validates the Cognito JWT before forwarding its Authorization header.
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
+import { SignatureV4 } from "@smithy/signature-v4";
+import { Hash } from "@smithy/hash-node";
+import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { BedrockRuntimeClient, ConverseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
 import { scriptedStream } from "./scripted-model.js";
 import { modelCost, periodKey } from "./accounting.js";
@@ -22,6 +26,7 @@ import {
   GetResourceApiKeyCommand,
   StartCodeInterpreterSessionCommand, InvokeCodeInterpreterCommand,
   StopCodeInterpreterSessionCommand,
+  StartBrowserSessionCommand, InvokeBrowserCommand, StopBrowserSessionCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
 
 const idp = new CognitoIdentityProviderClient({});
@@ -296,13 +301,17 @@ async function invoke(body, identity) {
     }));
     return { status: 200, data: { ok: true, data: {
       conversation: unpack(row.Item),
-      messages: (page.events || []).toReversed().flatMap((event) =>
-        (event.payload || []).flatMap((payload) => {
+      messages: (page.events || []).toReversed().flatMap((event) => {
+        const calls = (event.payload || []).find((payload) =>
+          Array.isArray(payload.json?.content?.toolCalls))?.json.content.toolCalls || [];
+        return (event.payload || []).flatMap((payload) => {
           const entry = payload.conversational;
           return entry?.content?.text && ["USER", "ASSISTANT"].includes(entry.role)
-            ? [{ role: entry.role.toLowerCase(), text: entry.content.text, status: "complete" }]
+            ? [{ role: entry.role.toLowerCase(), text: entry.content.text, status: "complete",
+              ...(entry.role === "ASSISTANT" && { tools: calls }) }]
             : [];
-        })),
+        });
+      }),
       nextCursor: page.nextToken || null,
     } } };
   }
@@ -310,24 +319,28 @@ async function invoke(body, identity) {
     if (identity.role === "Auditors")
       return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
     const { projectId, id: existingId, revision, name, modelId,
-      systemPrompt = "", codeInterpreter = false,
-      connectionIds = [], maxOutputTokens = 4096 } = body.input;
+      systemPrompt = "", codeInterpreter = false, webSearch = false, browser = false,
+      connectionIds = [], maxOutputTokens = 4096,
+      webSearchMaxResults = 5, browserSessionSeconds = 300 } = body.input;
     if (projectId !== "main" || typeof name !== "string" || !name.trim() || name.length > 80 ||
       typeof modelId !== "string" || !modelId || modelId.length > 512 ||
       typeof systemPrompt !== "string" || systemPrompt.length > 12000 ||
-      typeof codeInterpreter !== "boolean" ||
+      [codeInterpreter, webSearch, browser].some((value) => typeof value !== "boolean") ||
       !Array.isArray(connectionIds) || connectionIds.length > 4 ||
       connectionIds.some((id) => !uuidPattern.test(id || "")) ||
       new Set(connectionIds).size !== connectionIds.length ||
       (connectionIds.length && !codeInterpreter) ||
       (existingId !== undefined && (!uuidPattern.test(existingId || "") ||
         !Number.isSafeInteger(revision) || revision < 0)) ||
-      !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 16 || maxOutputTokens > 4096)
+      !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 16 || maxOutputTokens > 4096 ||
+      !Number.isSafeInteger(webSearchMaxResults) || webSearchMaxResults < 1 || webSearchMaxResults > 25 ||
+      !Number.isSafeInteger(browserSessionSeconds) || browserSessionSeconds < 60 ||
+      browserSessionSeconds > 900)
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
     const model = await approvedModel(modelId);
     if (!model)
       return { status: 400, data: { ok: false, error: { code: "MODEL_UNAVAILABLE" } } };
-    if (model.transport === "gemini" && codeInterpreter)
+    if (model.transport === "gemini" && (codeInterpreter || webSearch || browser))
       return { status: 400, data: { ok: false, error: { code: "TOOL_UNAVAILABLE" } } };
     if (connectionIds.length) {
       const saved = (await credentials(identity)).items;
@@ -350,15 +363,19 @@ async function invoke(body, identity) {
       legacyRevision = !current.Item.revision;
     }
     const agent = { id, name: name.trim(), modelId, systemPrompt,
-      codeInterpreter, connectionIds, maxOutputTokens, createdAt,
+      codeInterpreter, webSearch, browser, connectionIds, maxOutputTokens,
+      webSearchMaxResults, browserSessionSeconds, createdAt,
       revision: existingId ? revision + 1 : 0 };
     try {
       await db.send(new PutItemCommand({ TableName: process.env.TABLE,
         Item: { pk: S(`PROJECT#${identity.sub}/main`), sk: S(`AGENT#${id}`),
           id: S(id), name: S(agent.name), modelId: S(modelId),
           systemPrompt: S(systemPrompt), codeInterpreter: { BOOL: codeInterpreter },
+          webSearch: { BOOL: webSearch }, browser: { BOOL: browser },
           connectionIds: { L: connectionIds.map(S) },
           maxOutputTokens: N(maxOutputTokens), createdAt: S(createdAt),
+          webSearchMaxResults: N(webSearchMaxResults),
+          browserSessionSeconds: N(browserSessionSeconds),
           revision: N(agent.revision) },
         ConditionExpression: existingId
           ? legacyRevision ? "attribute_not_exists(revision)" : "revision = :expected"
@@ -640,10 +657,101 @@ async function initializeWorkspace(sessionId, scope) {
     values: Object.values(secretsForSession) };
 }
 
+const gatewaySigner = new SignatureV4({
+  credentials: defaultProvider(), region: process.env.AWS_REGION,
+  service: "bedrock-agentcore", sha256: Hash.bind(null, "sha256"),
+});
+
+async function searchWeb(query, maxResults) {
+  const endpoint = new URL("/mcp", process.env.GATEWAY_URL);
+  const body = JSON.stringify({ jsonrpc: "2.0", id: randomUUID(),
+    method: "tools/call", params: { name: "Search___WebSearch",
+      arguments: { query, maxResults } } });
+  const signed = await gatewaySigner.sign({
+    method: "POST", protocol: endpoint.protocol, hostname: endpoint.hostname,
+    path: endpoint.pathname, headers: { host: endpoint.hostname,
+      "content-type": "application/json", accept: "application/json, text/event-stream",
+      "mcp-protocol-version": "2025-03-26" }, body,
+  });
+  const response = await fetch(endpoint, { method: "POST", headers: signed.headers,
+    body, signal: AbortSignal.timeout(30000) });
+  const raw = await response.text();
+  if (!response.ok) throw Error(`Web Search gateway returned ${response.status}`);
+  const payload = raw.startsWith("data:")
+    ? JSON.parse(raw.split("\n").find((line) => line.startsWith("data:")).slice(5))
+    : JSON.parse(raw);
+  if (payload.error || payload.result?.isError)
+    throw Error("Web Search was unavailable");
+  const result = payload.result || payload;
+  const text = result.content?.find((item) => item.type === "text")?.text;
+  const results = result.structuredContent?.results || (text ? JSON.parse(text).results : []);
+  if (!Array.isArray(results)) throw Error("Unexpected Web Search result");
+  const visible = [];
+  let length = 2;
+  for (const item of results) {
+    const size = JSON.stringify(item).length + 1;
+    if (length + size > 12000) break;
+    visible.push(item);
+    length += size;
+  }
+  const sources = visible.flatMap(({ title, url }) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === "https:" ? [{ title: String(title || parsed.hostname)
+        .replace(/[\r\n]/g, " ").slice(0, 120),
+        url: parsed.href }] : [];
+    } catch { return []; }
+  });
+  return { text: JSON.stringify(visible), sources };
+}
+
+const browserId = "aws.browser.v1";
+async function browserAction(sessionId, input) {
+  const { action } = input;
+  const invoke = async (operation) => {
+    const result = (await memory.send(new InvokeBrowserCommand({
+      browserIdentifier: browserId, sessionId, action: operation,
+    }))).result;
+    const part = Object.values(result || {})[0];
+    if (part?.status !== "SUCCESS") throw Error("Browser action failed");
+    return part;
+  };
+  if (action === "navigate") {
+    const url = new URL(input.url);
+    if (url.protocol !== "https:" || url.username || url.password ||
+      url.port || url.href.length > 2000 ||
+      isIP(url.hostname.replace(/^\[|\]$/g, "")) ||
+      /(^localhost$|\.localhost$|\.local$)/i.test(url.hostname))
+      throw Error("Browser requires a public HTTPS URL");
+    await invoke({ keyShortcut: { keys: ["ctrl", "l"] } });
+    await invoke({ keyType: { text: url.href } });
+    await invoke({ keyPress: { key: "enter" } });
+  } else if (action === "click") {
+    if (![input.x, input.y].every((n) => Number.isInteger(n) && n >= 0 && n <= 2000))
+      throw Error("Invalid browser coordinates");
+    await invoke({ mouseClick: { x: input.x, y: input.y } });
+  } else if (action === "type") {
+    if (typeof input.text !== "string" || !input.text || input.text.length > 2000)
+      throw Error("Invalid browser text");
+    await invoke({ keyType: { text: input.text } });
+  } else if (action === "scroll") {
+    if (!Number.isInteger(input.deltaY) || Math.abs(input.deltaY) > 1000)
+      throw Error("Invalid browser scroll");
+    await invoke({ mouseScroll: { x: 500, y: 350, deltaY: input.deltaY } });
+  } else if (action !== "screenshot") throw Error("Invalid browser action");
+  if (action !== "screenshot") await new Promise((resolve) => setTimeout(resolve, 500));
+  const screenshot = await invoke({ screenshot: { format: "PNG" } });
+  if (!screenshot.data || screenshot.data.length > 3500000)
+    throw Error("Browser screenshot unavailable or too large");
+  return [{ text: `Browser ${action} complete. Inspect the screenshot before the next action.` },
+    { image: { format: "png", source: { bytes: screenshot.data } } }];
+}
+
 async function runModel(config, messages, emit, workloadToken, scope) {
   if (config.modelId === "gemini-3.8-flash")
     return runGemini(config, messages, emit, workloadToken);
-  const toolConfig = config.codeInterpreter ? { tools: [
+  const tools = [];
+  if (config.codeInterpreter) tools.push(
     { toolSpec: {
       name: "execute_code",
       description: "Run Python, JavaScript, or TypeScript in an isolated public-network workspace. Session .env is loaded automatically.",
@@ -659,14 +767,33 @@ async function runModel(config, messages, emit, workloadToken, scope) {
         command: { type: "string" },
       }, required: ["command"] } },
     } },
-  ] } : undefined;
+  );
+  if (config.webSearch) tools.push({ toolSpec: {
+    name: "web_search",
+    description: "Search the current public web. Cite source URLs in your answer. Queries are limited to 200 characters.",
+    inputSchema: { json: { type: "object", properties: {
+      query: { type: "string" },
+    }, required: ["query"] } },
+  } });
+  if (config.browser) tools.push({ toolSpec: {
+    name: "browser",
+    description: "Use an isolated public browser. Each action returns a screenshot to inspect. Navigate only to a public HTTPS URL; click uses screenshot coordinates. No authenticated browser profile is loaded.",
+    inputSchema: { json: { type: "object", properties: {
+      action: { type: "string", enum: ["navigate", "click", "type", "scroll", "screenshot"] },
+      url: { type: "string" }, x: { type: "integer" }, y: { type: "integer" },
+      text: { type: "string" }, deltaY: { type: "integer" },
+    }, required: ["action"] } },
+  } });
+  const toolConfig = tools.length ? { tools } : undefined;
   const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0,
     cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
   const toolCalls = [];
   let toolSession;
+  let browserSession;
   let envPath;
   let envNames = [];
   let envValues = [];
+  const sources = new Map();
   try {
     for (let turn = 0; turn < 8; turn++) {
       const stream = config.modelId === "test.echo"
@@ -675,7 +802,9 @@ async function runModel(config, messages, emit, workloadToken, scope) {
             modelId: config.modelId, messages,
             system: config.systemPrompt || toolConfig ? [{ text: [
               config.systemPrompt,
-              toolConfig ? "Use the code workspace to inspect, run and revise work. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
+              config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
+              config.webSearch ? "Web Search returns current results. Base factual claims on the returned sources and cite their URLs." : "",
+              config.browser ? "Browser actions return screenshots. Inspect each screenshot and avoid entering private credentials." : "",
             ].filter(Boolean).join("\n\n") }] : undefined,
             inferenceConfig: { maxTokens: config.maxOutputTokens || 4096 }, toolConfig,
           }))).stream;
@@ -707,8 +836,13 @@ async function runModel(config, messages, emit, workloadToken, scope) {
         }
       }
       if (!metered) throw Error("Model did not report token usage");
-      if (stopReason === "end_turn")
-        return { text: content.map((part) => part?.text || "").join(""), usage, toolCalls };
+      if (stopReason === "end_turn") {
+        const citations = sources.size ? "\n\nSources:\n" + [...sources]
+          .map(([url, title]) => `- ${title}: ${url}`).join("\n") : "";
+        if (citations) emit({ type: "message.delta", text: citations });
+        return { text: content.map((part) => part?.text || "").join("") + citations,
+          usage, toolCalls };
+      }
       if (stopReason !== "tool_use" || !toolConfig) throw Error("Unsupported model stop reason");
       const requested = content.filter((part) => part?.toolUse).map((part) => part.toolUse);
       if (!requested.length) throw Error("Tool turn had no tool requests");
@@ -721,9 +855,15 @@ async function runModel(config, messages, emit, workloadToken, scope) {
           typeof tool.input.code === "string" && tool.input.code.length <= 20000;
         const isCommand = tool.name === "execute_command" &&
           typeof tool.input?.command === "string" && tool.input.command.length <= 20000;
-        if (!isCode && !isCommand)
+        const isSearch = tool.name === "web_search" && config.webSearch &&
+          typeof tool.input?.query === "string" && tool.input.query.trim().length > 0 &&
+          tool.input.query.length <= 200;
+        const isBrowser = tool.name === "browser" && config.browser &&
+          ["navigate", "click", "type", "scroll", "screenshot"].includes(tool.input?.action);
+        if (!(isCode && config.codeInterpreter) && !(isCommand && config.codeInterpreter) &&
+          !isSearch && !isBrowser)
           throw Error("Invalid tool request");
-        if (!toolSession) {
+        if ((isCode || isCommand) && !toolSession) {
           if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
           toolSession = (await memory.send(new StartCodeInterpreterSessionCommand({
             codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID,
@@ -735,6 +875,36 @@ async function runModel(config, messages, emit, workloadToken, scope) {
           envValues = workspace.values;
         }
         const started = Date.now();
+        if (isSearch || isBrowser) {
+          let content;
+          let isError = false;
+          try {
+            if (isSearch) {
+              const result = await searchWeb(tool.input.query.trim(),
+                config.webSearchMaxResults || 5);
+              for (const { url, title } of result.sources) sources.set(url, title);
+              content = [{ text: result.text }];
+            } else {
+              if (!browserSession) browserSession = (await memory.send(
+                new StartBrowserSessionCommand({ browserIdentifier: browserId,
+                  name: `chat-${randomUUID().slice(0, 8)}`,
+                  sessionTimeoutSeconds: config.browserSessionSeconds || 300,
+                  viewPort: { width: 1000, height: 700 } }))).sessionId;
+              content = await browserAction(browserSession, tool.input);
+            }
+          } catch (error) {
+            console.error("Managed tool failed", tool.name, error.name,
+              error.$metadata?.httpStatusCode || "");
+            isError = true;
+            content = [{ text: `${isSearch ? "Web Search" : "Browser"} could not complete that action.` }];
+          }
+          toolCalls.push({ name: tool.name, latencyMs: Date.now() - started,
+            occurredAt: new Date().toISOString(), isError });
+          emit({ type: "tool.done", name: tool.name, isError });
+          results.push({ toolResult: { toolUseId: tool.toolUseId, content,
+            status: isError ? "error" : "success" } });
+          continue;
+        }
         const pythonEnv = envNames.length ? `import os, base64
 for _name in ${JSON.stringify(envNames)}:
     os.environ[_name] = base64.b64decode(os.environ.pop(_name + "_B64")).decode("utf-8")
@@ -769,6 +939,9 @@ for _name in ${JSON.stringify(envNames)}:
     }
     throw Error("Agent turn limit reached");
   } finally {
+    if (browserSession) await memory.send(new StopBrowserSessionCommand({
+      browserIdentifier: browserId, sessionId: browserSession,
+    })).catch(() => console.error("Could not stop Browser session"));
     if (toolSession) await memory.send(new StopCodeInterpreterSessionCommand({
       codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID, sessionId: toolSession,
     })).catch(() => console.error("Could not stop Code Interpreter session"));

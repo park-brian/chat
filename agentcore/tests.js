@@ -207,7 +207,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
   entry.pathname = local.pathname;
   let created = false;
   let sub;
-  const chatSessions = [];
+  const chatSessions = new Set();
   const cleanup = async () => {
     if (sub) {
       for (const sessionId of chatSessions) {
@@ -294,7 +294,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
     readUserControl,
     controllerUrl,
     hasGemini: Boolean(outputs.GeminiCredentialArn),
-    trackChat: (agentId, sessionId) => chatSessions.push(`a_${agentId}_${sessionId}`),
+    trackChat: (agentId, sessionId) => chatSessions.add(`a_${agentId}_${sessionId}`),
     readChat: async (agentId, sessionId) => memory.send(new memoryApi.ListEventsCommand({
       memoryId: outputs.MemoryArn, actorId: `${sub}/main`,
       sessionId: `a_${agentId}_${sessionId}`, includePayloads: true,
@@ -309,9 +309,9 @@ export async function createLiveFixture({ stackName, profile, region }) {
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
   const uiInvocations = [];
   const uiErrors = [];
@@ -323,7 +323,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   page.on("request", (request) => {
     if (!request.url().includes("/runtimes/")) return;
     const body = request.postDataJSON();
-    if (["runtime-ui", "runtime-connections"].includes(story) && body?.command === "chat.send")
+    if (["runtime-ui", "runtime-connections", "runtime-web"].includes(story) && body?.command === "chat.send")
       fixture.trackChat(body.input.agentId, body.input.sessionId);
     uiInvocations.push({ command: body?.command, input: body?.input,
       runtimeSession: request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"] });
@@ -334,7 +334,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (body.includes('"type":"error"')) uiErrors.push(body.slice(0, 1000));
   });
   const tokenResponse =
-    ["runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)
+    ["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)
       ? page.waitForResponse((response) =>
           response.url().includes("/oauth2/token"),
         )
@@ -353,7 +353,9 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     });
   if (uiInvocations.length !== 1 || uiInvocations[0].command !== "workspace.get" ||
     !uiInvocations[0].runtimeSession)
-    throw new Error("Sign-in must load the workspace in one sticky Runtime invocation");
+    throw new Error("Sign-in must load the workspace in one sticky Runtime invocation: " +
+      JSON.stringify({ invocations: uiInvocations.map((item) => item.command),
+        runtimeFailures }));
   if (story === "runtime-ui") {
     const label = page.viewportSize().width < 761 ? "mobile" : "desktop";
     const firstMessage = `hello ${label}`;
@@ -391,8 +393,9 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       throw new Error("Gemini dropdown availability must match the stack credential");
     if (fixture.hasGemini) {
       await dialog.locator("#agent-model").selectOption("gemini-3.8-flash");
-      if (!(await dialog.locator('input[name="codeInterpreter"]').isDisabled()))
-        throw new Error("Gemini cannot offer the unimplemented Code Interpreter bridge");
+      for (const name of ["codeInterpreter", "webSearch", "browser"])
+        if (!(await dialog.locator(`input[name="${name}"]`).isDisabled()))
+          throw new Error("Gemini cannot offer an unimplemented managed-tool bridge");
     }
     if (screenshot)
       await page.evaluate(async () => {
@@ -402,6 +405,10 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     await dialog.locator("#agent-name").fill(`Smoke UI ${label}`);
     await dialog.locator("#agent-model").selectOption("test.echo");
     await dialog.locator('input[name="codeInterpreter"]').check();
+    await dialog.locator('input[name="webSearch"]').check();
+    await dialog.locator('input[name="browser"]').check();
+    await dialog.locator("#agent-search-results").fill("7");
+    await dialog.locator("#agent-browser-timeout").fill("120");
     await dialog.locator('input[name="connectionId"]').last().check();
     await dialog.getByRole("button", { name: "Create agent" }).click();
     await dialog.waitFor({ state: "hidden", timeout: 12000 }).catch(async () => {
@@ -415,7 +422,11 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       throw new Error("Agent edit lost its saved connection grant");
     const editedModel = await editor.locator("#agent-model").inputValue();
     const editedTool = await editor.locator('input[name="codeInterpreter"]').isChecked();
-    if (editedModel !== "test.echo" || !editedTool)
+    if (editedModel !== "test.echo" || !editedTool ||
+      !(await editor.locator('input[name="webSearch"]').isChecked()) ||
+      !(await editor.locator('input[name="browser"]').isChecked()) ||
+      (await editor.locator("#agent-search-results").inputValue()) !== "7" ||
+      (await editor.locator("#agent-browser-timeout").inputValue()) !== "120")
       throw new Error(`Agent edit lost model/tool: ${editedModel} / ${editedTool}`);
     await editor.locator("#agent-name").fill(`Smoke UI ${label} revised`);
     await editor.getByRole("button", { name: "Save agent" }).click();
@@ -460,7 +471,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       });
     return;
   }
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)) {
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
     if (story === "runtime-connections") {
@@ -706,6 +717,57 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         chatComplete: summarize(sample.chat.map((x) => x.completeMs)),
         samples: { controls: 8, signInPerPath: 5, usagePerPath: 5, chat: 5 },
       }));
+      return;
+    }
+    if (story === "runtime-web") {
+      const result = await page.evaluate(async ({ url, token }) => {
+        const invoke = async (command, input) => {
+          const response = await fetch(url, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
+          }, body: JSON.stringify({ v: 1, command, input }) });
+          return command === "chat.send" ? await response.text() : await response.json();
+        };
+        const created = await invoke("agents.put", { projectId: "main",
+          name: "Web and Browser smoke", modelId: "test.echo",
+          webSearch: true, browser: true });
+        if (!created.ok) return { created };
+        const agentId = created.data.id, sessionId = crypto.randomUUID();
+        const send = (message) => invoke("chat.send", { projectId: "main",
+          agentId, sessionId, requestId: crypto.randomUUID(), message });
+        return { agentId, sessionId,
+          search: await send("run-search: Amazon Bedrock AgentCore documentation"),
+          browser: await send("run-browser: https://example.com/"),
+          reopened: await invoke("conversations.get", {
+            projectId: "main", agentId, conversationId: sessionId }) };
+      }, { url: fixture.controllerUrl, token: accessToken });
+      if (!result.search?.includes('"name":"web_search","isError":false') ||
+        !result.search.includes("Sources:") ||
+        !result.search.includes('"type":"message.done"') ||
+        !result.browser?.includes('"name":"browser","isError":false') ||
+        !result.browser.includes('"type":"message.done"') ||
+        !result.reopened?.ok ||
+        !result.reopened.data.messages.some((item) =>
+          item.role === "assistant" && item.text.includes("Sources:") &&
+          item.tools?.some((tool) => tool.name === "web_search")))
+        throw new Error("Live Web Search or Browser failed: " + JSON.stringify(result).slice(0, 1800));
+      const usage = await fixture.readUsage();
+      if (usage.Items?.length !== 4 ||
+        !usage.Items.some((item) => item.name?.S === "web_search") ||
+        !usage.Items.some((item) => item.name?.S === "browser"))
+        throw new Error("Web and Browser usage rows missing");
+      await page.reload();
+      await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+      await page.getByRole("button", {
+        name: "run-search: Amazon Bedrock AgentCore documentation",
+      }).click();
+      await page.locator('.message.assistant .message-text a[href^="https://"]')
+        .first().waitFor();
+      if (screenshot)
+        await page.evaluate(async () => {
+          const { _screenshot } = await import("./tests.js");
+          await _screenshot("live-web-conversation", undefined, { fullPage: true });
+        });
       return;
     }
     if (["runtime-chat", "runtime-tool"].includes(story)) {

@@ -212,6 +212,12 @@ Resources:
                 Resource:
                   - !GetAtt PolicyEngine.PolicyEngineArn
                   - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${ResourcePrefix}-gateway-*'
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${ResourcePrefix}-gateway-*'
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeWebSearch
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:tool/web-search.v1'
   Gateway:
     Type: AWS::BedrockAgentCore::Gateway
     Properties:
@@ -224,6 +230,20 @@ Resources:
       Tags:
         app: agentcore-chat
         stack: !Ref AWS::StackName
+  WebSearchTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !Ref Gateway
+      Name: Search
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Connector:
+            Source: {ConnectorId: web-search}
+            Configurations:
+              - Name: WebSearch
+                ParameterValues: {}
   GeminiCredential:
     Type: AWS::BedrockAgentCore::ApiKeyCredentialProvider
     Condition: HasGemini
@@ -287,6 +307,12 @@ Resources:
                 Action: [bedrock-agentcore:StartCodeInterpreterSession, bedrock-agentcore:InvokeCodeInterpreter, bedrock-agentcore:StopCodeInterpreterSession]
                 Resource: !GetAtt CodeWorkspace.CodeInterpreterArn
               - Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !GetAtt Gateway.GatewayArn
+              - Effect: Allow
+                Action: [bedrock-agentcore:StartBrowserSession, bedrock-agentcore:InvokeBrowser, bedrock-agentcore:StopBrowserSession]
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:browser/aws.browser.v1'
+              - Effect: Allow
                 Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
                 Resource:
                   # Global profiles check both destination-Region and Regionless model ARNs.
@@ -346,7 +372,26 @@ Resources:
         SCRIPTED_MODEL: !Ref EnableScriptedModel
         GEMINI_PROVIDER: !If [HasGemini, !Sub '${ResourcePrefix}-gemini', '']
         CODE_INTERPRETER_ID: !GetAtt CodeWorkspace.CodeInterpreterId
+        GATEWAY_URL: !GetAtt Gateway.GatewayUrl
       Tags: {app: agentcore-chat, stack: !Ref 'AWS::StackName'}
+
+  WebSearchPermit:
+    Type: AWS::BedrockAgentCore::Policy
+    Condition: HasControllerCode
+    DependsOn: [WebSearchTarget, ControllerRole]
+    Properties:
+      Name: !Sub '${ResourcePrefix}_WebSearch'
+      PolicyEngineId: !GetAtt PolicyEngine.PolicyEngineId
+      EnforcementMode: ACTIVE
+      ValidationMode: FAIL_ON_ANY_FINDINGS
+      Definition:
+        Cedar:
+          Statement: !Sub |
+            permit(
+              principal == AgentCore::IamEntity::"arn:aws:sts::${AWS::AccountId}:assumed-role/${ControllerRole}",
+              action == AgentCore::Action::"Search___WebSearch",
+              resource == AgentCore::Gateway::"${Gateway.GatewayArn}"
+            );
 
 Outputs:
   UserPoolId: {Value: !Ref UserPool}
@@ -356,6 +401,7 @@ Outputs:
   SharedBucket: {Value: !Ref SharedObjects}
   MemoryArn: {Value: !Ref Memory}
   GatewayArn: {Value: !GetAtt Gateway.GatewayArn}
+  GatewayUrl: {Value: !GetAtt Gateway.GatewayUrl}
   PolicyEngineArn: {Value: !GetAtt PolicyEngine.PolicyEngineArn}
   ControllerArn: {Value: !If [HasControllerCode, !GetAtt Controller.AgentRuntimeArn, '']}
   GeminiCredentialArn: {Value: !If [HasGemini, !GetAtt GeminiCredential.CredentialProviderArn, '']}
