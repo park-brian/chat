@@ -10,12 +10,13 @@ export async function* scriptedStream(messages) {
     : `Echo: ${prompt}`;
   yield { messageStart: { role: "assistant" } };
   const code = prompt.startsWith("run-code:") && !toolResult ? prompt.slice(9).trim() : null;
-  yield { contentBlockStart: { contentBlockIndex: 0, start: code
-    ? { toolUse: { toolUseId: "scripted-tool-1", name: "execute_code" } } : {} } };
-  yield { contentBlockDelta: { contentBlockIndex: 0, delta: code
-    ? { toolUse: { input: JSON.stringify({ language: "python", code }) } }
+  const command = prompt.startsWith("run-command:") && !toolResult ? prompt.slice(12).trim() : null;
+  yield { contentBlockStart: { contentBlockIndex: 0, start: code || command
+    ? { toolUse: { toolUseId: "scripted-tool-1", name: command ? "execute_command" : "execute_code" } } : {} } };
+  yield { contentBlockDelta: { contentBlockIndex: 0, delta: code || command
+    ? { toolUse: { input: JSON.stringify(command ? { command } : { language: "python", code }) } }
     : { text: reply } } };
   yield { contentBlockStop: { contentBlockIndex: 0 } };
-  yield { messageStop: { stopReason: code ? "tool_use" : "end_turn" } };
+  yield { messageStop: { stopReason: code || command ? "tool_use" : "end_turn" } };
   yield { metadata: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } };
 }

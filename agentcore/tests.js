@@ -564,11 +564,23 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
           projectId: "main", agentId, sessionId, requestId,
-          message: toolStory ? "run-code: print(2+2)" : "hello runtime",
+          message: toolStory
+            ? "run-code: import os; print(2+2, os.getenv('AGENTCORE_PROJECT_ID'))"
+            : "hello runtime",
         } }) });
         const stream = await response.text();
-        if (toolStory) return { agentId, sessionId, requestId, status: response.status, stream,
-          elapsedMs: performance.now() - started };
+        if (toolStory) {
+          const command = await fetch(url, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
+          }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            projectId: "main", agentId, sessionId, requestId: crypto.randomUUID(),
+            message: "run-command: printf '%s' \"$AGENTCORE_PROJECT_ID\"",
+          } }) });
+          return { agentId, sessionId, requestId, status: response.status, stream,
+            commandStatus: command.status, commandStream: await command.text(),
+            elapsedMs: performance.now() - started };
+        }
         const followup = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
@@ -598,15 +610,20 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       if (result.agentId && result.sessionId) fixture.trackChat(result.agentId, result.sessionId);
       if (toolStory) {
         if (result.status !== 200 || !result.stream?.includes('"type":"tool.done"') ||
-          !result.stream.includes("4") || !result.stream.includes('"type":"message.done"'))
+          !result.stream.includes("4 main") || !result.stream.includes('"type":"message.done"') ||
+          result.commandStatus !== 200 ||
+          !result.commandStream?.includes('"name":"execute_command"') ||
+          !result.commandStream.includes("main") ||
+          !result.commandStream.includes('"type":"message.done"'))
           throw new Error("Runtime managed tool turn failed: " + JSON.stringify(result));
         const usage = await fixture.readUsage();
-        if (usage.Items?.length !== 2 ||
-          !usage.Items.some((item) => item.unpricedToolCalls?.N === "1") ||
-          !usage.Items.some((item) => item.quality?.S === "unpriced" && item.name?.S === "execute_code"))
+        if (usage.Items?.length !== 4 ||
+          usage.Items.filter((item) => item.unpricedToolCalls?.N === "1").length !== 2 ||
+          !usage.Items.some((item) => item.quality?.S === "unpriced" && item.name?.S === "execute_code") ||
+          !usage.Items.some((item) => item.quality?.S === "unpriced" && item.name?.S === "execute_command"))
           throw new Error("Managed tool invocation was not recorded as unpriced");
         console.log("TOOL TIMING " + JSON.stringify({ browserCompleteMs: Math.round(result.elapsedMs),
-          sampleCount: 1, inference: "scripted", tool: "real AgentCore Code Interpreter" }));
+          sampleCount: 2, inference: "scripted", tool: "real AgentCore Code Interpreter" }));
         return;
       }
       if (result.status !== 200 || !result.stream?.includes('"text":"Echo: hello runtime"') ||

@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-YI3gTSqBFY6hVO7Edif9pmz/n+TdXgrE7BrHLUbFqVu7RZ2Me8r1EAV3RCjygIty' https://cdn.jsdelivr.net; style-src 'sha384-0uGIx2Ip1BbdBQBGXyQ+5xVRibP7jnRrZyS8gGSUn+Zxw0EXmgpSAWnOI3QViESy'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-gsdyd8Mt/CdHOaDJhVQDUJTLvx7T0R8X1/nvx30HcIf8of4ilHcFObWUlDCW792+' https://cdn.jsdelivr.net; style-src 'sha384-0uGIx2Ip1BbdBQBGXyQ+5xVRibP7jnRrZyS8gGSUn+Zxw0EXmgpSAWnOI3QViESy'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -1513,8 +1513,8 @@
               </select></div>
               <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3"></textarea></div>
               <div class="field"><label for="agent-max-output">Maximum output tokens per model turn</label><input id="agent-max-output" name="maxOutputTokens" type="number" min="16" max="4096" step="1" value="4096" required /></div>
-              <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" /> Enable managed Code Interpreter</label>
-                <p class="help">Code Interpreter currently supports Bedrock models only.</p></div>
+              <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" /> Enable code workspace</label>
+                <p class="help">Python, Node, shell, AWS CLI and internet access in an isolated session. No account credentials are granted automatically. Bedrock models only for now.</p></div>
               <div class="actions"><button class="primary" type="submit">Create agent</button></div>
             </form>
             <${Show}

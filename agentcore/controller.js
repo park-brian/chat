@@ -446,28 +446,88 @@ async function runGemini(config, messages, emit, workloadToken) {
   }, toolCalls: [] };
 }
 
-async function runModel(config, messages, emit, workloadToken) {
+async function interpreterCall(sessionId, name, args) {
+  const response = await memory.send(new InvokeCodeInterpreterCommand({
+    codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID, sessionId,
+    name, arguments: args,
+  }));
+  let output = "";
+  let isError = false;
+  for await (const event of response.stream) {
+    if (!event.result) continue;
+    const structured = event.result.structuredContent;
+    const content = (event.result.content || []).filter((part) => part.type === "text")
+      .map((part) => part.text).join("\n");
+    output = (output + (structured?.stdout || "") + (structured?.stderr || "") +
+      (structured?.stdout || structured?.stderr ? "" : content)).slice(0, 8000);
+    isError ||= event.result.isError === true;
+  }
+  return { output, isError };
+}
+
+const shellQuote = (value) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+
+async function initializeWorkspace(sessionId, scope) {
+  const variables = {
+    AGENTCORE_USER_ID: scope.sub,
+    AGENTCORE_PROJECT_ID: scope.projectId,
+    AGENTCORE_AGENT_ID: scope.agentId,
+    AGENTCORE_CHAT_ID: scope.sessionId,
+    AWS_REGION: process.env.AWS_REGION,
+    AWS_DEFAULT_REGION: process.env.AWS_REGION,
+  };
+  // These are derived identifiers only. Credential values need a separately
+  // audited serializer and an explicit user grant before they may be added.
+  const contents = Object.entries(variables).map(([name, value]) => {
+    if (!/^[A-Za-z0-9._:/-]+$/.test(value || "")) throw Error("Invalid workspace context");
+    return `${name}=${value}`;
+  }).join("\n") + "\n";
+  const written = await interpreterCall(sessionId, "writeFiles", {
+    content: [{ path: ".env", text: contents }],
+  });
+  if (written.isError) throw Error("Could not initialize code workspace");
+  const cwd = await interpreterCall(sessionId, "executeCommand", { command: "pwd" });
+  const path = cwd.output.trim().split(/\r?\n/)[0];
+  if (cwd.isError || !/^\/[A-Za-z0-9._/-]+$/.test(path))
+    throw Error("Could not locate code workspace");
+  return `${path}/.env`;
+}
+
+async function runModel(config, messages, emit, workloadToken, scope) {
   if (config.modelId === "gemini-3.8-flash")
     return runGemini(config, messages, emit, workloadToken);
-  const toolConfig = config.codeInterpreter ? { tools: [{ toolSpec: {
-    name: "execute_code",
-    description: "Execute Python, JavaScript, or TypeScript in an isolated managed Code Interpreter.",
-    inputSchema: { json: { type: "object", properties: {
-      language: { type: "string", enum: ["python", "javascript", "typescript"] },
-      code: { type: "string" },
-    }, required: ["language", "code"] } },
-  } }] } : undefined;
+  const toolConfig = config.codeInterpreter ? { tools: [
+    { toolSpec: {
+      name: "execute_code",
+      description: "Run Python, JavaScript, or TypeScript in an isolated public-network workspace. Session .env is loaded automatically.",
+      inputSchema: { json: { type: "object", properties: {
+        language: { type: "string", enum: ["python", "javascript", "typescript"] },
+        code: { type: "string" },
+      }, required: ["language", "code"] } },
+    } },
+    { toolSpec: {
+      name: "execute_command",
+      description: "Run a shell command in that workspace, with session .env loaded. Python, Node, curl, AWS CLI, pip and npm are installed; install other tools only when needed. Commands are capped at 120 seconds.",
+      inputSchema: { json: { type: "object", properties: {
+        command: { type: "string" },
+      }, required: ["command"] } },
+    } },
+  ] } : undefined;
   const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0,
     cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
   const toolCalls = [];
   let toolSession;
+  let envPath;
   try {
     for (let turn = 0; turn < 8; turn++) {
       const stream = config.modelId === "test.echo"
         ? scriptedStream(messages)
         : (await bedrock.send(new ConverseStreamCommand({
             modelId: config.modelId, messages,
-            system: config.systemPrompt ? [{ text: config.systemPrompt }] : undefined,
+            system: config.systemPrompt || toolConfig ? [{ text: [
+              config.systemPrompt,
+              toolConfig ? "Use the code workspace to inspect, run and revise work. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Do not print session secrets; code with granted credentials can read and transmit them." : "",
+            ].filter(Boolean).join("\n\n") }] : undefined,
             inferenceConfig: { maxTokens: config.maxOutputTokens || 4096 }, toolConfig,
           }))).stream;
       const content = [];
@@ -507,31 +567,31 @@ async function runModel(config, messages, emit, workloadToken) {
       const results = [];
       for (const tool of requested) {
         if (toolCalls.length >= 8) throw Error("Agent tool call limit reached");
-        if (tool.name !== "execute_code" ||
-          !["python", "javascript", "typescript"].includes(tool.input?.language) ||
-          typeof tool.input.code !== "string" || tool.input.code.length > 20000)
+        const isCode = tool.name === "execute_code" &&
+          ["python", "javascript", "typescript"].includes(tool.input?.language) &&
+          typeof tool.input.code === "string" && tool.input.code.length <= 20000;
+        const isCommand = tool.name === "execute_command" &&
+          typeof tool.input?.command === "string" && tool.input.command.length <= 20000;
+        if (!isCode && !isCommand)
           throw Error("Invalid tool request");
-        if (!toolSession) toolSession = (await memory.send(new StartCodeInterpreterSessionCommand({
-          codeInterpreterIdentifier: "aws.codeinterpreter.v1",
-          name: `chat-${randomUUID().slice(0, 8)}`, sessionTimeoutSeconds: 900,
-        }))).sessionId;
-        const started = Date.now();
-        const answer = await memory.send(new InvokeCodeInterpreterCommand({
-          codeInterpreterIdentifier: "aws.codeinterpreter.v1", sessionId: toolSession,
-          name: "executeCode", arguments: { language: tool.input.language, code: tool.input.code },
-        }));
-        let output = "";
-        let isError = false;
-        for await (const event of answer.stream) {
-          if (event.result) {
-            output += event.result.structuredContent?.stdout || "";
-            output += event.result.structuredContent?.stderr || "";
-            output += (event.result.content || []).filter((part) => part.type === "text")
-              .map((part) => part.text).join("\n");
-            isError ||= event.result.isError === true;
-          }
+        if (!toolSession) {
+          if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
+          toolSession = (await memory.send(new StartCodeInterpreterSessionCommand({
+            codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID,
+            name: `chat-${randomUUID().slice(0, 8)}`, sessionTimeoutSeconds: 900,
+          }))).sessionId;
+          envPath = await initializeWorkspace(toolSession, scope);
         }
-        output = output.slice(0, 8000);
+        const started = Date.now();
+        const args = isCode ? {
+          language: tool.input.language,
+          runtime: tool.input.language === "python" ? "python" : "nodejs",
+          code: tool.input.language === "python"
+            ? `from dotenv import load_dotenv\nload_dotenv(${JSON.stringify(envPath)}, override=True)\n${tool.input.code}`
+            : `process.loadEnvFile(${JSON.stringify(envPath)});\n${tool.input.code}`,
+        } : { command: `set -a; . ${shellQuote(envPath)}; set +a; timeout 120s sh -lc ${shellQuote(tool.input.command)}` };
+        const { output, isError } = await interpreterCall(toolSession,
+          isCode ? "executeCode" : "executeCommand", args);
         toolCalls.push({ name: tool.name, latencyMs: Date.now() - started,
           occurredAt: new Date().toISOString(), isError });
         emit({ type: "tool.done", name: tool.name, isError });
@@ -543,7 +603,7 @@ async function runModel(config, messages, emit, workloadToken) {
     throw Error("Agent turn limit reached");
   } finally {
     if (toolSession) await memory.send(new StopCodeInterpreterSessionCommand({
-      codeInterpreterIdentifier: "aws.codeinterpreter.v1", sessionId: toolSession,
+      codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID, sessionId: toolSession,
     })).catch(() => console.error("Could not stop Code Interpreter session"));
   }
 }
@@ -601,7 +661,8 @@ async function chat(input, identity, response, workloadToken) {
   const emit = (event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
   const started = Date.now();
   try {
-    const result = await runModel(config, messages, emit, workloadToken);
+    const result = await runModel(config, messages, emit, workloadToken,
+      { sub: identity.sub, projectId, agentId, sessionId });
     const costMicroUsd = modelCost(result.usage, model);
     const occurredAt = new Date().toISOString();
     const receipt = { version: 1, requestId, agentId, conversationId: sessionId,

@@ -234,6 +234,14 @@ Resources:
       Tags:
         - {Key: app, Value: agentcore-chat}
         - {Key: stack, Value: !Ref 'AWS::StackName'}
+  CodeWorkspace:
+    Type: AWS::BedrockAgentCore::CodeInterpreterCustom
+    Condition: HasControllerCode
+    Properties:
+      Name: !Sub '${ResourcePrefix}_code'
+      Description: Shared public-network interpreter; each chat tool turn gets an isolated session.
+      NetworkConfiguration: {NetworkMode: PUBLIC}
+      Tags: {app: agentcore-chat, stack: !Ref 'AWS::StackName'}
   ControllerRole:
     Type: AWS::IAM::Role
     Condition: HasControllerCode
@@ -277,7 +285,7 @@ Resources:
                 - !Ref AWS::NoValue
               - Effect: Allow
                 Action: [bedrock-agentcore:StartCodeInterpreterSession, bedrock-agentcore:InvokeCodeInterpreter, bedrock-agentcore:StopCodeInterpreterSession]
-                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1'
+                Resource: !GetAtt CodeWorkspace.CodeInterpreterArn
               - Effect: Allow
                 Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
                 Resource:
@@ -336,6 +344,7 @@ Resources:
         MEMORY: !GetAtt Memory.MemoryId
         SCRIPTED_MODEL: !Ref EnableScriptedModel
         GEMINI_PROVIDER: !If [HasGemini, !Sub '${ResourcePrefix}-gemini', '']
+        CODE_INTERPRETER_ID: !GetAtt CodeWorkspace.CodeInterpreterId
       Tags: {app: agentcore-chat, stack: !Ref 'AWS::StackName'}
 
 Outputs:
@@ -349,6 +358,7 @@ Outputs:
   PolicyEngineArn: {Value: !GetAtt PolicyEngine.PolicyEngineArn}
   ControllerArn: {Value: !If [HasControllerCode, !GetAtt Controller.AgentRuntimeArn, '']}
   GeminiCredentialArn: {Value: !If [HasGemini, !GetAtt GeminiCredential.CredentialProviderArn, '']}
+  CodeWorkspaceArn: {Value: !If [HasControllerCode, !GetAtt CodeWorkspace.CodeInterpreterArn, '']}
   ApplicationEntryUrl:
     Condition: HasControllerCode
     Value: !Sub '${ApplicationUrl}?region=${AWS::Region}&stack=${AWS::StackName}&pool=${UserPool}&client=${Client}&domain=https%3A%2F%2F${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com&scope=chat-api%2Faccess&runtime=${Controller.AgentRuntimeArn}'
