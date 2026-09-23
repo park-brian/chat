@@ -9,14 +9,18 @@
   "scripts": {
     "build:controller": "node scripts/build-controller.js",
     "csp:sync": "node scripts/sync-csp.js",
-    "test": "node scripts/sync-csp.js --check && node scripts/test-controller.js && node ../test.js index.html",
+    "test": "node scripts/sync-csp.js --check && node scripts/test-accounting.js && node scripts/test-controller.js && node ../test.js index.html",
     "test:visual": "node scripts/sync-csp.js --check && node ../test.js index.html --screenshot --viewports desktop,mobile --story shell",
     "test:live": "node scripts/sync-csp.js --check && node ../test.js index.html --story login --live-stack",
-    "test:runtime": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime --live-stack"
+    "test:runtime": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime --live-stack",
+    "test:runtime-chat": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-chat --live-stack",
+    "test:runtime-tool": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-tool --live-stack",
+    "bench:runtime": "node ../test.js index.html --story runtime-benchmark --live-stack"
   },
   "devDependencies": {
     "@aws-sdk/client-bedrock-agentcore": "^3.1137.0",
     "@aws-sdk/client-bedrock-agentcore-control": "^3.1137.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1138.0",
     "@aws-sdk/client-budgets": "^3.1137.0",
     "@aws-sdk/client-cloudformation": "^3.1137.0",
     "@aws-sdk/client-cloudwatch": "^3.1137.0",

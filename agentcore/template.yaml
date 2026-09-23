@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: AgentCore Chat foundation - one AWS-native control plane, no per-user stacks
+Description: AgentCore Chat - one JWT-protected Runtime for control and agents
 
 Parameters:
   ResourcePrefix:
@@ -33,8 +33,13 @@ Parameters:
   ControllerCodeKey:
     Type: String
     Default: ''
-    Description: Content-addressed CodeZip key in SharedObjects; empty leaves the current Lambda path active.
+    Description: Content-addressed CodeZip key in SharedObjects; empty creates only bootstrap resources.
     AllowedPattern: '^(|controller/[0-9a-f]{20}\.zip)$'
+  EnableScriptedModel:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Disposable test stacks only; never enable scripted inference in production.
 
 Conditions:
   HasControllerCode: !Not [!Equals [!Ref ControllerCodeKey, '']]
@@ -121,9 +126,17 @@ Resources:
       AttributeDefinitions:
         - {AttributeName: pk, AttributeType: S}
         - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: gsi1pk, AttributeType: S}
+        - {AttributeName: gsi1sk, AttributeType: S}
       KeySchema:
         - {AttributeName: pk, KeyType: HASH}
         - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: UsageByTime
+          KeySchema:
+            - {AttributeName: gsi1pk, KeyType: HASH}
+            - {AttributeName: gsi1sk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
       SSESpecification: {SSEEnabled: true}
       PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
       TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
@@ -205,22 +218,11 @@ Resources:
       Tags:
         app: agentcore-chat
         stack: !Ref AWS::StackName
-  HarnessRole:
-    Type: AWS::IAM::Role
-    Properties:
-      Description: Shared execution role; add only scoped capabilities before creating a Harness.
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: {Service: bedrock-agentcore.amazonaws.com}
-            Action: sts:AssumeRole
-
   ControllerRole:
     Type: AWS::IAM::Role
     Condition: HasControllerCode
     Properties:
-      Description: Deterministic AgentCore control boundary; no model or tool permissions.
+      Description: Single Runtime for authenticated control and configured agent execution.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -233,10 +235,25 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:UpdateItem]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query, dynamodb:TransactWriteItems, dynamodb:UpdateItem]
                 Resource: !GetAtt Data.Arn
               - Effect: Allow
-                Action: [cognito-idp:AdminGetUser]
+                Action: [dynamodb:Query]
+                Resource: !Sub '${Data.Arn}/index/UsageByTime'
+              - Effect: Allow
+                Action: [bedrock-agentcore:CreateEvent, bedrock-agentcore:ListEvents]
+                Resource: !Ref Memory
+              - Effect: Allow
+                Action: [bedrock-agentcore:StartCodeInterpreterSession, bedrock-agentcore:InvokeCodeInterpreter, bedrock-agentcore:StopCodeInterpreterSession]
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1'
+              - Effect: Allow
+                Action: [bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:application-inference-profile/*'
+              - Effect: Allow
+                Action: [cognito-idp:AdminGetUser, cognito-idp:AdminCreateUser, cognito-idp:AdminAddUserToGroup, cognito-idp:ListUsers]
                 Resource: !GetAtt UserPool.Arn
               - Effect: Allow
                 Action: [s3:GetObject]
@@ -250,7 +267,7 @@ Resources:
     Condition: HasControllerCode
     Properties:
       AgentRuntimeName: !Sub '${ResourcePrefix}_controller'
-      Description: Cognito-scoped deterministic product API; the Harness owns agent execution.
+      Description: Cognito-scoped product API and direct model loop; no Harness or Lambda needed.
       AgentRuntimeArtifact:
         CodeConfiguration:
           Code:
@@ -274,234 +291,20 @@ Resources:
         ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
         BUDGET: !Ref DefaultDailyBudgetMicroUsd
         STORAGE: !Ref DefaultStorageBytes
+        MEMORY: !GetAtt Memory.MemoryId
+        SCRIPTED_MODEL: !Ref EnableScriptedModel
       Tags: {app: agentcore-chat, stack: !Ref 'AWS::StackName'}
-
-  BrokerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: {Service: lambda.amazonaws.com}
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: Broker
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
-              - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
-                Resource: !GetAtt Data.Arn
-              - Effect: Allow
-                Action: [cognito-idp:AdminGetUser, cognito-idp:AdminCreateUser, cognito-idp:AdminAddUserToGroup, cognito-idp:ListUsers]
-                Resource: !GetAtt UserPool.Arn
-  Broker:
-    Type: AWS::Lambda::Function
-    Properties:
-      Description: Narrow Cognito-authorized control plane; no browser AWS credentials.
-      Runtime: nodejs22.x
-      Handler: index.handler
-      MemorySize: 256
-      Timeout: 15
-      Role: !GetAtt BrokerRole.Arn
-      Environment:
-        Variables:
-          TABLE: !Ref Data
-          POOL: !Ref UserPool
-          ORIGINS: !Sub '${ProductionOrigin},${LocalOrigin}'
-          BUDGET: !Ref DefaultDailyBudgetMicroUsd
-          STORAGE: !Ref DefaultStorageBytes
-      Code:
-        ZipFile: |
-          const { DynamoDBClient, GetItemCommand, UpdateItemCommand, QueryCommand } = require('@aws-sdk/client-dynamodb');
-          const { CognitoIdentityProviderClient, AdminGetUserCommand, AdminCreateUserCommand, AdminAddUserToGroupCommand, ListUsersCommand } = require('@aws-sdk/client-cognito-identity-provider');
-          const db = new DynamoDBClient({}), idp = new CognitoIdentityProviderClient({});
-          const table = process.env.TABLE, pool = process.env.POOL;
-          const S = value => ({ S: String(value) }), N = value => ({ N: String(value) });
-          const key = (pk, sk) => ({ pk: S(pk), sk: S(sk) });
-          const unpack = item => Object.fromEntries(Object.entries(item || {}).map(([name, value]) =>
-            [name, value.S ?? (value.N === undefined ? value.BOOL : Number(value.N))]));
-          const defaults = async () => unpack((await db.send(new UpdateItemCommand({ TableName: table,
-            Key: key('ACCOUNT#CONTROL', 'DEFAULTS'),
-            UpdateExpression: 'SET budgetMicroUsd = if_not_exists(budgetMicroUsd, :budget), storageBytes = if_not_exists(storageBytes, :storage), #period = if_not_exists(#period, :period), revision = if_not_exists(revision, :zero)',
-            ExpressionAttributeNames: { '#period': 'period' },
-            ExpressionAttributeValues: { ':budget': N(process.env.BUDGET), ':storage': N(process.env.STORAGE), ':period': S('daily'), ':zero': N(0) },
-            ReturnValues: 'ALL_NEW' }))).Attributes);
-          const reply = (statusCode, body, origin) => ({ statusCode, headers: {
-            'content-type': 'application/json',
-            'access-control-allow-origin': origin || 'null',
-            'access-control-allow-headers': 'authorization,content-type',
-            'access-control-allow-methods': 'POST,OPTIONS', 'vary': 'Origin'
-          }, body: JSON.stringify(body) });
-          const groups = text => String(text || '').replace(/[\[\]" ]/g, '').split(',').filter(Boolean);
-          exports.handler = async event => {
-            const origin = process.env.ORIGINS.split(',').includes(event.headers?.origin || event.headers?.Origin)
-              ? (event.headers.origin || event.headers.Origin) : null;
-            if (event.httpMethod === 'OPTIONS') return reply(204, {}, origin);
-            if (!origin) return reply(403, { ok: false, error: { code: 'ORIGIN', message: 'Origin not allowed' } }, origin);
-            const claims = event.requestContext?.authorizer?.claims || {};
-            const roles = groups(claims['cognito:groups']);
-            if (!claims.sub || roles.length !== 1 || !['Administrators', 'Members', 'Auditors'].includes(roles[0]))
-              return reply(403, { ok: false, error: { code: 'ROLE', message: 'A single account role is required' } }, origin);
-            const admin = roles[0] === 'Administrators', sub = claims.sub;
-            try {
-              const request = JSON.parse(event.body || '{}'), command = request.command, input = request.input || {};
-              if (request.v !== 1 || !/^[a-z]+\.[a-zA-Z]+$/.test(command || '')) throw Error('Invalid command');
-              let data;
-              if (command === 'session.get') {
-                const user = await idp.send(new AdminGetUserCommand({ UserPoolId: pool, Username: sub }));
-                const email = user.UserAttributes?.find(a => a.Name === 'email')?.Value || '';
-                const limits = await defaults();
-                const row = await db.send(new UpdateItemCommand({ TableName: table, Key: key('USER#' + sub, 'CONTROL'),
-                  UpdateExpression: 'SET budgetMicroUsd = if_not_exists(budgetMicroUsd, :budget), storageBytes = if_not_exists(storageBytes, :storage)',
-                  ExpressionAttributeValues: { ':budget': N(limits.budgetMicroUsd), ':storage': N(limits.storageBytes) }, ReturnValues: 'ALL_NEW' }));
-                data = { user: { sub, email, role: roles[0], budgetMicroUsd: Number(row.Attributes.budgetMicroUsd.N),
-                  storageBytes: Number(row.Attributes.storageBytes.N) }, defaults: limits, defaultProjectId: 'main' };
-              } else if (command === 'users.list' && admin) {
-                const page = await idp.send(new ListUsersCommand({ UserPoolId: pool, Limit: 20, PaginationToken: input.cursor || undefined }));
-                const limits = await defaults();
-                data = { items: await Promise.all(page.Users.map(async u => {
-                  const userSub = u.Attributes?.find(a => a.Name === 'sub')?.Value;
-                  const row = await db.send(new GetItemCommand({ TableName: table, Key: key('USER#' + userSub, 'CONTROL') }));
-                  return { sub: userSub, email: u.Attributes?.find(a => a.Name === 'email')?.Value,
-                    enabled: u.Enabled, status: u.UserStatus, budgetMicroUsd: Number(row.Item?.budgetMicroUsd?.N || limits.budgetMicroUsd),
-                    storageBytes: Number(row.Item?.storageBytes?.N || limits.storageBytes) };
-                })),
-                  cursor: page.PaginationToken || null };
-              } else if (command === 'users.invite' && admin) {
-                if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.email || '') || !['Members', 'Auditors', 'Administrators'].includes(input.role))
-                  throw Error('Valid email and account role required');
-                await idp.send(new AdminCreateUserCommand({ UserPoolId: pool, Username: input.email,
-                  UserAttributes: [{ Name: 'email', Value: input.email }, { Name: 'email_verified', Value: 'true' }] }));
-                await idp.send(new AdminAddUserToGroupCommand({ UserPoolId: pool, Username: input.email, GroupName: input.role }));
-                data = { invited: true };
-              } else if (command === 'users.setLimits' && admin) {
-                if (!/^[0-9a-f-]{36}$/.test(input.sub || '') || !Number.isSafeInteger(input.budgetMicroUsd) || input.budgetMicroUsd < 0 ||
-                    !Number.isSafeInteger(input.storageBytes) || input.storageBytes < 0) throw Error('Invalid limits');
-                await idp.send(new AdminGetUserCommand({ UserPoolId: pool, Username: input.sub }));
-                await db.send(new UpdateItemCommand({ TableName: table, Key: key('USER#' + input.sub, 'CONTROL'),
-                  UpdateExpression: 'SET budgetMicroUsd = :budget, storageBytes = :storage',
-                  ExpressionAttributeValues: { ':budget': N(input.budgetMicroUsd), ':storage': N(input.storageBytes) } }));
-                data = { updated: true };
-              } else if (command === 'defaults.get' && admin) {
-                data = await defaults();
-              } else if (command === 'defaults.set' && admin) {
-                if (!Number.isSafeInteger(input.budgetMicroUsd) || input.budgetMicroUsd < 0 ||
-                    !Number.isSafeInteger(input.storageBytes) || input.storageBytes < 0 ||
-                    !['daily', 'weekly', 'monthly'].includes(input.period) || !Number.isSafeInteger(input.revision))
-                  throw Error('Invalid defaults');
-                const row = await db.send(new UpdateItemCommand({ TableName: table, Key: key('ACCOUNT#CONTROL', 'DEFAULTS'),
-                  UpdateExpression: 'SET budgetMicroUsd = :budget, storageBytes = :storage, #period = :period, revision = revision + :one',
-                  ConditionExpression: 'revision = :revision', ExpressionAttributeNames: { '#period': 'period' },
-                  ExpressionAttributeValues: { ':budget': N(input.budgetMicroUsd), ':storage': N(input.storageBytes),
-                    ':period': S(input.period), ':revision': N(input.revision), ':one': N(1) }, ReturnValues: 'ALL_NEW' }));
-                data = unpack(row.Attributes);
-              } else if (command === 'agents.list') {
-                if (input.projectId !== 'main') throw Error('Invalid project');
-                const page = await db.send(new QueryCommand({ TableName: table,
-                  KeyConditionExpression: 'pk = :pk', ExpressionAttributeValues: { ':pk': S('PROJECT#' + sub + '/main') }, Limit: 100 }));
-                data = { items: page.Items.filter(item => item.sk.S.startsWith('AGENT#')).map(unpack) };
-              } else if (command === 'models.list') {
-                const page = await db.send(new QueryCommand({ TableName: table,
-                  KeyConditionExpression: 'pk = :pk', ExpressionAttributeValues: { ':pk': S('MODEL') }, Limit: 100 }));
-                data = { items: page.Items.map(unpack) };
-              } else if (command === 'models.put' && admin) {
-                if (!/^[a-zA-Z0-9._/-]{1,120}$/.test(input.id || '') || typeof input.name !== 'string' || !input.name.trim())
-                  throw Error('Invalid model');
-                await db.send(new UpdateItemCommand({ TableName: table, Key: key('MODEL', input.id),
-                  UpdateExpression: 'SET #name = :name, active = :active',
-                  ExpressionAttributeNames: { '#name': 'name' }, ExpressionAttributeValues: { ':name': S(input.name.trim()), ':active': { BOOL: input.active !== false } } }));
-                data = { updated: true };
-              } else if (command === 'usage.summary') {
-                const period = new Date().toISOString().slice(0, 10);
-                const row = await db.send(new GetItemCommand({ TableName: table, Key: key('USER#' + sub, 'PERIOD#' + period), ConsistentRead: true }));
-                data = { period, costMicroUsd: Number(row.Item?.costMicroUsd?.N || 0), quality: 'unmetered' };
-              } else {
-                return reply(501, { ok: false, error: { code: 'NOT_IMPLEMENTED', message: command + ' is not available yet' } }, origin);
-              }
-              return reply(200, { ok: true, data }, origin);
-            } catch (error) {
-              const badInput = error instanceof SyntaxError || error.message?.startsWith('Invalid') || error.message?.startsWith('Valid');
-              return reply(badInput ? 400 : 500, { ok: false, error: { code: badInput ? 'INPUT' : 'INTERNAL', message: badInput ? error.message : 'Operation failed' } }, origin);
-            }
-          };
-  Api:
-    Type: AWS::ApiGateway::RestApi
-    Properties:
-      Name: !Sub '${ResourcePrefix}-chat-api'
-      EndpointConfiguration: {Types: [REGIONAL]}
-  ApiAuthorizer:
-    Type: AWS::ApiGateway::Authorizer
-    Properties:
-      Name: CognitoAccessToken
-      Type: COGNITO_USER_POOLS
-      RestApiId: !Ref Api
-      IdentitySource: method.request.header.Authorization
-      ProviderARNs: [!GetAtt UserPool.Arn]
-  RpcResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref Api
-      ParentId: !GetAtt Api.RootResourceId
-      PathPart: rpc
-  RpcPost:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref Api
-      ResourceId: !Ref RpcResource
-      HttpMethod: POST
-      AuthorizationType: COGNITO_USER_POOLS
-      AuthorizerId: !Ref ApiAuthorizer
-      AuthorizationScopes: [chat-api/access]
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Broker.Arn}/invocations'
-  RpcOptions:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref Api
-      ResourceId: !Ref RpcResource
-      HttpMethod: OPTIONS
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Broker.Arn}/invocations'
-  ApiInvokeBroker:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref Broker
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*/rpc'
-  ApiDeployment:
-    Type: AWS::ApiGateway::Deployment
-    DependsOn: [RpcPost, RpcOptions]
-    Properties:
-      RestApiId: !Ref Api
-  ApiStage:
-    Type: AWS::ApiGateway::Stage
-    Properties:
-      RestApiId: !Ref Api
-      DeploymentId: !Ref ApiDeployment
-      StageName: v1
 
 Outputs:
   UserPoolId: {Value: !Ref UserPool}
   ClientId: {Value: !Ref Client}
   CognitoDomain: {Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'}
-  ApiUrl: {Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1'}
   DataTable: {Value: !Ref Data}
   SharedBucket: {Value: !Ref SharedObjects}
   MemoryArn: {Value: !Ref Memory}
   GatewayArn: {Value: !GetAtt Gateway.GatewayArn}
   PolicyEngineArn: {Value: !GetAtt PolicyEngine.PolicyEngineArn}
-  HarnessRoleArn: {Value: !GetAtt HarnessRole.Arn}
   ControllerArn: {Value: !If [HasControllerCode, !GetAtt Controller.AgentRuntimeArn, '']}
   ApplicationEntryUrl:
-    Value: !Sub '${ApplicationUrl}?region=${AWS::Region}&stack=${AWS::StackName}&pool=${UserPool}&client=${Client}&domain=https%3A%2F%2F${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com&api=https%3A%2F%2F${Api}.execute-api.${AWS::Region}.amazonaws.com%2Fv1&scope=chat-api%2Faccess'
+    Condition: HasControllerCode
+    Value: !Sub '${ApplicationUrl}?region=${AWS::Region}&stack=${AWS::StackName}&pool=${UserPool}&client=${Client}&domain=https%3A%2F%2F${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com&scope=chat-api%2Faccess&runtime=${Controller.AgentRuntimeArn}'
