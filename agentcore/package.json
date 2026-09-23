@@ -15,6 +15,7 @@
     "test:runtime": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime --live-stack",
     "test:runtime-chat": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-chat --live-stack",
     "test:runtime-ui": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-ui --live-stack",
+    "test:runtime-composer": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-composer --live-stack",
     "test:runtime-tool": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-tool --live-stack",
     "test:runtime-web": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-web --live-stack",
     "test:runtime-connections": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-connections --live-stack",

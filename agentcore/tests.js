@@ -295,6 +295,11 @@ export async function createLiveFixture({ stackName, profile, region }) {
     controllerUrl,
     hasGemini: Boolean(outputs.GeminiCredentialArn),
     trackChat: (agentId, sessionId) => chatSessions.add(`a_${agentId}_${sessionId}`),
+    readAgent: async (agentId) => (await db.send(new dynamodb.GetItemCommand({
+      TableName: outputs.DataTable,
+      Key: { pk: { S: `PROJECT#${sub}/main` }, sk: { S: `AGENT#${agentId}` } },
+      ConsistentRead: true,
+    }))).Item,
     readChat: async (agentId, sessionId) => memory.send(new memoryApi.ListEventsCommand({
       memoryId: outputs.MemoryArn, actorId: `${sub}/main`,
       sessionId: `a_${agentId}_${sessionId}`, includePayloads: true,
@@ -309,9 +314,9 @@ export async function createLiveFixture({ stackName, profile, region }) {
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
   const uiInvocations = [];
   const uiErrors = [];
@@ -323,7 +328,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   page.on("request", (request) => {
     if (!request.url().includes("/runtimes/")) return;
     const body = request.postDataJSON();
-    if (["runtime-ui", "runtime-connections", "runtime-web"].includes(story) && body?.command === "chat.send")
+    if (["runtime-ui", "runtime-composer", "runtime-connections", "runtime-web"].includes(story) && body?.command === "chat.send")
       fixture.trackChat(body.input.agentId, body.input.sessionId);
     uiInvocations.push({ command: body?.command, input: body?.input,
       runtimeSession: request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"] });
@@ -356,6 +361,51 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     throw new Error("Sign-in must load the workspace in one sticky Runtime invocation: " +
       JSON.stringify({ invocations: uiInvocations.map((item) => item.command),
         runtimeFailures }));
+  if (story === "runtime-composer") {
+    await page.getByRole("button", { name: "Choose an agent" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.locator("#agent-model option[value='global.openai.gpt-6-luna']")
+      .waitFor({ state: "attached" });
+    await dialog.locator("#agent-name").fill("Composer smoke");
+    await dialog.locator("#agent-model").selectOption("global.openai.gpt-6-luna");
+    await dialog.getByRole("button", { name: "Create agent" }).click();
+    await dialog.waitFor({ state: "hidden" });
+    const picker = page.getByRole("combobox", { name: "Model for this message" });
+    if (await picker.inputValue() !== "global.openai.gpt-6-luna")
+      throw new Error("Composer did not inherit the agent's saved model");
+    await picker.selectOption("global.anthropic.claude-sonnet-5");
+    const slider = page.getByRole("slider", { name: "Thinking level for this message" });
+    await slider.evaluate((input) => {
+      input.value = "0";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await page.getByText("Thinking: low").waitFor();
+    await page.getByRole("textbox", { name: "Message" }).fill("Reply OK only.");
+    if (screenshot)
+      await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-composer", document.querySelector(".composer"));
+      });
+    const sent = page.waitForRequest((request) =>
+      request.postDataJSON()?.command === "chat.send");
+    await page.getByRole("button", { name: "Send ↑" }).click();
+    const input = (await sent).postDataJSON().input;
+    if (input.modelId !== "global.anthropic.claude-sonnet-5" ||
+      input.thinkingLevel !== "low")
+      throw new Error("Composer did not send the selected model and thinking level");
+    await page.locator(".message.assistant .message-state").last()
+      .waitFor({ state: "hidden", timeout: 30000 });
+    const [agent, events, usage] = await Promise.all([
+      fixture.readAgent(input.agentId),
+      fixture.readChat(input.agentId, input.sessionId),
+      fixture.readUsage(),
+    ]);
+    if (agent?.modelId?.S !== "global.openai.gpt-6-luna" ||
+      events.events?.[0]?.payload?.[2]?.json?.content?.modelId !== input.modelId ||
+      !usage.Items?.some((row) => row.modelId?.S === input.modelId))
+      throw new Error("Composer override did not retain the agent default and meter the used model");
+    return;
+  }
   if (story === "runtime-ui") {
     const label = page.viewportSize().width < 761 ? "mobile" : "desktop";
     const firstMessage = `hello ${label}`;
@@ -591,34 +641,37 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         throw new Error("AGENTCORE_TEST_WEB requires one Bedrock AGENTCORE_TEST_MODEL");
       for (const { id: modelId } of catalog.filter((model) =>
         (selected ? model.id === selected : model.transport === "bedrock"))) {
-      const ids = await page.evaluate(async ({ url, token, modelId, toolStory }) => {
+      const defaultModelId = modelId === "global.openai.gpt-6-luna"
+        ? "global.anthropic.claude-fable-5-1" : "global.openai.gpt-6-luna";
+      const ids = await page.evaluate(async ({ url, token, defaultModelId, toolStory }) => {
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "agents.put", input: {
-          projectId: "main", name: "Full-ceiling model smoke", modelId,
-          thinkingLevel: toolStory ? "high" : "low", webSearch: toolStory,
+          projectId: "main", name: "Full-ceiling model smoke",
+          modelId: defaultModelId, webSearch: toolStory,
         } }) });
         const body = await response.json();
         if (!response.ok || !body.ok)
           throw Error(`Could not create model smoke agent: ${response.status} ${body.error?.code || ""}`);
         return { agentId: body.data.id, sessionId: crypto.randomUUID() };
-      }, { url: fixture.controllerUrl, token: accessToken, modelId, toolStory });
+      }, { url: fixture.controllerUrl, token: accessToken, defaultModelId, toolStory });
       fixture.trackChat(ids.agentId, ids.sessionId);
-      const result = await page.evaluate(async ({ url, token, ids, toolStory }) => {
+      const result = await page.evaluate(async ({ url, token, ids, modelId, toolStory }) => {
         const started = performance.now();
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
           projectId: "main", ...ids, requestId: crypto.randomUUID(),
+          modelId, thinkingLevel: toolStory ? "high" : "low",
           message: toolStory
             ? "Use web_search to find the official Amazon Bedrock AgentCore documentation, then answer with one short sentence and a source."
             : "Reply with OK only.",
         } }) });
         return { status: response.status, stream: await response.text(),
           elapsedMs: Math.round(performance.now() - started) };
-      }, { url: fixture.controllerUrl, token: accessToken, ids, toolStory });
+      }, { url: fixture.controllerUrl, token: accessToken, ids, modelId, toolStory });
       if (result.status !== 200 || !result.stream.includes('"type":"message.done"'))
         throw new Error("Real-model turn incomplete: " + result.stream.slice(-1000));
       if (toolStory && (!result.stream.includes('"name":"web_search","isError":false') ||
@@ -627,20 +680,27 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       if (modelId === "gemini-3.8-flash" &&
         result.stream.includes("output limit before producing a visible reply"))
         throw new Error("Gemini smoke used all tokens on thinking");
-      const usage = await fixture.readUsage();
-      if (!(usage.Items || []).some((row) => row.modelId?.S === modelId))
-        throw new Error("Real-model usage row missing");
+      const [usage, agent, events] = await Promise.all([
+        fixture.readUsage(), fixture.readAgent(ids.agentId),
+        fixture.readChat(ids.agentId, ids.sessionId),
+      ]);
+      if (agent?.modelId?.S !== defaultModelId ||
+        !(usage.Items || []).some((row) => row.modelId?.S === modelId) ||
+        !(events.events || []).some((event) =>
+          event.payload?.[2]?.json?.content?.modelId === modelId))
+        throw new Error("Per-turn model override changed the agent or lost attribution");
       if (modelId === "gemini-3.8-flash") {
-        const followUp = await page.evaluate(async ({ url, token, ids }) => {
+        const followUp = await page.evaluate(async ({ url, token, ids, modelId }) => {
           const response = await fetch(url, { method: "POST", headers: {
             authorization: `Bearer ${token}`, "content-type": "application/json",
             "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
           }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
             projectId: "main", ...ids, requestId: crypto.randomUUID(),
+            modelId, thinkingLevel: "low",
             message: "Reply SECOND only.",
           } }) });
           return { status: response.status, stream: await response.text() };
-        }, { url: fixture.controllerUrl, token: accessToken, ids });
+        }, { url: fixture.controllerUrl, token: accessToken, ids, modelId });
         if (followUp.status !== 200 || !followUp.stream.includes('"type":"message.done"'))
           throw new Error("Gemini follow-up incomplete: " + followUp.stream.slice(-1000));
         const events = await fixture.readChat(ids.agentId, ids.sessionId);
@@ -947,7 +1007,15 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           name: `Model config smoke ${i}`, modelId: model?.id, thinkingLevel: "low" }));
       const rejected = await call("agents.put", { projectId: "main",
         name: "Invalid thinking", modelId: model?.id, thinkingLevel: "unsupported" });
-      return { model, created, more, rejected };
+      const invalidTurn = await fetch(url, { method: "POST", headers: {
+        authorization: `Bearer ${token}`, "content-type": "application/json",
+        "x-amzn-bedrock-agentcore-runtime-session-id": `model-config-${crypto.randomUUID()}`,
+      }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+        projectId: "main", agentId: created.data?.id,
+        sessionId: crypto.randomUUID(), requestId: crypto.randomUUID(),
+        message: "Do not invoke", modelId: model?.id, thinkingLevel: "unsupported",
+      } }) });
+      return { model, created, more, rejected, invalidTurn: await invalidTurn.text() };
     }, { url: fixture.controllerUrl, token: accessToken });
     if (!configured.model || configured.model.maxOutputTokens <= 4096 ||
       configured.model.contextTokens < configured.model.maxOutputTokens ||
@@ -956,7 +1024,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       configured.more.some((item) => !item.ok) ||
       new Set([configured.created, ...configured.more].map((item) => item.data?.id)).size !== 4 ||
       "maxOutputTokens" in (configured.created?.data || {}) ||
-      configured.rejected?.error?.code !== "VALIDATION_FAILED")
+      configured.rejected?.error?.code !== "VALIDATION_FAILED" ||
+      !configured.invalidTurn.includes('"code":"VALIDATION_FAILED"'))
       throw new Error("Model catalog/config contract failed: " +
         JSON.stringify(configured).slice(0, 1200));
     return;

@@ -113,6 +113,13 @@ async function approvedModel(modelId) {
     Number.isSafeInteger(model.outputRate) ? model : null;
 }
 
+const modelCatalog = () => [
+  ...(process.env.SCRIPTED_MODEL === "true" ? [scriptedModel] : []),
+  ...suggestedModels.map((model) => ({ ...model,
+    active: model.transport === "bedrock" ||
+      (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER)) })),
+];
+
 async function listAgents(identity) {
   const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
     KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
@@ -285,7 +292,8 @@ async function invoke(body, identity) {
       getSession(identity), listAgents(identity), listConversations(identity),
     ]);
     return { status: 200, data: { ok: true,
-      data: { session, agents, conversations: conversations.data.data } } };
+      data: { session, agents, models: modelCatalog(),
+        conversations: conversations.data.data } } };
   }
   if (body.command === "conversations.list") {
     if (body.input.projectId !== "main")
@@ -470,12 +478,7 @@ async function invoke(body, identity) {
         ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null } } };
   }
   if (body.command === "models.list") {
-    const items = suggestedModels.map((model) =>
-      ({ ...model, active: model.transport === "bedrock" ||
-        (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER)) }));
-    if (process.env.SCRIPTED_MODEL === "true")
-      items.unshift(scriptedModel);
-    return { status: 200, data: { ok: true, data: { items } } };
+    return { status: 200, data: { ok: true, data: { items: modelCatalog() } } };
   }
   const admin = identity.role === "Administrators";
   if (["users.list", "users.invite", "users.setLimits", "defaults.get", "defaults.set"].includes(body.command) && !admin)
@@ -991,6 +994,7 @@ function rejectChat(response, code) {
     CONNECTION_REVOKED: "A granted connection was removed. Edit this agent before sending again.",
     BUDGET_EXHAUSTED: "Your current budget is exhausted.",
     MODEL_UNAVAILABLE: "This agent's model is unavailable.",
+    TOOL_UNAVAILABLE: "This model cannot use the agent's enabled tools.",
     REQUEST_ALREADY_COMPLETED: "This request was already completed.",
     FORBIDDEN: "This account cannot send messages.",
     NOT_FOUND: "This agent was not found.",
@@ -1002,11 +1006,13 @@ function rejectChat(response, code) {
 }
 
 async function chat(input, identity, response, workloadToken) {
-  const { projectId, agentId, sessionId, requestId, message } = input;
+  const { projectId, agentId, sessionId, requestId, message, modelId, thinkingLevel } = input;
   const uuid = /^[0-9a-f-]{36}$/i;
   if (projectId !== "main" || !uuid.test(agentId || "") ||
     !uuid.test(sessionId || "") || !uuid.test(requestId || "") ||
-    typeof message !== "string" || !message.trim() || message.length > 20000)
+    typeof message !== "string" || !message.trim() || message.length > 20000 ||
+    (modelId !== undefined && (typeof modelId !== "string" || modelId.length > 512)) ||
+    (thinkingLevel !== undefined && typeof thinkingLevel !== "string"))
     return rejectChat(response, "VALIDATION_FAILED");
   if (identity.role === "Auditors")
     return rejectChat(response, "FORBIDDEN");
@@ -1025,13 +1031,26 @@ async function chat(input, identity, response, workloadToken) {
   if (prior.Item)
     return rejectChat(response, "REQUEST_ALREADY_COMPLETED");
   const period = periodKey(defaultsRow.period);
+  const turnModelId = modelId ?? config.modelId;
   const [model, spent] = await Promise.all([
-    approvedModel(config.modelId),
+    approvedModel(turnModelId),
     db.send(new GetItemCommand({ TableName: process.env.TABLE,
       Key: key(`USER#${identity.sub}`, period), ConsistentRead: true })),
   ]);
   if (!model)
     return rejectChat(response, "MODEL_UNAVAILABLE");
+  const savedLevel = turnModelId === config.modelId &&
+    model.thinkingLevels.includes(config.thinkingLevel)
+    ? config.thinkingLevel : model.defaultThinkingLevel;
+  const turnThinkingLevel = thinkingLevel ?? savedLevel;
+  if (model.thinkingLevels.length
+    ? !model.thinkingLevels.includes(turnThinkingLevel)
+    : thinkingLevel !== undefined)
+    return rejectChat(response, "VALIDATION_FAILED");
+  if (model.transport === "gemini" &&
+    (config.codeInterpreter || config.webSearch || config.browser))
+    return rejectChat(response, "TOOL_UNAVAILABLE");
+  const turnConfig = { ...config, modelId: turnModelId, thinkingLevel: turnThinkingLevel };
   if (config.connectionIds?.length) {
     const current = (await credentials(identity)).items;
     if (config.connectionIds.some((id) => !current[id]))
@@ -1059,13 +1078,13 @@ async function chat(input, identity, response, workloadToken) {
   const emit = (event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
   const started = Date.now();
   try {
-    const result = await runModel(config, model, messages, emit, workloadToken,
+    const result = await runModel(turnConfig, model, messages, emit, workloadToken,
       { sub: identity.sub, projectId, agentId, sessionId,
         connectionIds: config.connectionIds || [] });
     const costMicroUsd = modelCost(result.usage, model);
     const occurredAt = new Date().toISOString();
     const receipt = { version: 1, requestId, agentId, conversationId: sessionId,
-      modelId: config.modelId, occurredAt, usage: result.usage, costMicroUsd,
+      modelId: turnModelId, occurredAt, usage: result.usage, costMicroUsd,
       rates: { inputRate: model.inputRate || 0, outputRate: model.outputRate || 0,
         cacheReadRate: model.cacheReadRate || 0, cacheWriteRate: model.cacheWriteRate || 0 },
       pricingQuality: model.pricingQuality || "unknown",
@@ -1088,7 +1107,7 @@ async function chat(input, identity, response, workloadToken) {
         Item: { pk: S(`USER#${identity.sub}`), sk: S(`USAGE#${occurredAt}#${requestId}`),
           gsi1pk: S("USAGE"), gsi1sk: S(`${occurredAt}#${identity.sub}#${requestId}`),
           occurredAt: S(occurredAt), userSub: S(identity.sub), requestId: S(requestId),
-          agentId: S(agentId), modelId: S(config.modelId), costMicroUsd: N(costMicroUsd),
+          agentId: S(agentId), modelId: S(turnModelId), costMicroUsd: N(costMicroUsd),
           inputTokens: N(result.usage.inputTokens), outputTokens: N(result.usage.outputTokens),
           cacheReadInputTokens: N(result.usage.cacheReadInputTokens || 0),
           cacheWriteInputTokens: N(result.usage.cacheWriteInputTokens || 0),
