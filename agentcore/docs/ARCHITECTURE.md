@@ -1,6 +1,6 @@
-# AgentCore Chat: Runtime-only product plan
+# AgentCore Chat: Runtime-only architecture
 
-Status: authoritative plan and implementation map, 2026-09-23. The old PLAN, API-CONTRACT, IMPLEMENTATION, USAGE-RESOURCES, RUNTIME-DECISION, and STATUS documents record earlier explorations; where they conflict, this document and the current code win. "Implemented" below means exercised in a disposable live AWS stack. "Planned" is not a claim of availability.
+Status: authoritative current architecture and implementation map, 2026-09-23. [PRODUCT-ROADMAP.md](PRODUCT-ROADMAP.md) owns the remaining product work and acceptance gates. The old PLAN, API-CONTRACT, IMPLEMENTATION, USAGE-RESOURCES, RUNTIME-DECISION, and STATUS documents record earlier explorations; where they conflict, this document and the current code win. "Implemented" below means exercised in a disposable live AWS stack. "Planned" is not a claim of availability.
 
 ## Product in one sentence
 
@@ -85,12 +85,7 @@ Skills are versioned text/object manifests scoped to user/project/agent with byt
 
 ## Remaining work in dependency order
 
-1. Finish current Runtime slice: reject malformed control bodies, test all group permissions and budget exhaustion live, check event/cursor pagination and error behavior, ensure Memory/ledger failure reconciliation, and confirm production Bedrock model access with an approved model and a small paid smoke turn. The present live suite intentionally mocks inference only.
-2. Make configurable projects and agent lifecycle complete: project create/list/rename/archive, memberships or explicit single-owner policy, agent edit/archive, model catalog version/region/price revision, authorization regression tests. Keep agent ID separate from actor ID.
-3. Complete cost coverage and enforcement: use official per-service meters where available, per-tool/service rows, storage accounting, usage reconciliation, budget presentation and alerts, and a correction record rather than mutating historical facts. Expose user and admin per-request/tool time views with pagination and cumulative summaries.
-4. Implement credential vault and Gateway target lifecycle, tested against real disposable service resources; add Cedar permissions and scope tagging/filtering. Build one narrow Jira or equivalent integration before generalizing the UI. Add secure Code Interpreter access only after a concrete ephemeral credential design.
-5. Add skills and shared-bucket object flows; add a real Browser tool story. Keep each modal projection driven by the Runtime API. Add CloudFormation deployment-admin mode only after live CORS/auth testing; CLI bootstrap remains a supported minimal path.
-6. Finish production readiness: access/logging review, retention and deletion policy, multi-user isolation tests, benchmarks, native tool cost policy, accessibility and visual pass, GitHub Pages origin smoke test, documented rollback/cleanup. Keep tests quick by reusing one disposable stack, using test.js stories and _screenshot for DOM-node/full-page visual inspection, cleaning every fixture in finally.
+The ordered product work, planned API changes, UI contract, concrete acceptance stories, live development loop, and review of failure scenarios now live in [PRODUCT-ROADMAP.md](PRODUCT-ROADMAP.md). The immediate sequence is: fix real-model onboarding blockers; make conversations reopenable and the stream state truthful; complete model approval; make admin/usage trustworthy; then add projects, a narrow secure integration, skills/Browser/storage enforcement, and optional browser deployment administration. Do not treat the presence of a dialog or AWS resource as proof that the associated capability is available.
 
 ## Development loop and live evidence
 
