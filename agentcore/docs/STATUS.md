@@ -1,5 +1,7 @@
 # AgentCore Chat: implemented slice and development loop
 
+> Superseded status snapshot. [ARCHITECTURE.md](./ARCHITECTURE.md) is the authoritative implementation map and development loop; the Lambda/Harness status below is no longer current.
+
 Updated 2026-09-22. This is the implementation ledger; [PLAN.md](./PLAN.md), [API-CONTRACT.md](./API-CONTRACT.md), and [USAGE-RESOURCES.md](./USAGE-RESOURCES.md) describe the target product, not a claim that every route exists today.
 
 The backend target changed after a live CORS preflight and SDK review: [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) chooses one JWT-protected AgentCore CodeZip Runtime for deterministic application control, while managed Harnesses remain the chat workers. **The published app still uses Lambda/API Gateway; Runtime parity and migration are not complete.** `controller.js` is an isolated migration slice with only `/ping` and `session.get`; `npm run build:controller` bundles it into a single Linux-readable, content-addressed ZIP under `.artifacts/` using dev-only `esbuild` and `fflate`. `template.yaml` conditionally creates a CloudFormation-owned Runtime when `ControllerCodeKey` names that ZIP in the shared bucket; the default remains the existing Lambda path.

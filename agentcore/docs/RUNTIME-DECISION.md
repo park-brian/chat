@@ -1,5 +1,7 @@
 # Why the application backend should be an AgentCore CodeZip Runtime
 
+> Superseded decision record. The team subsequently chose Runtime-only, with a direct Bedrock Converse loop and no managed Harness. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the current rationale and implementation.
+
 Decision (2026-09-22): replace the foundation's Lambda/API Gateway broker with **one small, deterministic AgentCore Runtime**, deployed as a Node.js 22 ZIP from the existing shared S3 bucket. Keep **one managed Harness per durable agent** for chat. A Harness is the agent loop; the Runtime is the product control boundary. This is the target architecture, **not yet the deployed implementation**. [STATUS.md](./STATUS.md) records what actually works today.
 
 ## Why not call the Harness directly for everything?

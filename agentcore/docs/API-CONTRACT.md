@@ -1,5 +1,7 @@
 # AgentCore Chat application API contract
 
+> Historical target contract. The authoritative implemented commands and Runtime-only API boundary are in [ARCHITECTURE.md](./ARCHITECTURE.md) and controller.js. Lambda/API Gateway/Harness routes below are superseded.
+
 **Backend amendment (2026-09-22):** [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) supersedes the Lambda/API Gateway transport described below. The command names and authorization/accounting invariants remain the target; the new transport is `POST /invocations` on a JWT-protected AgentCore CodeZip Runtime. Secret-body and streaming behavior must be reverified there before migration.
 
 Status: target contract; [STATUS.md](./STATUS.md) lists implemented commands and routes

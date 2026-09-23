@@ -1,5 +1,7 @@
 # AgentCore Chat: implementation and test runbook
 
+> Historical runbook. Use [ARCHITECTURE.md](./ARCHITECTURE.md) for current Runtime-only deployment, tests, status, and roadmap. Commands below may describe removed Lambda/Harness resources.
+
 **Backend amendment (2026-09-22):** Follow [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) for the CodeZip Runtime migration. Lambda/API Gateway steps below document the currently deployed slice and prior live evidence, not the final backend topology.
 
 Status: roadmap/runbook; [STATUS.md](./STATUS.md) has current commands and live results

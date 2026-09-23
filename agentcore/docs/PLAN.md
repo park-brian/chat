@@ -1,5 +1,7 @@
 # AgentCore Chat: implementation plan
 
+> Historical design exploration. The authoritative Runtime-only product plan and current implementation map are in [ARCHITECTURE.md](./ARCHITECTURE.md). This document includes superseded Harness/Lambda proposals and must not be used as a current runbook.
+
 **Backend amendment (2026-09-22):** [RUNTIME-DECISION.md](./RUNTIME-DECISION.md) supersedes this plan's Lambda/API Gateway backend topology. The product contract and AWS resource ownership remain, but the target trusted boundary is one AgentCore CodeZip Runtime. Existing Lambda-specific passages below are migration history until rewritten. [STATUS.md](./STATUS.md) distinguishes deployed behavior from the target.
 
 Status: target architecture; [STATUS.md](./STATUS.md) records the implemented, live-verified slice

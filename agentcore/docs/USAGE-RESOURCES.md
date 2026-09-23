@@ -1,5 +1,7 @@
 # Usage, budgets, and user-resource accounting
 
+> Historical detailed design. [ARCHITECTURE.md](./ARCHITECTURE.md) distinguishes implemented model-only metering from planned full-cost and storage accounting. Treat future-tense claims below as proposals, not shipping behavior.
+
 Status: normative target design, not yet an implemented meter or quota gate; see [STATUS.md](./STATUS.md)
 Audience: product, frontend, broker, Harness, CloudFormation, and test authors
 Related contracts: [PLAN.md](./PLAN.md), [API-CONTRACT.md](./API-CONTRACT.md), [IMPLEMENTATION.md](./IMPLEMENTATION.md)
