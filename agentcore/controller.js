@@ -31,7 +31,7 @@ import {
 
 const scriptedModel = { id: "test.echo", name: "Scripted echo (test only)",
   transport: "scripted", contextTokens: 1000000, maxOutputTokens: 128000,
-  thinkingLevels: [], active: true };
+  thinkingLevels: [], browserTool: true, active: true };
 const idp = new CognitoIdentityProviderClient({});
 const db = new DynamoDBClient({});
 const memory = new BedrockAgentCoreClient({});
@@ -363,7 +363,8 @@ async function invoke(body, identity) {
       ? !model.thinkingLevels.includes(selectedThinkingLevel)
       : thinkingLevel !== undefined)
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    if (model.transport === "gemini" && (codeInterpreter || webSearch || browser))
+    if ((model.transport === "gemini" && (codeInterpreter || webSearch || browser)) ||
+      (browser && !model.browserTool))
       return { status: 400, data: { ok: false, error: { code: "TOOL_UNAVAILABLE" } } };
     if (connectionIds.length) {
       const saved = (await credentials(identity)).items;
@@ -726,10 +727,20 @@ async function searchWeb(query, maxResults) {
 }
 
 const browserId = "aws.browser.v1";
+async function browserSend(command) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await memory.send(command);
+    } catch (error) {
+      if (error.name !== "ConflictException" || attempt === 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+    }
+  }
+}
 async function browserAction(sessionId, input) {
   const { action } = input;
   const invoke = async (operation) => {
-    const result = (await memory.send(new InvokeBrowserCommand({
+    const result = (await browserSend(new InvokeBrowserCommand({
       browserIdentifier: browserId, sessionId, action: operation,
     }))).result;
     const part = Object.values(result || {})[0];
@@ -747,7 +758,8 @@ async function browserAction(sessionId, input) {
     await invoke({ keyType: { text: url.href } });
     await invoke({ keyPress: { key: "enter" } });
   } else if (action === "click") {
-    if (![input.x, input.y].every((n) => Number.isInteger(n) && n >= 0 && n <= 2000))
+    if (!Number.isInteger(input.x) || input.x < 2 || input.x > 997 ||
+      !Number.isInteger(input.y) || input.y < 2 || input.y > 697)
       throw Error("Invalid browser coordinates");
     await invoke({ mouseClick: { x: input.x, y: input.y } });
   } else if (action === "type") {
@@ -926,9 +938,10 @@ async function runModel(config, model, messages, emit, workloadToken, scope) {
               for (const { url, title } of result.sources) sources.set(url, title);
               content = [{ text: result.text }];
             } else {
-              if (!browserSession) browserSession = (await memory.send(
+              if (!browserSession) browserSession = (await browserSend(
                 new StartBrowserSessionCommand({ browserIdentifier: browserId,
                   name: `chat-${uuid().slice(0, 8)}`,
+                  clientToken: uuid(),
                   sessionTimeoutSeconds: config.browserSessionSeconds || 300,
                   viewPort: { width: 1000, height: 700 } }))).sessionId;
               content = await browserAction(browserSession, tool.input);
@@ -980,7 +993,7 @@ for _name in ${JSON.stringify(envNames)}:
     }
     throw Error("Agent turn limit reached");
   } finally {
-    if (browserSession) await memory.send(new StopBrowserSessionCommand({
+    if (browserSession) await browserSend(new StopBrowserSessionCommand({
       browserIdentifier: browserId, sessionId: browserSession,
     })).catch(() => console.error("Could not stop Browser session"));
     if (toolSession) await memory.send(new StopCodeInterpreterSessionCommand({
@@ -1047,8 +1060,9 @@ async function chat(input, identity, response, workloadToken) {
     ? !model.thinkingLevels.includes(turnThinkingLevel)
     : thinkingLevel !== undefined)
     return rejectChat(response, "VALIDATION_FAILED");
-  if (model.transport === "gemini" &&
-    (config.codeInterpreter || config.webSearch || config.browser))
+  if ((model.transport === "gemini" &&
+    (config.codeInterpreter || config.webSearch || config.browser)) ||
+    (config.browser && !model.browserTool))
     return rejectChat(response, "TOOL_UNAVAILABLE");
   const turnConfig = { ...config, modelId: turnModelId, thinkingLevel: turnThinkingLevel };
   if (config.connectionIds?.length) {

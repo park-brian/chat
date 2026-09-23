@@ -28,6 +28,7 @@ for (const model of models) {
   assert.ok(Array.isArray(model.thinkingLevels) && model.thinkingLevels.length);
   assert.equal(new Set(model.thinkingLevels).size, model.thinkingLevels.length);
   assert.ok(model.thinkingLevels.includes(model.defaultThinkingLevel));
+  assert.equal(model.browserTool, model.company === "Anthropic");
   if (model.transport === "bedrock") {
     assert.equal(validModelId(model.id, region, account), true);
     for (const rate of ["inputRate", "outputRate", "cacheReadRate", "cacheWriteRate"])

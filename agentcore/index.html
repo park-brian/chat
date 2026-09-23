@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-jmWCeZdAP5SU+8rgcPNNL6sqLMMBwcYLlmldNmgyCB2v/3uzacMQCBsR4KrTNRkn' https://cdn.jsdelivr.net; style-src 'sha384-6gtzCXm/dOos6Ceb/92xliWcB8y9NP1IU7F5COe/zUddPYRSaGZ+U4zCmC+GvtRQ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-kiMZFJVZajA6pIbCC8yO22+MolJJx6QJCDgOeDzxNhb763eyiKa9BGVPs5ZUjg+S' https://cdn.jsdelivr.net; style-src 'sha384-6gtzCXm/dOos6Ceb/92xliWcB8y9NP1IU7F5COe/zUddPYRSaGZ+U4zCmC+GvtRQ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -1030,6 +1030,7 @@
       const [selectedAgent, setSelectedAgent] = createSignal(null);
       const [composerChoice, setComposerChoice] = createSignal(null);
       const modelAllowed = (model, agent) => model.active &&
+        !(agent?.browser && !model.browserTool) &&
         !(model.transport === "gemini" &&
           (agent?.codeInterpreter || agent?.webSearch || agent?.browser));
       const composerModel = () => {
@@ -1686,7 +1687,8 @@
                 onChange=${(event) => {
                   setDraftModelId(event.currentTarget.value);
                   for (const tool of event.currentTarget.form.querySelectorAll("[data-model-tool]")) {
-                    tool.disabled = chosenModel()?.transport === "gemini";
+                    tool.disabled = chosenModel()?.transport === "gemini" ||
+                      (tool.name === "browser" && !chosenModel()?.browserTool);
                     if (tool.disabled) tool.checked = false;
                   }
                 }}>
@@ -1722,9 +1724,9 @@
                 <input id="agent-search-results" name="webSearchMaxResults" type="number" min="1" max="25"
                   value=${() => editingAgent()?.webSearchMaxResults || 5} required /></div>
               <div class="field"><label class="check"><input type="checkbox" name="browser" data-model-tool
-                disabled=${() => chosenModel()?.transport === "gemini"}
+                disabled=${() => !chosenModel()?.browserTool}
                 checked=${() => Boolean(editingAgent()?.browser)} /> Enable browser</label>
-                <p class="help">An isolated public browser with visual navigation and screenshots. No site logins or saved browser profile. Sessions stop after each turn.</p>
+                <p class="help">Visual browsing needs a Claude model; GPT-6 can use Web Search instead. The isolated browser has no site logins or saved profile and stops after each turn.</p>
                 <label for="agent-browser-timeout">Session timeout (seconds)</label>
                 <input id="agent-browser-timeout" name="browserSessionSeconds" type="number" min="60" max="900"
                   value=${() => editingAgent()?.browserSessionSeconds || 300} required /></div>
@@ -1993,6 +1995,9 @@
                   disabled=${() => !selectedAgent() || sending() || loadingConversation() ||
                     uncertainConversationId() === conversationId()}
                 ></textarea>
+                <${Show} when=${() => selectedAgent()?.browser && !composerModel()?.browserTool}>
+                  <p class="help">Visual browsing needs Claude. Choose a Claude model before sending, or disable Browser in the agent settings.</p>
+                <//>
                 <div class="composer-foot">
                   <${Show} when=${selectedAgent}
                     fallback=${html`<span class="hint">AgentCore handles memory, tools and execution</span>`}>
@@ -2009,7 +2014,9 @@
                               modelCompany(model) === company)}>
                               ${(model) => html`<option value=${model.id}
                                 disabled=${() => !modelAllowed(model, selectedAgent())}
-                                selected=${() => composerModel()?.id === model.id}>${model.name}</option>`}<//>
+                                selected=${() => composerModel()?.id === model.id}>${() =>
+                                  model.name + (selectedAgent()?.browser && !model.browserTool
+                                    ? " · no visual browser" : "")}</option>`}<//>
                           </optgroup>`}<//>
                       </select>
                       <${Show} when=${() => composerModel()?.thinkingLevels?.length}>

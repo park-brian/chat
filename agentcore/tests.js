@@ -294,6 +294,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
     readUserControl,
     controllerUrl,
     hasGemini: Boolean(outputs.GeminiCredentialArn),
+    hasScriptedModel: parameters.EnableScriptedModel === "true",
     trackChat: (agentId, sessionId) => chatSessions.add(`a_${agentId}_${sessionId}`),
     readAgent: async (agentId) => (await db.send(new dynamodb.GetItemCommand({
       TableName: outputs.DataTable,
@@ -407,6 +408,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     return;
   }
   if (story === "runtime-ui") {
+    if (!fixture.hasScriptedModel)
+      throw new Error("runtime-ui requires a disposable stack with EnableScriptedModel=true");
     const label = page.viewportSize().width < 761 ? "mobile" : "desktop";
     const firstMessage = `hello ${label}`;
     const secondMessage = `second ${label}`;
@@ -447,6 +450,10 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         if (!(await dialog.locator(`input[name="${name}"]`).isDisabled()))
           throw new Error("Gemini cannot offer an unimplemented managed-tool bridge");
     }
+    await dialog.locator("#agent-model").selectOption("global.openai.gpt-6-luna");
+    if (!(await dialog.locator('input[name="browser"]').isDisabled()) ||
+      (await dialog.locator('input[name="webSearch"]').isDisabled()))
+      throw new Error("GPT-6 must offer Web Search but not screenshot-based Browser");
     if (screenshot)
       await page.evaluate(async () => {
         const { _screenshot } = await import("./tests.js");
@@ -634,49 +641,65 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       const catalog = (await import("./models.json", { with: { type: "json" } })).default;
       const selected = process.env.AGENTCORE_TEST_MODEL;
       const toolStory = process.env.AGENTCORE_TEST_WEB === "1";
+      const browserStory = process.env.AGENTCORE_TEST_BROWSER === "1";
       if (selected && !catalog.some((model) =>
         ["bedrock", "gemini"].includes(model.transport) && model.id === selected))
         throw new Error("AGENTCORE_TEST_MODEL must name a checked-in live model");
       if (toolStory && (!selected || selected.startsWith("gemini-")))
         throw new Error("AGENTCORE_TEST_WEB requires one Bedrock AGENTCORE_TEST_MODEL");
+      if (browserStory && (!selected ||
+        !catalog.find((model) => model.id === selected)?.browserTool || toolStory))
+        throw new Error("AGENTCORE_TEST_BROWSER requires one Browser-compatible AGENTCORE_TEST_MODEL");
       for (const { id: modelId } of catalog.filter((model) =>
         (selected ? model.id === selected : model.transport === "bedrock"))) {
-      const defaultModelId = modelId === "global.openai.gpt-6-luna"
-        ? "global.anthropic.claude-fable-5-1" : "global.openai.gpt-6-luna";
-      const ids = await page.evaluate(async ({ url, token, defaultModelId, toolStory }) => {
+      const defaultModelId = browserStory
+        ? "global.anthropic.claude-fable-5-1"
+        : modelId === "global.openai.gpt-6-luna"
+          ? "global.anthropic.claude-fable-5-1" : "global.openai.gpt-6-luna";
+      const ids = await page.evaluate(async ({ url, token, defaultModelId, toolStory, browserStory }) => {
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "agents.put", input: {
           projectId: "main", name: "Full-ceiling model smoke",
-          modelId: defaultModelId, webSearch: toolStory,
+          modelId: defaultModelId, webSearch: toolStory, browser: browserStory,
         } }) });
         const body = await response.json();
         if (!response.ok || !body.ok)
           throw Error(`Could not create model smoke agent: ${response.status} ${body.error?.code || ""}`);
         return { agentId: body.data.id, sessionId: crypto.randomUUID() };
-      }, { url: fixture.controllerUrl, token: accessToken, defaultModelId, toolStory });
+      }, { url: fixture.controllerUrl, token: accessToken, defaultModelId, toolStory, browserStory });
       fixture.trackChat(ids.agentId, ids.sessionId);
-      const result = await page.evaluate(async ({ url, token, ids, modelId, toolStory }) => {
+      const result = await page.evaluate(async ({ url, token, ids, modelId, toolStory, browserStory }) => {
         const started = performance.now();
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
           projectId: "main", ...ids, requestId: crypto.randomUUID(),
-          modelId, thinkingLevel: toolStory ? "high" : "low",
+          modelId, thinkingLevel: toolStory || browserStory ? "high" : "low",
           message: toolStory
             ? "Use web_search to find the official Amazon Bedrock AgentCore documentation, then answer with one short sentence and a source."
+            : browserStory
+            ? "Use the browser tool to navigate to https://example.com/ and tell me the visible page title in one sentence."
             : "Reply with OK only.",
         } }) });
         return { status: response.status, stream: await response.text(),
           elapsedMs: Math.round(performance.now() - started) };
-      }, { url: fixture.controllerUrl, token: accessToken, ids, modelId, toolStory });
+      }, { url: fixture.controllerUrl, token: accessToken, ids, modelId, toolStory, browserStory });
       if (result.status !== 200 || !result.stream.includes('"type":"message.done"'))
         throw new Error("Real-model turn incomplete: " + result.stream.slice(-1000));
       if (toolStory && (!result.stream.includes('"name":"web_search","isError":false') ||
         !result.stream.includes("Sources:")))
         throw new Error("Real-model tool continuation incomplete: " + result.stream.slice(-1200));
+      const visibleText = result.stream.split("\n\n")
+        .filter((chunk) => chunk.startsWith("data: "))
+        .map((chunk) => JSON.parse(chunk.slice(6)))
+        .filter((event) => event.type === "message.delta")
+        .map((event) => event.text).join("");
+      if (browserStory && (!result.stream.includes('"name":"browser","isError":false') ||
+        !/Example Domain/i.test(visibleText)))
+        throw new Error("Real-model Browser continuation incomplete: " + result.stream.slice(-1600));
       if (modelId === "gemini-3.8-flash" &&
         result.stream.includes("output limit before producing a visible reply"))
         throw new Error("Gemini smoke used all tokens on thinking");
@@ -1007,6 +1030,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           name: `Model config smoke ${i}`, modelId: model?.id, thinkingLevel: "low" }));
       const rejected = await call("agents.put", { projectId: "main",
         name: "Invalid thinking", modelId: model?.id, thinkingLevel: "unsupported" });
+      const rejectedBrowser = await call("agents.put", { projectId: "main",
+        name: "Invalid visual browser", modelId: model?.id, browser: true });
       const invalidTurn = await fetch(url, { method: "POST", headers: {
         authorization: `Bearer ${token}`, "content-type": "application/json",
         "x-amzn-bedrock-agentcore-runtime-session-id": `model-config-${crypto.randomUUID()}`,
@@ -1015,7 +1040,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         sessionId: crypto.randomUUID(), requestId: crypto.randomUUID(),
         message: "Do not invoke", modelId: model?.id, thinkingLevel: "unsupported",
       } }) });
-      return { model, created, more, rejected, invalidTurn: await invalidTurn.text() };
+      return { model, created, more, rejected, rejectedBrowser,
+        invalidTurn: await invalidTurn.text() };
     }, { url: fixture.controllerUrl, token: accessToken });
     if (!configured.model || configured.model.maxOutputTokens <= 4096 ||
       configured.model.contextTokens < configured.model.maxOutputTokens ||
@@ -1025,6 +1051,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       new Set([configured.created, ...configured.more].map((item) => item.data?.id)).size !== 4 ||
       "maxOutputTokens" in (configured.created?.data || {}) ||
       configured.rejected?.error?.code !== "VALIDATION_FAILED" ||
+      configured.rejectedBrowser?.error?.code !== "TOOL_UNAVAILABLE" ||
       !configured.invalidTurn.includes('"code":"VALIDATION_FAILED"'))
       throw new Error("Model catalog/config contract failed: " +
         JSON.stringify(configured).slice(0, 1200));
@@ -1093,6 +1120,9 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   if (!(await thinking.locator('option[value="max"]').count()) ||
     (await thinking.inputValue()) !== "medium")
     throw new Error("OpenAI model thinking choices were not loaded from the catalog");
+  if (!(await page.getByRole("dialog").locator('input[name="browser"]').isDisabled()) ||
+    (await page.getByRole("dialog").locator('input[name="webSearch"]').isDisabled()))
+    throw new Error("GPT-6 must offer Web Search without unsupported visual Browser");
   if (screenshot) {
     await thinking.scrollIntoViewIfNeeded();
     await page.evaluate(async () => {
