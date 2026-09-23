@@ -56,10 +56,10 @@ export async function runTests(api) {
             client: "client",
             scope: "chat-api/access",
             domain: "https://example.com",
-            api: "https://evil.example/rpc",
+            runtime: "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/evil",
           }) !== null
         )
-          throw new Error("Non-AWS token destination accepted");
+          throw new Error("Cross-region Runtime destination accepted");
       },
     ],
     [
@@ -162,12 +162,14 @@ export async function createLiveFixture({ stackName, profile, region }) {
     cloudformation,
     cognito,
     dynamodb,
+    memoryApi,
     { randomUUID, randomBytes },
   ] = await Promise.all([
     import("@aws-sdk/credential-providers"),
     import("@aws-sdk/client-cloudformation"),
     import("@aws-sdk/client-cognito-identity-provider"),
     import("@aws-sdk/client-dynamodb"),
+    import("@aws-sdk/client-bedrock-agentcore"),
     import("node:crypto"),
   ]);
   const credentials = fromIni({ profile });
@@ -177,6 +179,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
     credentials,
   });
   const db = new dynamodb.DynamoDBClient({ region, credentials });
+  const memory = new memoryApi.BedrockAgentCoreClient({ region, credentials });
   const result = await cf.send(
     new cloudformation.DescribeStacksCommand({ StackName: stackName }),
   );
@@ -204,21 +207,35 @@ export async function createLiveFixture({ stackName, profile, region }) {
   entry.pathname = local.pathname;
   let created = false;
   let sub;
+  const chatSessions = [];
   const cleanup = async () => {
+    if (sub) {
+      for (const sessionId of chatSessions) {
+        const scope = { memoryId: outputs.MemoryArn, actorId: `${sub}/main`, sessionId };
+        const page = await memory.send(new memoryApi.ListEventsCommand(scope));
+        for (const event of page.events || [])
+          await memory.send(new memoryApi.DeleteEventCommand({ ...scope, eventId: event.eventId }));
+      }
+      for (const pk of [`USER#${sub}`, `PROJECT#${sub}/main`]) {
+        let nextToken;
+        do {
+          const page = await db.send(new dynamodb.QueryCommand({
+            TableName: outputs.DataTable,
+            KeyConditionExpression: "pk = :pk",
+            ExpressionAttributeValues: { ":pk": { S: pk } },
+            ExclusiveStartKey: nextToken,
+          }));
+          for (const item of page.Items || [])
+            await db.send(new dynamodb.DeleteItemCommand({
+              TableName: outputs.DataTable,
+              Key: { pk: item.pk, sk: item.sk },
+            }));
+          nextToken = page.LastEvaluatedKey;
+        } while (nextToken);
+      }
+    }
     if (created)
-      await idp.send(
-        new cognito.AdminDeleteUserCommand({
-          UserPoolId: pool,
-          Username: email,
-        }),
-      );
-    if (sub)
-      await db.send(
-        new dynamodb.DeleteItemCommand({
-          TableName: outputs.DataTable,
-          Key: { pk: { S: "USER#" + sub }, sk: { S: "CONTROL" } },
-        }),
-      );
+      await idp.send(new cognito.AdminDeleteUserCommand({ UserPoolId: pool, Username: email }));
   };
   try {
     const createdUser = await idp.send(
@@ -275,16 +292,28 @@ export async function createLiveFixture({ stackName, profile, region }) {
     cleanup,
     readUserControl,
     controllerUrl,
+    apiUrl: outputs.ApiUrl ? outputs.ApiUrl + "/rpc" : null,
+    trackChat: (agentId, sessionId) => chatSessions.push(`a_${agentId}_${sessionId}`),
+    readChat: async (agentId, sessionId) => memory.send(new memoryApi.ListEventsCommand({
+      memoryId: outputs.MemoryArn, actorId: `${sub}/main`,
+      sessionId: `a_${agentId}_${sessionId}`, includePayloads: true,
+    })),
+    readUsage: async () => db.send(new dynamodb.QueryCommand({
+      TableName: outputs.DataTable,
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :usage)",
+      ExpressionAttributeValues: { ":pk": { S: `USER#${sub}` }, ":usage": { S: "USAGE#" } },
+      ConsistentRead: true,
+    })),
   };
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (story === "runtime" && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
   const tokenResponse =
-    story === "runtime"
+    ["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story)
       ? page.waitForResponse((response) =>
           response.url().includes("/oauth2/token"),
         )
@@ -298,9 +327,161 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .first()
     .click();
   await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
-  if (story === "runtime") {
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
+    if (story === "runtime-benchmark") {
+      const sample = await page.evaluate(async ({ runtimeUrl, apiUrl, token }) => {
+        const runtimeSession = `bench-${crypto.randomUUID()}`;
+        const call = async (url, command, input) => {
+          const start = performance.now();
+          const response = await fetch(url, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            ...(url === runtimeUrl && { "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession }),
+          }, body: JSON.stringify({ v: 1, command, input }) });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw Error(`${command}: ${response.status}`);
+          return { ms: performance.now() - start, data: data.data };
+        };
+        const coldRuntimeMs = (await call(runtimeUrl, "session.get", {})).ms;
+        if (apiUrl) await call(apiUrl, "session.get", {});
+        const controls = { runtime: [], lambda: [] };
+        for (let i = 0; i < 8; i++) {
+          controls.runtime.push((await call(runtimeUrl, "session.get", {})).ms);
+          if (apiUrl) controls.lambda.push((await call(apiUrl, "session.get", {})).ms);
+        }
+        const agentId = (await call(runtimeUrl, "agents.put", {
+          projectId: "main", name: "Benchmark agent", modelId: "test.echo",
+        })).data.id;
+        const sessionId = crypto.randomUUID();
+        const chat = [];
+        for (let i = 0; i < 5; i++) {
+          const start = performance.now();
+          const response = await fetch(runtimeUrl, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
+          }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            projectId: "main", agentId, sessionId, requestId: crypto.randomUUID(), message: `turn ${i}`,
+          } }) });
+          if (!response.ok || !response.body) throw Error(`chat.send: ${response.status}`);
+          const reader = response.body.getReader();
+          const first = await reader.read();
+          const firstChunkMs = performance.now() - start;
+          let text = new TextDecoder().decode(first.value || new Uint8Array());
+          for (;;) {
+            const next = await reader.read();
+            if (next.done) break;
+            text += new TextDecoder().decode(next.value);
+          }
+          if (!text.includes('"type":"message.done"')) throw Error(`Incomplete chat: ${text}`);
+          chat.push({ firstChunkMs, completeMs: performance.now() - start });
+        }
+        return { coldRuntimeMs, controls, chat, agentId, sessionId };
+      }, { runtimeUrl: fixture.controllerUrl, apiUrl: fixture.apiUrl, token: accessToken });
+      fixture.trackChat(sample.agentId, sample.sessionId);
+      const percentile = (values, fraction) =>
+        Math.round([...values].sort((a, b) => a - b)[Math.ceil(values.length * fraction) - 1]);
+      const summarize = (values) => ({ p50Ms: percentile(values, 0.5), p95Ms: percentile(values, 0.95) });
+      console.log("BENCHMARK " + JSON.stringify({
+        coldRuntimeMs: Math.round(sample.coldRuntimeMs),
+        warmRuntimeControl: summarize(sample.controls.runtime),
+        warmLambdaControl: sample.controls.lambda.length ? summarize(sample.controls.lambda) : null,
+        chatFirstChunk: summarize(sample.chat.map((x) => x.firstChunkMs)),
+        chatComplete: summarize(sample.chat.map((x) => x.completeMs)),
+        samples: { controlsPerPath: 8, chat: 5 },
+      }));
+      return;
+    }
+    if (["runtime-chat", "runtime-tool"].includes(story)) {
+      const toolStory = story === "runtime-tool";
+      const result = await page.evaluate(async ({ url, token, toolStory }) => {
+        const call = async (command, input) => {
+          const response = await fetch(url, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
+          }, body: JSON.stringify({ v: 1, command, input }) });
+          return { status: response.status, body: await response.json() };
+        };
+        const created = await call("agents.put", { projectId: "main", name: "Smoke agent",
+          modelId: "test.echo", codeInterpreter: toolStory });
+        if (!created.body.ok) return { created };
+        const agentId = created.body.data.id;
+        const sessionId = crypto.randomUUID();
+        const requestId = crypto.randomUUID();
+        const started = performance.now();
+        const response = await fetch(url, { method: "POST", headers: {
+          authorization: `Bearer ${token}`, "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
+        }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+          projectId: "main", agentId, sessionId, requestId,
+          message: toolStory ? "run-code: print(2+2)" : "hello runtime",
+        } }) });
+        const stream = await response.text();
+        if (toolStory) return { agentId, sessionId, requestId, status: response.status, stream,
+          elapsedMs: performance.now() - started };
+        const followup = await fetch(url, { method: "POST", headers: {
+          authorization: `Bearer ${token}`, "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": `smoke-${crypto.randomUUID()}`,
+        }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+          projectId: "main", agentId, sessionId, requestId: crypto.randomUUID(), message: "history?",
+        } }) });
+        const followupStream = await followup.text();
+        const [newest, oldest, ninety] = await Promise.all([
+          call("usage.list", { range: "30d", sort: "desc" }),
+          call("usage.list", { range: "30d", sort: "asc" }),
+          call("usage.list", { range: "90d", sort: "desc" }),
+        ]);
+        let combined;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          combined = await call("usage.list", { range: "30d", scope: "all" });
+          if (combined.body.data?.items?.length >= 2) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        return { agentId, sessionId, requestId, status: response.status, stream,
+          followupStatus: followup.status, followupStream, newest, oldest, ninety, combined };
+      }, { url: fixture.controllerUrl, token: accessToken, toolStory });
+      if (result.agentId && result.sessionId) fixture.trackChat(result.agentId, result.sessionId);
+      if (toolStory) {
+        if (result.status !== 200 || !result.stream?.includes('"type":"tool.done"') ||
+          !result.stream.includes("4") || !result.stream.includes('"type":"message.done"'))
+          throw new Error("Runtime managed tool turn failed: " + JSON.stringify(result));
+        const usage = await fixture.readUsage();
+        if (usage.Items?.length !== 2 ||
+          !usage.Items.some((item) => item.unpricedToolCalls?.N === "1") ||
+          !usage.Items.some((item) => item.quality?.S === "unpriced" && item.name?.S === "execute_code"))
+          throw new Error("Managed tool invocation was not recorded as unpriced");
+        console.log("TOOL TIMING " + JSON.stringify({ browserCompleteMs: Math.round(result.elapsedMs),
+          sampleCount: 1, inference: "scripted", tool: "real AgentCore Code Interpreter" }));
+        return;
+      }
+      if (result.status !== 200 || !result.stream?.includes('"text":"Echo: hello runtime"') ||
+        !result.stream.includes('"type":"message.done"') ||
+        result.followupStatus !== 200 || !result.followupStream?.includes("History: hello runtime | history?"))
+        throw new Error("Runtime-only chat failed: " + JSON.stringify(result));
+      const [events, usage] = await Promise.all([
+        fixture.readChat(result.agentId, result.sessionId), fixture.readUsage(),
+      ]);
+      const replies = events.events?.map((event) => event.payload?.[1]?.conversational?.content?.text);
+      if (replies?.[0] !== "History: hello runtime | history?" ||
+        replies?.[1] !== "Echo: hello runtime" ||
+        usage.Items?.length !== 2 || usage.Items.some((item) => item.inputTokens?.N !== "10"))
+        throw new Error("Runtime chat did not persist Memory and metered usage");
+      const newest = result.newest.body.data?.items || [];
+      const oldest = result.oldest.body.data?.items || [];
+      if ([result.newest, result.oldest, result.ninety, result.combined]
+        .some((page) => page.status !== 200 || !page.body.ok) ||
+        newest.length !== 2 || oldest.length !== 2 ||
+        result.ninety.body.data.items.length !== 2 ||
+        result.combined.body.data.items.length < 2 ||
+        newest[0].occurredAt < newest[1].occurredAt ||
+        oldest[0].occurredAt > oldest[1].occurredAt ||
+        newest.some((item) => item.userSub !== result.combined.body.data.items
+          .find((all) => all.requestId === item.requestId)?.userSub))
+        throw new Error("Historical usage ordering or admin combined view failed: " +
+          JSON.stringify({ newest: result.newest, oldest: result.oldest,
+            ninety: result.ninety, combined: result.combined }));
+      return;
+    }
     const result = await page.evaluate(
       async ({ url, token }) => {
         const response = await fetch(url, {
@@ -349,12 +530,10 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   await ownLimits.locator('input[name="budget"]').fill("1.25");
   const changed = page.waitForResponse(
     (response) =>
-      response.url().endsWith("/rpc") &&
       response.request().postDataJSON()?.command === "users.setLimits",
   );
   const reloaded = page.waitForResponse(
     (response) =>
-      response.url().endsWith("/rpc") &&
       response.request().postDataJSON()?.command === "users.list",
   );
   await ownLimits.getByRole("button", { name: "Save limits" }).click();
@@ -385,5 +564,15 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .getByRole("button", { name: "Close dialog" })
     .click();
   await page.getByRole("button", { name: /Usage/ }).first().click();
-  await page.getByRole("dialog").getByText("Not yet metered").waitFor();
+  await page.getByRole("dialog").getByText(/Not yet metered|\$0\.00/).first().waitFor();
+  await page.getByRole("dialog").locator("#usage-range").selectOption("90d");
+  await page.getByRole("dialog").locator("#usage-sort").selectOption("asc");
+  await page.getByRole("dialog").locator("#usage-scope").selectOption("all");
+  await page.getByRole("dialog").getByText(/(Daily|Weekly|Monthly) ·/).waitFor();
+  await page.getByRole("dialog").getByText("No requests in this range.").waitFor();
+  if (screenshot)
+    await page.evaluate(async () => {
+      const { _screenshot } = await import("./tests.js");
+      await _screenshot("live-usage", document.querySelector("dialog[open]"));
+    });
 }

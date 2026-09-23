@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-zhL2OKtHmNZVBrY22b6L+oKBIF7TLy7OF2Zok5qzQL9bQhLtHGUJoDGkc8hwl4iI' https://cdn.jsdelivr.net; style-src 'sha384-JmalHHmnnsAGTpkLNIpJuU44MiCNoRwhT0FUSHwEMTgrdxDrAN1PCkcz0jGs4zc0'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-UKMu4uAU5UmcxdzaBfhkTRBM+3d6gsD5lts/1fHOQ1ZCwikC7nzEPClhtO3b3HgW' https://cdn.jsdelivr.net; style-src 'sha384-JmalHHmnnsAGTpkLNIpJuU44MiCNoRwhT0FUSHwEMTgrdxDrAN1PCkcz0jGs4zc0'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -607,7 +607,7 @@
               : input;
           const { region, stack, pool, client, scope } = raw;
           const domain = new URL(raw.domain),
-            api = new URL(raw.api);
+            runtime = raw.runtime || null;
           if (
             !/^[a-z]{2}-[a-z]+-\d$/.test(region) ||
             !/^[\w-]+$/.test(stack) ||
@@ -615,9 +615,9 @@
             !/^[\w-]+$/.test(client) ||
             !/^[\w/-]+$/.test(scope) ||
             domain.protocol !== "https:" ||
-            api.protocol !== "https:" ||
             !domain.hostname.endsWith(`.auth.${region}.amazoncognito.com`) ||
-            !api.hostname.endsWith(`.execute-api.${region}.amazonaws.com`)
+            !runtime ||
+            !new RegExp(`^arn:aws:bedrock-agentcore:${region}:[0-9]{12}:runtime/[A-Za-z0-9_-]+$`).test(runtime)
           )
             return null;
           return {
@@ -627,7 +627,7 @@
             client,
             scope,
             domain: domain.origin,
-            api: api.origin + api.pathname.replace(/\/$/, ""),
+            runtime,
           };
         } catch {
           return null;
@@ -810,15 +810,20 @@
       }
 
       // 2. The product API owns AWS authorization, state changes, and metering.
+      const runtimeControlSession = crypto.randomUUID();
+      const runtimeUrl = (config) =>
+        `https://bedrock-agentcore.${config.region}.amazonaws.com/runtimes/${encodeURIComponent(config.runtime)}/invocations?qualifier=DEFAULT`;
       async function rpc(command, input) {
         if (!tokens?.access_token || !deployment())
           throw Error("Sign in before using this action.");
         const access = await accessToken();
-        const response = await fetch(deployment().api + "/rpc", {
+        const config = deployment();
+        const response = await fetch(runtimeUrl(config), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: "Bearer " + access,
+            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeControlSession,
           },
           body: JSON.stringify({
             v: 1,
@@ -856,21 +861,22 @@
           { role: "assistant", text: "" },
         ]);
         try {
-          const response = await fetch(config.api + "/chat", {
+          const response = await fetch(runtimeUrl(config), {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               Authorization: "Bearer " + (await accessToken()),
+              "x-amzn-bedrock-agentcore-runtime-session-id": `a_${agent.id}_${conversationId()}`,
             },
-            body: JSON.stringify({
+            body: JSON.stringify({ v: 1, command: "chat.send", input: {
               projectId: self.defaultProjectId,
-              agentId: agent.id || agent.agentId,
-              requestId: crypto.randomUUID(),
-              message,
-            }),
+              agentId: agent.id,
+              sessionId: conversationId(),
+              requestId: crypto.randomUUID(), message,
+            } }),
           });
           if (!response.ok || !response.body)
-            throw Error("Chat could not start.");
+            throw Error((await response.json().catch(() => ({}))).error?.code || "Chat could not start.");
           const reader = response.body.getReader(),
             decoder = new TextDecoder();
           let buffer = "";
@@ -910,12 +916,16 @@
       // 3. Local signals represent only the current view, not a second product database.
       const [agents, setAgents] = createSignal([]);
       const [selectedAgent, setSelectedAgent] = createSignal(null);
+      const [conversationId, setConversationId] = createSignal(crypto.randomUUID());
       const [messages, setMessages] = createSignal([]);
       const [draft, setDraft] = createSignal("");
       const [sending, setSending] = createSignal(false);
       const [modal, setModal] = createSignal(null);
       const [entry, setEntry] = createSignal("");
       const [view, setView] = createSignal(null);
+      const [usageRange, setUsageRange] = createSignal("30d");
+      const [usageSort, setUsageSort] = createSignal("desc");
+      const [usageScope, setUsageScope] = createSignal("self");
       const [error, setError] = createSignal("");
       const [loading, setLoading] = createSignal(
         Boolean(initial || query.has("code")),
@@ -935,7 +945,7 @@
         menu: "Navigation",
         deployment: "AWS account · infrastructure",
         account: "Your Cognito session",
-        agents: "Project · managed Harnesses",
+        agents: "Project · Runtime configurations",
         models: "Account · approved models",
         skills: "Project · skill storage",
         integrations: "Account · Gateway and credentials",
@@ -947,8 +957,10 @@
         setModal(route);
         if (session()) loadView(route);
       };
+      let viewRequest = 0;
       async function loadView(route) {
-        if (!["users", "models", "usage"].includes(route)) return;
+        if (!["users", "models", "usage", "agents"].includes(route)) return;
+        const request = ++viewRequest;
         setView({ route, loading: true });
         try {
           if (route === "users") {
@@ -956,19 +968,41 @@
               rpc("users.list", {}),
               rpc("defaults.get", {}),
             ]);
-            setView({ route, ...users, defaults });
+            if (request === viewRequest) setView({ route, ...users, defaults });
+          } else if (route === "agents") {
+            const result = await rpc("models.list", {});
+            if (request === viewRequest) setView({ route, ...result });
+          } else if (route === "usage") {
+            const [summary, detail] = await Promise.all([
+              rpc("usage.summary", {}),
+              rpc("usage.list", { range: usageRange(), sort: usageSort(), scope: usageScope() }),
+            ]);
+            if (request === viewRequest)
+              setView({ route, ...summary, items: detail.items, nextCursor: detail.nextCursor });
           } else {
-            setView({
-              route,
-              ...(await rpc(
-                route + (route === "usage" ? ".summary" : ".list"),
-                {},
-              )),
-            });
+            const result = await rpc(route + ".list", {});
+            if (request === viewRequest) setView({ route, ...result });
           }
         } catch (cause) {
-          setError(cause.message);
-          setView({ route, items: [] });
+          if (request === viewRequest) {
+            setError(cause.message);
+            setView({ route, items: [] });
+          }
+        }
+      }
+      async function moreUsage() {
+        const cursor = view()?.nextCursor;
+        if (!cursor) return;
+        const request = viewRequest;
+        try {
+          const page = await rpc("usage.list", {
+            range: usageRange(), sort: usageSort(), scope: usageScope(), cursor,
+          });
+          if (request === viewRequest)
+            setView((current) => ({ ...current, items: [...current.items, ...page.items],
+              nextCursor: page.nextCursor }));
+        } catch (cause) {
+          if (request === viewRequest) setError(cause.message);
         }
       }
       async function change(command, input, route) {
@@ -980,8 +1014,35 @@
           setError(cause.message);
         }
       }
+      async function createAgent(form) {
+        setError("");
+        try {
+          const result = await rpc("agents.put", {
+            projectId: session().defaultProjectId,
+            name: form.get("name"),
+            modelId: form.get("modelId"),
+            systemPrompt: form.get("systemPrompt"),
+            codeInterpreter: form.has("codeInterpreter"),
+          });
+          const list = await rpc("agents.list", { projectId: session().defaultProjectId });
+          setAgents(list.items);
+          setSelectedAgent(list.items.find((agent) => agent.id === result.id));
+          setConversationId(crypto.randomUUID());
+          setMessages([]);
+          setModal(null);
+        } catch (cause) {
+          setError(cause.message);
+        }
+      }
       const dollars = (micro) => (Number(micro || 0) / 1000000).toFixed(2);
       const gb = (bytes) => (Number(bytes || 0) / 1000000000).toFixed(2);
+      const periodLabel = (key) => {
+        const [, cadence, date] = (key || "").split("#");
+        return date ? cadence[0].toUpperCase() + cadence.slice(1) + " · " +
+          new Date(date + "T00:00:00Z").toLocaleDateString(undefined, {
+            timeZone: "UTC", month: "short", day: "numeric", year: "numeric",
+          }) : "—";
+      };
       function connectEntry() {
         const config = parseDeployment(entry());
         if (!config) {
@@ -998,7 +1059,7 @@
         if (route === "menu")
           return html`<div class="rail-list">
             <${For} each=${Object.keys(names).filter((name) => name !== "menu")}
-              >${(name) => html`<button class="nav" onClick=${(e) => setModal(name)}>${names[name]}</button>`}<//
+              >${(name) => html`<button class="nav" onClick=${(e) => openDialog(name)}>${names[name]}</button>`}<//
             >
           </div>`;
         if (route === "deployment")
@@ -1236,8 +1297,8 @@
           <//>`;
         if (route === "models")
           return html`<p class="help">
-              Approved model IDs live in the account catalog. Agent creation and
-              price metering are not connected yet.
+              Approved model IDs and per-million-token prices live in this account.
+              Rates are a snapshot for usage; review them when provider prices change.
             </p>
             <${Show} when=${() => session()?.user?.role === "Administrators"}>
               <form
@@ -1246,7 +1307,11 @@
                   const form = new FormData(event.currentTarget);
                   change(
                     "models.put",
-                    { id: form.get("id"), name: form.get("name") },
+                    { id: form.get("id"), name: form.get("name"),
+                      inputRate: Math.round(Number(form.get("inputRate")) * 1000000),
+                      outputRate: Math.round(Number(form.get("outputRate")) * 1000000),
+                      cacheReadRate: Math.round(Number(form.get("cacheReadRate")) * 1000000),
+                      cacheWriteRate: Math.round(Number(form.get("cacheWriteRate")) * 1000000) },
                     "models",
                   );
                   event.currentTarget.reset();
@@ -1259,6 +1324,14 @@
                 <div class="field">
                   <label for="model-name">Display name</label
                   ><input id="model-name" name="name" required />
+                </div>
+                <div class="inline-fields">
+                  <div class="field"><label for="model-input-rate">Input $/M tokens</label><input id="model-input-rate" name="inputRate" type="number" min="0" step="0.000001" required /></div>
+                  <div class="field"><label for="model-output-rate">Output $/M tokens</label><input id="model-output-rate" name="outputRate" type="number" min="0" step="0.000001" required /></div>
+                </div>
+                <div class="inline-fields">
+                  <div class="field"><label for="model-cache-read-rate">Cache read $/M</label><input id="model-cache-read-rate" name="cacheReadRate" type="number" min="0" step="0.000001" required /></div>
+                  <div class="field"><label for="model-cache-write-rate">Cache write $/M</label><input id="model-cache-write-rate" name="cacheWriteRate" type="number" min="0" step="0.000001" required /></div>
                 </div>
                 <div class="actions">
                   <button class="primary" type="submit">Add model</button>
@@ -1275,13 +1348,13 @@
             >`;
         if (route === "usage")
           return html`<p class="help">
-              Usage is attributed per request and tool once streamed metering is
-              connected. No cost is inferred from missing telemetry.
+              Model charges use reported tokens and the account's model rates.
+              Unpriced managed-tool calls are shown separately, not guessed.
             </p>
             <dl>
               <div class="kv">
-                <dt>Period</dt>
-                <dd>${() => view()?.period || "—"}</dd>
+                <dt>Budget period</dt>
+                <dd>${() => periodLabel(view()?.period)}</dd>
               </div>
               <div class="kv">
                 <dt>Cost</dt>
@@ -1293,12 +1366,57 @@
                 <dt>Budget</dt>
                 <dd>$${() => dollars(session()?.user?.budgetMicroUsd)}</dd>
               </div>
-            </dl>`;
+              <div class="kv">
+                <dt>Unpriced tool calls</dt>
+                <dd>${() => view()?.unpricedToolCalls || 0}</dd>
+              </div>
+            </dl>
+            <h3 class="section-title">Requests and tools</h3>
+            <div class="inline-fields">
+              <div class="field"><label for="usage-range">Time range</label>
+                <select id="usage-range" value=${usageRange} onChange=${(event) => {
+                  setUsageRange(event.currentTarget.value); loadView("usage");
+                }}><option value="30d">Last 30 days</option><option value="90d">Last 90 days</option></select>
+              </div>
+              <div class="field"><label for="usage-sort">Order</label>
+                <select id="usage-sort" value=${usageSort} onChange=${(event) => {
+                  setUsageSort(event.currentTarget.value); loadView("usage");
+                }}><option value="desc">Newest first</option><option value="asc">Oldest first</option></select>
+              </div>
+              <${Show} when=${() => session()?.user?.role === "Administrators"}>
+                <div class="field"><label for="usage-scope">People</label>
+                  <select id="usage-scope" value=${usageScope} onChange=${(event) => {
+                    setUsageScope(event.currentTarget.value); loadView("usage");
+                  }}><option value="self">My usage</option><option value="all">All users</option></select>
+                </div><//
+              >
+            </div>
+            <${For} each=${() => view()?.route === "usage" ? view()?.items || [] : []}>
+              ${(item) => html`<div class="item"><strong>${item.name || item.modelId || "Request"}</strong>
+                <small>${new Date(item.occurredAt).toLocaleString()} · ${usageScope() === "all" ? item.userSub + " · " : ""}
+                ${item.quality === "unpriced" ? "Tool · unpriced" : "Model · " + item.inputTokens + " in / " + item.outputTokens + " out"}
+                · ${item.latencyMs} ms · $${(Number(item.costMicroUsd || 0) / 1000000).toFixed(6)}</small></div>`}<//>
+            <${Show} when=${() => !view()?.items?.length}><div class="empty">No requests in this range.</div><//>
+            <${Show} when=${() => view()?.nextCursor}><div class="actions">
+              <button class="secondary" onClick=${moreUsage}>Load more</button></div><//>`;
         if (route === "agents")
           return html` <p class="help">
-              Each agent is a managed AgentCore Harness. Configurations are
-              separate while project Memory is shared.
+              Each agent is a configuration in this project. One AgentCore Runtime
+              executes them; Memory stays scoped to your user and project.
             </p>
+            <form onSubmit=${(event) => {
+              event.preventDefault();
+              createAgent(new FormData(event.currentTarget));
+            }}>
+              <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" name="name" required maxlength="80" /></div>
+              <div class="field"><label for="agent-model">Model</label><select id="agent-model" name="modelId" required>
+                <${For} each=${() => (view()?.route === "agents" ? view()?.items?.filter((model) => model.active) || [] : [])}>
+                  ${(model) => html`<option value=${model.id || model.sk}>${model.name}</option>`}<//>
+              </select></div>
+              <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3"></textarea></div>
+              <div class="field"><label><input type="checkbox" name="codeInterpreter" /> Enable managed Code Interpreter</label></div>
+              <div class="actions"><button class="primary" type="submit">Create agent</button></div>
+            </form>
             <${Show}
               when=${() => agents().length}
               fallback=${html`<div class="empty">No agents found in this project.</div>`}
@@ -1310,6 +1428,8 @@
                       class="nav"
                       onClick=${(e) => {
                         setSelectedAgent(agent);
+                        setConversationId(crypto.randomUUID());
+                        setMessages([]);
                         setModal(null);
                       }}
                     >
@@ -1369,6 +1489,7 @@
                       class="nav"
                       onClick=${(e) => {
                         setSelectedAgent(agent);
+                        setConversationId(crypto.randomUUID());
                         setMessages([]);
                       }}
                     >
