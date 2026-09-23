@@ -247,9 +247,19 @@ Resources:
                 Action: [bedrock-agentcore:StartCodeInterpreterSession, bedrock-agentcore:InvokeCodeInterpreter, bedrock-agentcore:StopCodeInterpreterSession]
                 Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1'
               - Effect: Allow
-                Action: [bedrock:InvokeModelWithResponseStream]
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
                 Resource:
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  # Global profiles check both destination-Region and Regionless model ARNs.
+                  - 'arn:aws:bedrock:*::foundation-model/anthropic.claude-fable-5-1'
+                  - 'arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-5-5'
+                  - 'arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5'
+                  - 'arn:aws:bedrock:*::foundation-model/openai.gpt-6-sol'
+                  - 'arn:aws:bedrock:*::foundation-model/openai.gpt-6-luna'
+                  - 'arn:aws:bedrock:::foundation-model/anthropic.claude-fable-5-1'
+                  - 'arn:aws:bedrock:::foundation-model/anthropic.claude-opus-5-5'
+                  - 'arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-5'
+                  - 'arn:aws:bedrock:::foundation-model/openai.gpt-6-sol'
+                  - 'arn:aws:bedrock:::foundation-model/openai.gpt-6-luna'
                   - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
                   - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:application-inference-profile/*'
               - Effect: Allow

@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-tlRsxQQlj92dAaGahUsX/ye8ODr3K3nBu3KYJeKaz4qINSfFnBo/qbg4Xy6qBGoe' https://cdn.jsdelivr.net; style-src 'sha384-JmalHHmnnsAGTpkLNIpJuU44MiCNoRwhT0FUSHwEMTgrdxDrAN1PCkcz0jGs4zc0'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-be5r09cETG1QhEmGxsGimj8NllqQBgaMqIoP1sYSlsO6ayshIBZTsLQltfDqvxVl' https://cdn.jsdelivr.net; style-src 'sha384-JmalHHmnnsAGTpkLNIpJuU44MiCNoRwhT0FUSHwEMTgrdxDrAN1PCkcz0jGs4zc0'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -929,7 +929,6 @@
         deployment: "Connect a deployment",
         account: "Account",
         agents: "Agents",
-        models: "Models",
         skills: "Skills",
         integrations: "Integrations",
         usage: "Usage",
@@ -940,7 +939,6 @@
         deployment: "AWS account · infrastructure",
         account: "Your Cognito session",
         agents: "Project · Runtime configurations",
-        models: "Account · approved models",
         skills: "Project · skill storage",
         integrations: "Account · Gateway and credentials",
         usage: "Account · metering",
@@ -953,7 +951,7 @@
       };
       let viewRequest = 0;
       async function loadView(route) {
-        if (!["users", "models", "usage", "agents"].includes(route)) return;
+        if (!["users", "usage", "agents"].includes(route)) return;
         const request = ++viewRequest;
         setView({ route, loading: true });
         try {
@@ -969,9 +967,6 @@
             });
             if (request === viewRequest)
               setView({ route, ...detail });
-          } else {
-            const result = await rpc(route + ".list", {});
-            if (request === viewRequest) setView({ route, ...result });
           }
         } catch (cause) {
           if (request === viewRequest) {
@@ -1013,6 +1008,7 @@
             modelId: form.get("modelId"),
             systemPrompt: form.get("systemPrompt"),
             codeInterpreter: form.has("codeInterpreter"),
+            maxOutputTokens: Number(form.get("maxOutputTokens")),
           });
           setAgents((items) => [...items, result]);
           setSelectedAgent(result);
@@ -1024,6 +1020,13 @@
         }
       }
       const dollars = (micro) => (Number(micro || 0) / 1000000).toFixed(2);
+      const modelCompanies = ["Anthropic", "OpenAI", "Google", "Amazon", "Other"];
+      const modelCompany = (model) => model.company || (
+        /anthropic/.test(model.id) ? "Anthropic" :
+        /openai/.test(model.id) ? "OpenAI" :
+        /gemini/.test(model.id) ? "Google" :
+        /amazon/.test(model.id) ? "Amazon" : "Other"
+      );
       const gb = (bytes) => (Number(bytes || 0) / 1000000000).toFixed(2);
       const periodLabel = (key) => {
         const [, cadence, date] = (key || "").split("#");
@@ -1284,60 +1287,10 @@
                 </div>`}<//
             >
           <//>`;
-        if (route === "models")
-          return html`<p class="help">
-              Approved model IDs and per-million-token prices live in this account.
-              Rates are a snapshot for usage; review them when provider prices change.
-            </p>
-            <${Show} when=${() => session()?.user?.role === "Administrators"}>
-              <form
-                onSubmit=${(event) => {
-                  event.preventDefault();
-                  const form = new FormData(event.currentTarget);
-                  change(
-                    "models.put",
-                    { id: form.get("id"), name: form.get("name"),
-                      inputRate: Math.round(Number(form.get("inputRate")) * 1000000),
-                      outputRate: Math.round(Number(form.get("outputRate")) * 1000000),
-                      cacheReadRate: Math.round(Number(form.get("cacheReadRate")) * 1000000),
-                      cacheWriteRate: Math.round(Number(form.get("cacheWriteRate")) * 1000000) },
-                    "models",
-                  );
-                  event.currentTarget.reset();
-                }}
-              >
-                <div class="field">
-                  <label for="model-id">Provider model ID</label
-                  ><input id="model-id" name="id" required />
-                </div>
-                <div class="field">
-                  <label for="model-name">Display name</label
-                  ><input id="model-name" name="name" required />
-                </div>
-                <div class="inline-fields">
-                  <div class="field"><label for="model-input-rate">Input $/M tokens</label><input id="model-input-rate" name="inputRate" type="number" min="0" step="0.000001" required /></div>
-                  <div class="field"><label for="model-output-rate">Output $/M tokens</label><input id="model-output-rate" name="outputRate" type="number" min="0" step="0.000001" required /></div>
-                </div>
-                <div class="inline-fields">
-                  <div class="field"><label for="model-cache-read-rate">Cache read $/M</label><input id="model-cache-read-rate" name="cacheReadRate" type="number" min="0" step="0.000001" required /></div>
-                  <div class="field"><label for="model-cache-write-rate">Cache write $/M</label><input id="model-cache-write-rate" name="cacheWriteRate" type="number" min="0" step="0.000001" required /></div>
-                </div>
-                <div class="actions">
-                  <button class="primary" type="submit">Add model</button>
-                </div>
-              </form><//
-            >
-            <h3 class="section-title">Catalog</h3>
-            <${Show} when=${() => view()?.loading}
-              ><div class="empty">Loading models…</div><//
-            >
-            <${For}
-              each=${() => (view()?.route === "models" ? view()?.items || [] : [])}
-              >${(model) => html`<div class="item"><strong>${model.name}</strong><small>${model.sk} · ${model.active ? "Active" : "Inactive"}</small></div>`}<//
-            >`;
         if (route === "usage")
           return html`<p class="help">
-              Model charges use reported tokens and the account's model rates.
+              Model costs estimate reported tokens using the checked-in rates.
+              Provider tiers, discounts and other AWS charges may differ.
               Unpriced managed-tool calls are shown separately, not guessed.
             </p>
             <dl>
@@ -1392,6 +1345,7 @@
           return html` <p class="help">
               Each agent is a configuration in this project. One AgentCore Runtime
               executes them; Memory stays scoped to your user and project.
+              Bedrock models may require a one-time account Marketplace agreement.
             </p>
             <form onSubmit=${(event) => {
               event.preventDefault();
@@ -1399,10 +1353,15 @@
             }}>
               <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" name="name" required maxlength="80" /></div>
               <div class="field"><label for="agent-model">Model</label><select id="agent-model" name="modelId" required>
-                <${For} each=${() => (view()?.route === "agents" ? view()?.items?.filter((model) => model.active) || [] : [])}>
-                  ${(model) => html`<option value=${model.id || model.sk}>${model.name}</option>`}<//>
+                <${For} each=${modelCompanies}>${(company) => html`
+                  <optgroup label=${company}>
+                    <${For} each=${() => (view()?.route === "agents" ? view()?.items || [] : [])
+                      .filter((model) => modelCompany(model) === company)}>
+                      ${(model) => html`<option value=${model.id} disabled=${!model.active}>${model.name}${model.active ? "" : " · needs adapter"}</option>`}<//>
+                  </optgroup>`}<//>
               </select></div>
               <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3"></textarea></div>
+              <div class="field"><label for="agent-max-output">Maximum output tokens per model turn</label><input id="agent-max-output" name="maxOutputTokens" type="number" min="16" max="4096" step="1" value="4096" required /></div>
               <div class="field"><label><input type="checkbox" name="codeInterpreter" /> Enable managed Code Interpreter</label></div>
               <div class="actions"><button class="primary" type="submit">Create agent</button></div>
             </form>
@@ -1494,9 +1453,6 @@
             <section class="rail-bottom">
               <div class="eyebrow">Manage</div>
               <div class="rail-list">
-                <button class="nav" onClick=${(e) => openDialog("models")}>
-                  <span class="nav-icon">◈</span>Models
-                </button>
                 <button class="nav" onClick=${(e) => openDialog("skills")}>
                   <span class="nav-icon">◇</span>Skills
                 </button>

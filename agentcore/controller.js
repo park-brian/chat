@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { BedrockRuntimeClient, ConverseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
 import { scriptedStream } from "./scripted-model.js";
 import { modelCost, periodKey } from "./accounting.js";
+import suggestedModels from "./models.json" with { type: "json" };
 import {
   CognitoIdentityProviderClient,
   AdminGetUserCommand,
@@ -87,10 +88,8 @@ async function defaults() {
 async function approvedModel(modelId) {
   if (modelId === "test.echo")
     return process.env.SCRIPTED_MODEL === "true" ? { id: modelId } : null;
-  const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
-    Key: key("MODEL", modelId), ConsistentRead: true }));
-  const model = unpack(row.Item);
-  return model.active === true && Number.isSafeInteger(model.inputRate) &&
+  const model = suggestedModels.find((entry) => entry.id === modelId);
+  return model?.transport === "bedrock" && Number.isSafeInteger(model.inputRate) &&
     Number.isSafeInteger(model.outputRate) ? model : null;
 }
 
@@ -147,21 +146,24 @@ async function invoke(body, identity) {
   if (body.command === "agents.put") {
     if (identity.role === "Auditors")
       return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
-    const { projectId, name, modelId, systemPrompt = "", codeInterpreter = false } = body.input;
+    const { projectId, name, modelId, systemPrompt = "", codeInterpreter = false,
+      maxOutputTokens = 4096 } = body.input;
     if (projectId !== "main" || typeof name !== "string" || !name.trim() || name.length > 80 ||
-      !/^[a-zA-Z0-9._/-]{1,120}$/.test(modelId || "") ||
+      typeof modelId !== "string" || !modelId || modelId.length > 512 ||
       typeof systemPrompt !== "string" || systemPrompt.length > 12000 ||
-      typeof codeInterpreter !== "boolean")
+      typeof codeInterpreter !== "boolean" ||
+      !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 16 || maxOutputTokens > 4096)
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
     if (!(await approvedModel(modelId)))
       return { status: 400, data: { ok: false, error: { code: "MODEL_UNAVAILABLE" } } };
     const id = randomUUID();
     const agent = { id, name: name.trim(), modelId, systemPrompt,
-      codeInterpreter, createdAt: new Date().toISOString() };
+      codeInterpreter, maxOutputTokens, createdAt: new Date().toISOString() };
     await db.send(new PutItemCommand({ TableName: process.env.TABLE,
       Item: { pk: S(`PROJECT#${identity.sub}/main`), sk: S(`AGENT#${id}`),
         id: S(id), name: S(agent.name), modelId: S(modelId),
         systemPrompt: S(systemPrompt), codeInterpreter: { BOOL: codeInterpreter },
+        maxOutputTokens: N(maxOutputTokens),
         createdAt: S(agent.createdAt) },
       ConditionExpression: "attribute_not_exists(pk)" }));
     return { status: 200, data: { ok: true, data: agent } };
@@ -185,7 +187,8 @@ async function invoke(body, identity) {
     return { status: 200, data: { ok: true, data: { period,
       costMicroUsd: Number(row.Item?.costMicroUsd?.N || 0),
       unpricedToolCalls: Number(row.Item?.unpricedToolCalls?.N || 0),
-      quality: Number(row.Item?.unpricedToolCalls?.N || 0) ? "partial" : "model-only" } } };
+      quality: Number(row.Item?.unpricedToolCalls?.N || 0) ? "partial" :
+        Number(row.Item?.estimatedModelCalls?.N || 0) ? "estimated" : "model-only" } } };
   }
   if (body.command === "usage.list") {
     const { range = "30d", sort = "desc", scope = "self", cursor } = body.input;
@@ -229,16 +232,14 @@ async function invoke(body, identity) {
         ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null } } };
   }
   if (body.command === "models.list") {
-    const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
-      KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": S("MODEL") },
-      Limit: 100 }));
-    const items = page.Items.map(unpack);
+    const items = suggestedModels.map((model) =>
+      ({ ...model, active: model.transport === "bedrock" }));
     if (process.env.SCRIPTED_MODEL === "true")
       items.unshift({ id: "test.echo", name: "Scripted echo (test only)", active: true });
     return { status: 200, data: { ok: true, data: { items } } };
   }
   const admin = identity.role === "Administrators";
-  if (["users.list", "users.invite", "users.setLimits", "defaults.get", "defaults.set", "models.put"].includes(body.command) && !admin)
+  if (["users.list", "users.invite", "users.setLimits", "defaults.get", "defaults.set"].includes(body.command) && !admin)
     return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
   if (body.command === "users.list") {
     const page = await idp.send(new ListUsersCommand({ UserPoolId: process.env.POOL,
@@ -299,18 +300,6 @@ async function invoke(body, identity) {
         ":period": S(period), ":revision": N(revision), ":one": N(1) }, ReturnValues: "ALL_NEW" }));
     return { status: 200, data: { ok: true, data: unpack(row.Attributes) } };
   }
-  if (body.command === "models.put") {
-    const { id, name, inputRate, outputRate, cacheReadRate, cacheWriteRate } = body.input;
-    if (!/^[a-zA-Z0-9._/-]{1,120}$/.test(id || "") || id === "test.echo" ||
-      typeof name !== "string" || !name.trim() || name.length > 80 ||
-      ![inputRate, outputRate, cacheReadRate, cacheWriteRate].every((rate) => Number.isSafeInteger(rate) && rate >= 0))
-      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    await db.send(new PutItemCommand({ TableName: process.env.TABLE,
-      Item: { pk: S("MODEL"), sk: S(id), id: S(id), name: S(name.trim()), active: { BOOL: true },
-        inputRate: N(inputRate), outputRate: N(outputRate),
-        cacheReadRate: N(cacheReadRate), cacheWriteRate: N(cacheWriteRate) } }));
-    return { status: 200, data: { ok: true, data: { updated: true } } };
-  }
   if (body.command !== "session.get" || Object.keys(body.input).length)
     return { status: 501, data: { ok: false, error: { code: "NOT_IMPLEMENTED" } } };
   return { status: 200, data: { ok: true, data: await getSession(identity) } };
@@ -336,7 +325,7 @@ async function runModel(config, messages, emit) {
         : (await bedrock.send(new ConverseStreamCommand({
             modelId: config.modelId, messages,
             system: config.systemPrompt ? [{ text: config.systemPrompt }] : undefined,
-            inferenceConfig: { maxTokens: 4096 }, toolConfig,
+            inferenceConfig: { maxTokens: config.maxOutputTokens || 4096 }, toolConfig,
           }))).stream;
       const content = [];
       let stopReason;
@@ -494,13 +483,16 @@ async function chat(input, identity, response) {
           cacheWriteInputTokens: N(result.usage.cacheWriteInputTokens || 0),
           inputRate: N(model.inputRate || 0), outputRate: N(model.outputRate || 0),
           cacheReadRate: N(model.cacheReadRate || 0), cacheWriteRate: N(model.cacheWriteRate || 0),
+          pricingSource: S(model.pricingSource || ""), pricingQuality: S(model.pricingQuality || "unknown"),
+          quality: S("estimated"),
           toolCalls: N(result.toolCalls.length),
           unpricedToolCalls: N(result.toolCalls.length),
           latencyMs: N(Date.now() - started) },
         ConditionExpression: "attribute_not_exists(pk)" } },
       { Update: { TableName: process.env.TABLE, Key: key(`USER#${identity.sub}`, period),
-        UpdateExpression: "ADD costMicroUsd :cost, unpricedToolCalls :tools",
-        ExpressionAttributeValues: { ":cost": N(costMicroUsd), ":tools": N(result.toolCalls.length) } } },
+        UpdateExpression: "ADD costMicroUsd :cost, unpricedToolCalls :tools, estimatedModelCalls :one",
+        ExpressionAttributeValues: { ":cost": N(costMicroUsd), ":tools": N(result.toolCalls.length),
+          ":one": N(1) } } },
       ...result.toolCalls.map((tool, index) => ({ Put: { TableName: process.env.TABLE,
         Item: { pk: S(`USER#${identity.sub}`),
           sk: S(`USAGE#${tool.occurredAt}#${requestId}#TOOL#${index}`),
@@ -515,7 +507,12 @@ async function chat(input, identity, response) {
       unpricedToolCalls: result.toolCalls.length, latencyMs: Date.now() - started });
   } catch (error) {
     console.error("Chat failed", error.name, error.$metadata?.httpStatusCode || "");
-    emit({ type: "error", message: "Agent turn failed",
+    const message = error.name === "AccessDeniedException"
+      ? "Model access denied. An AWS administrator may need to enable its Marketplace agreement or Runtime role."
+      : error.name === "ThrottlingException"
+        ? "The model is busy. Please try again."
+        : "Agent turn failed";
+    emit({ type: "error", message,
       ...(process.env.SCRIPTED_MODEL === "true" && { diagnostic: error.name }) });
   } finally {
     response.end();

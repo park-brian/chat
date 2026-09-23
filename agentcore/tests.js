@@ -307,9 +307,9 @@ export async function createLiveFixture({ stackName, profile, region }) {
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-benchmark"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
   const uiInvocations = [];
   page.on("request", (request) => {
@@ -321,7 +321,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       runtimeSession: request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"] });
   });
   const tokenResponse =
-    ["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story)
+    ["runtime", "runtime-chat", "runtime-tool", "runtime-model", "runtime-benchmark"].includes(story)
       ? page.waitForResponse((response) =>
           response.url().includes("/oauth2/token"),
         )
@@ -342,6 +342,15 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     await page.getByRole("button", { name: "Choose an agent" }).click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#agent-model option[value='test.echo']").waitFor({ state: "attached" });
+    await dialog.locator("#agent-model option[value='global.openai.gpt-6-luna']")
+      .waitFor({ state: "attached" });
+    if (!(await dialog.locator("#agent-model option[value='gemini-3.8-flash']").isDisabled()))
+      throw new Error("Gemini must remain disabled until its adapter exists");
+    if (screenshot)
+      await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-agent-models", document.querySelector("dialog[open]"));
+      });
     await dialog.locator("#agent-name").fill("Smoke UI agent");
     await dialog.locator("#agent-model").selectOption("test.echo");
     await dialog.getByRole("button", { name: "Create agent" }).click();
@@ -366,9 +375,48 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       });
     return;
   }
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story)) {
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-model", "runtime-benchmark"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
+    if (story === "runtime-model") {
+      const catalog = (await import("./models.json", { with: { type: "json" } })).default;
+      const selected = process.env.AGENTCORE_TEST_MODEL;
+      if (selected && !catalog.some((model) => model.transport === "bedrock" && model.id === selected))
+        throw new Error("AGENTCORE_TEST_MODEL must name a checked-in Bedrock model");
+      for (const { id: modelId } of catalog.filter((model) =>
+        model.transport === "bedrock" && (!selected || model.id === selected))) {
+      const ids = await page.evaluate(async ({ url, token, modelId }) => {
+        const response = await fetch(url, { method: "POST", headers: {
+          authorization: `Bearer ${token}`, "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
+        }, body: JSON.stringify({ v: 1, command: "agents.put", input: {
+          projectId: "main", name: "Capped model smoke", modelId, maxOutputTokens: 64,
+        } }) });
+        if (!response.ok) throw Error("Could not create model smoke agent");
+        return { agentId: (await response.json()).data.id, sessionId: crypto.randomUUID() };
+      }, { url: fixture.controllerUrl, token: accessToken, modelId });
+      fixture.trackChat(ids.agentId, ids.sessionId);
+      const result = await page.evaluate(async ({ url, token, ids }) => {
+        const started = performance.now();
+        const response = await fetch(url, { method: "POST", headers: {
+          authorization: `Bearer ${token}`, "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
+        }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+          projectId: "main", ...ids, requestId: crypto.randomUUID(),
+          message: "Reply with OK only.",
+        } }) });
+        return { status: response.status, stream: await response.text(),
+          elapsedMs: Math.round(performance.now() - started) };
+      }, { url: fixture.controllerUrl, token: accessToken, ids });
+      if (result.status !== 200 || !result.stream.includes('"type":"message.done"'))
+        throw new Error("Real-model turn incomplete: " + result.stream.slice(-1000));
+      const usage = await fixture.readUsage();
+      if (!(usage.Items || []).some((row) => row.modelId?.S === modelId))
+        throw new Error("Real-model usage row missing");
+      console.log("REAL_MODEL " + JSON.stringify({ modelId, elapsedMs: result.elapsedMs }));
+      }
+      return;
+    }
     if (story === "runtime-benchmark") {
       const sample = await page.evaluate(async ({ runtimeUrl, token }) => {
         const runtimeSession = `bench-${crypto.randomUUID()}`;
@@ -606,18 +654,13 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .getByRole("dialog")
     .getByRole("button", { name: "Close dialog" })
     .click();
-  await page
-    .getByRole("button", { name: /Models/ })
-    .first()
-    .click();
-  await page
-    .getByRole("dialog")
-    .getByRole("heading", { name: "Catalog" })
-    .waitFor();
-  await page
-    .getByRole("dialog")
-    .getByRole("button", { name: "Close dialog" })
-    .click();
+  await page.getByRole("button", { name: /View agents/ }).click();
+  await page.getByRole("dialog").locator("#agent-model option[value='global.openai.gpt-6-luna']")
+    .waitFor({ state: "attached" });
+  if (!(await page.getByRole("dialog")
+    .locator("#agent-model option[value='gemini-3.8-flash']").isDisabled()))
+    throw new Error("Unimplemented Gemini adapter must not be selectable");
+  await page.getByRole("dialog").getByRole("button", { name: "Close dialog" }).click();
   await page.getByRole("button", { name: /Usage/ }).first().click();
   await page.getByRole("dialog").getByText(/Not yet metered|\$0\.00/).first().waitFor();
   await page.getByRole("dialog").locator("#usage-range").selectOption("90d");
