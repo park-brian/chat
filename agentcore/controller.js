@@ -94,6 +94,38 @@ async function approvedModel(modelId) {
     Number.isSafeInteger(model.outputRate) ? model : null;
 }
 
+async function listAgents(identity) {
+  const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
+    KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+    ExpressionAttributeValues: { ":pk": S(`PROJECT#${identity.sub}/main`), ":prefix": S("AGENT#") },
+    Limit: 100 }));
+  return (page.Items || []).map(unpack);
+}
+
+async function getSession(identity) {
+  const [user, limits] = await Promise.all([
+    idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL, Username: identity.sub })),
+    defaults(),
+  ]);
+  const row = await db.send(new UpdateItemCommand({
+    TableName: process.env.TABLE, Key: key(`USER#${identity.sub}`, "CONTROL"),
+    UpdateExpression:
+      "SET budgetMicroUsd = if_not_exists(budgetMicroUsd, :budget), storageBytes = if_not_exists(storageBytes, :storage)",
+    ExpressionAttributeValues: { ":budget": N(limits.budgetMicroUsd), ":storage": N(limits.storageBytes) },
+    ReturnValues: "ALL_NEW",
+  }));
+  return {
+    user: {
+      sub: identity.sub,
+      email: user.UserAttributes?.find((attribute) => attribute.Name === "email")?.Value || "",
+      role: identity.role,
+      budgetMicroUsd: Number(row.Attributes.budgetMicroUsd.N),
+      storageBytes: Number(row.Attributes.storageBytes.N),
+    },
+    defaults: limits, defaultProjectId: "main",
+  };
+}
+
 async function invoke(body, identity) {
   if (body?.v !== 1 || !body.input || typeof body.input !== "object") {
     return {
@@ -104,11 +136,13 @@ async function invoke(body, identity) {
   if (body.command === "agents.list") {
     if (body.input.projectId !== "main")
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
-      KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
-      ExpressionAttributeValues: { ":pk": S(`PROJECT#${identity.sub}/main`), ":prefix": S("AGENT#") },
-      Limit: 100 }));
-    return { status: 200, data: { ok: true, data: { items: page.Items.map(unpack) } } };
+    return { status: 200, data: { ok: true, data: { items: await listAgents(identity) } } };
+  }
+  if (body.command === "workspace.get") {
+    if (Object.keys(body.input).length)
+      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    const [session, agents] = await Promise.all([getSession(identity), listAgents(identity)]);
+    return { status: 200, data: { ok: true, data: { session, agents } } };
   }
   if (body.command === "agents.put") {
     if (identity.role === "Auditors")
@@ -122,13 +156,26 @@ async function invoke(body, identity) {
     if (!(await approvedModel(modelId)))
       return { status: 400, data: { ok: false, error: { code: "MODEL_UNAVAILABLE" } } };
     const id = randomUUID();
+    const agent = { id, name: name.trim(), modelId, systemPrompt,
+      codeInterpreter, createdAt: new Date().toISOString() };
     await db.send(new PutItemCommand({ TableName: process.env.TABLE,
       Item: { pk: S(`PROJECT#${identity.sub}/main`), sk: S(`AGENT#${id}`),
-        id: S(id), name: S(name.trim()), modelId: S(modelId),
+        id: S(id), name: S(agent.name), modelId: S(modelId),
         systemPrompt: S(systemPrompt), codeInterpreter: { BOOL: codeInterpreter },
-        createdAt: S(new Date().toISOString()) },
+        createdAt: S(agent.createdAt) },
       ConditionExpression: "attribute_not_exists(pk)" }));
-    return { status: 200, data: { ok: true, data: { id } } };
+    return { status: 200, data: { ok: true, data: agent } };
+  }
+  if (body.command === "usage.get") {
+    // Compose two independent, authorized reads inside one Runtime invocation.
+    const [summary, detail] = await Promise.all([
+      invoke({ v: 1, command: "usage.summary", input: {} }, identity),
+      invoke({ v: 1, command: "usage.list", input: body.input }, identity),
+    ]);
+    if (summary.status !== 200) return summary;
+    if (detail.status !== 200) return detail;
+    return { status: 200, data: { ok: true,
+      data: { ...summary.data.data, ...detail.data.data } } };
   }
   if (body.command === "usage.summary") {
     const limits = await defaults();
@@ -206,7 +253,8 @@ async function invoke(body, identity) {
         budgetMicroUsd: Number(row.Item?.budgetMicroUsd?.N || limits.budgetMicroUsd),
         storageBytes: Number(row.Item?.storageBytes?.N || limits.storageBytes) };
     }));
-    return { status: 200, data: { ok: true, data: { items, cursor: page.PaginationToken || null } } };
+    return { status: 200, data: { ok: true, data: {
+      items, cursor: page.PaginationToken || null, defaults: limits } } };
   }
   if (body.command === "users.invite") {
     const { email, role } = body.input;
@@ -265,46 +313,7 @@ async function invoke(body, identity) {
   }
   if (body.command !== "session.get" || Object.keys(body.input).length)
     return { status: 501, data: { ok: false, error: { code: "NOT_IMPLEMENTED" } } };
-  const user = await idp.send(
-    new AdminGetUserCommand({
-      UserPoolId: process.env.POOL,
-      Username: identity.sub,
-    }),
-  );
-  const email =
-    user.UserAttributes?.find((attribute) => attribute.Name === "email")
-      ?.Value || "";
-  const limits = await defaults();
-  const row = await db.send(
-    new UpdateItemCommand({
-      TableName: process.env.TABLE,
-      Key: key("USER#" + identity.sub, "CONTROL"),
-      UpdateExpression:
-        "SET budgetMicroUsd = if_not_exists(budgetMicroUsd, :budget), storageBytes = if_not_exists(storageBytes, :storage)",
-      ExpressionAttributeValues: {
-        ":budget": N(limits.budgetMicroUsd),
-        ":storage": N(limits.storageBytes),
-      },
-      ReturnValues: "ALL_NEW",
-    }),
-  );
-  return {
-    status: 200,
-    data: {
-      ok: true,
-      data: {
-        user: {
-          sub: identity.sub,
-          email,
-          role: identity.role,
-          budgetMicroUsd: Number(row.Attributes.budgetMicroUsd.N),
-          storageBytes: Number(row.Attributes.storageBytes.N),
-        },
-        defaults: limits,
-        defaultProjectId: "main",
-      },
-    },
-  };
+  return { status: 200, data: { ok: true, data: await getSession(identity) } };
 }
 
 async function runModel(config, messages, emit) {
@@ -416,26 +425,28 @@ async function chat(input, identity, response) {
     return respond(response, 400, { ok: false, error: { code: "VALIDATION_FAILED" } });
   if (identity.role === "Auditors")
     return respond(response, 403, { ok: false, error: { code: "FORBIDDEN" } });
-  const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
-    Key: key(`PROJECT#${identity.sub}/main`, `AGENT#${agentId}`), ConsistentRead: true }));
-  if (!row.Item)
-    return respond(response, 404, { ok: false, error: { code: "NOT_FOUND" } });
-  const config = unpack(row.Item);
-  const model = await approvedModel(config.modelId);
-  if (!model)
-    return respond(response, 403, { ok: false, error: { code: "MODEL_UNAVAILABLE" } });
-  const defaultsRow = await defaults();
-  const period = periodKey(defaultsRow.period);
-  const prior = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
-    Key: key(`USER#${identity.sub}`, `REQUEST#${requestId}`), ConsistentRead: true }));
-  if (prior.Item)
-    return respond(response, 409, { ok: false, error: { code: "REQUEST_ALREADY_COMPLETED" } });
-  const [spent, user] = await Promise.all([
+  const [row, defaultsRow, prior, user] = await Promise.all([
     db.send(new GetItemCommand({ TableName: process.env.TABLE,
-      Key: key(`USER#${identity.sub}`, period), ConsistentRead: true })),
+      Key: key(`PROJECT#${identity.sub}/main`, `AGENT#${agentId}`), ConsistentRead: true })),
+    defaults(),
+    db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: key(`USER#${identity.sub}`, `REQUEST#${requestId}`), ConsistentRead: true })),
     db.send(new GetItemCommand({ TableName: process.env.TABLE,
       Key: key(`USER#${identity.sub}`, "CONTROL"), ConsistentRead: true })),
   ]);
+  if (!row.Item)
+    return respond(response, 404, { ok: false, error: { code: "NOT_FOUND" } });
+  const config = unpack(row.Item);
+  if (prior.Item)
+    return respond(response, 409, { ok: false, error: { code: "REQUEST_ALREADY_COMPLETED" } });
+  const period = periodKey(defaultsRow.period);
+  const [model, spent] = await Promise.all([
+    approvedModel(config.modelId),
+    db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: key(`USER#${identity.sub}`, period), ConsistentRead: true })),
+  ]);
+  if (!model)
+    return respond(response, 403, { ok: false, error: { code: "MODEL_UNAVAILABLE" } });
   const limit = Number(user.Item?.budgetMicroUsd?.N ?? defaultsRow.budgetMicroUsd);
   if (Number(spent.Item?.costMicroUsd?.N || 0) >= limit)
     return respond(response, 403, { ok: false, error: { code: "BUDGET_EXHAUSTED" } });

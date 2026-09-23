@@ -292,7 +292,6 @@ export async function createLiveFixture({ stackName, profile, region }) {
     cleanup,
     readUserControl,
     controllerUrl,
-    apiUrl: outputs.ApiUrl ? outputs.ApiUrl + "/rpc" : null,
     trackChat: (agentId, sessionId) => chatSessions.push(`a_${agentId}_${sessionId}`),
     readChat: async (agentId, sessionId) => memory.send(new memoryApi.ListEventsCommand({
       memoryId: outputs.MemoryArn, actorId: `${sub}/main`,
@@ -308,10 +307,19 @@ export async function createLiveFixture({ stackName, profile, region }) {
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-benchmark"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
+  const uiInvocations = [];
+  page.on("request", (request) => {
+    if (!request.url().includes("/runtimes/")) return;
+    const body = request.postDataJSON();
+    if (story === "runtime-ui" && body?.command === "chat.send")
+      fixture.trackChat(body.input.agentId, body.input.sessionId);
+    uiInvocations.push({ command: body?.command, input: body?.input,
+      runtimeSession: request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"] });
+  });
   const tokenResponse =
     ["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story)
       ? page.waitForResponse((response) =>
@@ -327,30 +335,74 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .first()
     .click();
   await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+  if (uiInvocations.length !== 1 || uiInvocations[0].command !== "workspace.get" ||
+    !uiInvocations[0].runtimeSession)
+    throw new Error("Sign-in must load the workspace in one sticky Runtime invocation");
+  if (story === "runtime-ui") {
+    await page.getByRole("button", { name: "Choose an agent" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.locator("#agent-model option[value='test.echo']").waitFor({ state: "attached" });
+    await dialog.locator("#agent-name").fill("Smoke UI agent");
+    await dialog.locator("#agent-model").selectOption("test.echo");
+    await dialog.getByRole("button", { name: "Create agent" }).click();
+    await dialog.waitFor({ state: "hidden" });
+    const message = page.locator('textarea[aria-label="Message"]');
+    await message.fill("hello ui");
+    await page.getByRole("button", { name: "Send ↑" }).click();
+    await page.locator(".message-text").getByText("Echo: hello ui").waitFor();
+    await page.getByRole("button", { name: "Smoke UI agent" }).first().click();
+    await message.fill("second ui");
+    await page.getByRole("button", { name: "Send ↑" }).click();
+    await page.locator(".message-text").getByText("Echo: second ui").waitFor();
+    const chats = uiInvocations.filter((item) => item.command === "chat.send");
+    if (chats.length !== 2 || chats[0].input.sessionId === chats[1].input.sessionId ||
+      uiInvocations.some((item) => item.command === "agents.list") ||
+      uiInvocations.some((item) => item.runtimeSession !== uiInvocations[0].runtimeSession))
+      throw new Error("UI did not reuse one Runtime session across control and conversations");
+    if (screenshot)
+      await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-chat", undefined, { fullPage: true });
+      });
+    return;
+  }
   if (["runtime", "runtime-chat", "runtime-tool", "runtime-benchmark"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
     if (story === "runtime-benchmark") {
-      const sample = await page.evaluate(async ({ runtimeUrl, apiUrl, token }) => {
+      const sample = await page.evaluate(async ({ runtimeUrl, token }) => {
         const runtimeSession = `bench-${crypto.randomUUID()}`;
-        const call = async (url, command, input) => {
+        const call = async (command, input) => {
           const start = performance.now();
-          const response = await fetch(url, { method: "POST", headers: {
+          const response = await fetch(runtimeUrl, { method: "POST", headers: {
             authorization: `Bearer ${token}`, "content-type": "application/json",
-            ...(url === runtimeUrl && { "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession }),
+            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
           }, body: JSON.stringify({ v: 1, command, input }) });
           const data = await response.json();
           if (!response.ok || !data.ok) throw Error(`${command}: ${response.status}`);
           return { ms: performance.now() - start, data: data.data };
         };
-        const coldRuntimeMs = (await call(runtimeUrl, "session.get", {})).ms;
-        if (apiUrl) await call(apiUrl, "session.get", {});
-        const controls = { runtime: [], lambda: [] };
-        for (let i = 0; i < 8; i++) {
-          controls.runtime.push((await call(runtimeUrl, "session.get", {})).ms);
-          if (apiUrl) controls.lambda.push((await call(apiUrl, "session.get", {})).ms);
+        const coldRuntimeMs = (await call("workspace.get", {})).ms;
+        const controls = [];
+        for (let i = 0; i < 8; i++)
+          controls.push((await call("session.get", {})).ms);
+        const signIn = { separate: [], workspace: [] };
+        for (let i = 0; i < 5; i++) {
+          const start = performance.now();
+          await call("session.get", {});
+          await call("agents.list", { projectId: "main" });
+          signIn.separate.push(performance.now() - start);
+          signIn.workspace.push((await call("workspace.get", {})).ms);
         }
-        const agentId = (await call(runtimeUrl, "agents.put", {
+        const usageView = { parallel: [], combined: [] };
+        for (let i = 0; i < 5; i++) {
+          const start = performance.now();
+          await Promise.all([call("usage.summary", {}),
+            call("usage.list", { range: "30d" })]);
+          usageView.parallel.push(performance.now() - start);
+          usageView.combined.push((await call("usage.get", { range: "30d" })).ms);
+        }
+        const agentId = (await call("agents.put", {
           projectId: "main", name: "Benchmark agent", modelId: "test.echo",
         })).data.id;
         const sessionId = crypto.randomUUID();
@@ -376,19 +428,22 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           if (!text.includes('"type":"message.done"')) throw Error(`Incomplete chat: ${text}`);
           chat.push({ firstChunkMs, completeMs: performance.now() - start });
         }
-        return { coldRuntimeMs, controls, chat, agentId, sessionId };
-      }, { runtimeUrl: fixture.controllerUrl, apiUrl: fixture.apiUrl, token: accessToken });
+        return { coldRuntimeMs, controls, signIn, usageView, chat, agentId, sessionId };
+      }, { runtimeUrl: fixture.controllerUrl, token: accessToken });
       fixture.trackChat(sample.agentId, sample.sessionId);
       const percentile = (values, fraction) =>
         Math.round([...values].sort((a, b) => a - b)[Math.ceil(values.length * fraction) - 1]);
       const summarize = (values) => ({ p50Ms: percentile(values, 0.5), p95Ms: percentile(values, 0.95) });
       console.log("BENCHMARK " + JSON.stringify({
         coldRuntimeMs: Math.round(sample.coldRuntimeMs),
-        warmRuntimeControl: summarize(sample.controls.runtime),
-        warmLambdaControl: sample.controls.lambda.length ? summarize(sample.controls.lambda) : null,
+        warmRuntimeControl: summarize(sample.controls),
+        sequentialSignIn: summarize(sample.signIn.separate),
+        workspaceSignIn: summarize(sample.signIn.workspace),
+        parallelUsageView: summarize(sample.usageView.parallel),
+        combinedUsageView: summarize(sample.usageView.combined),
         chatFirstChunk: summarize(sample.chat.map((x) => x.firstChunkMs)),
         chatComplete: summarize(sample.chat.map((x) => x.completeMs)),
-        samples: { controlsPerPath: 8, chat: 5 },
+        samples: { controls: 8, signInPerPath: 5, usagePerPath: 5, chat: 5 },
       }));
       return;
     }
@@ -570,6 +625,9 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   await page.getByRole("dialog").locator("#usage-scope").selectOption("all");
   await page.getByRole("dialog").getByText(/(Daily|Weekly|Monthly) ·/).waitFor();
   await page.getByRole("dialog").getByText("No requests in this range.").waitFor();
+  if (uiInvocations.some((item) => ["usage.summary", "usage.list", "defaults.get"].includes(item.command)) ||
+    uiInvocations.filter((item) => item.command === "usage.get").length !== 4)
+    throw new Error("Usage and Users dialogs made avoidable Runtime invocations");
   if (screenshot)
     await page.evaluate(async () => {
       const { _screenshot } = await import("./tests.js");

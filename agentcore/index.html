@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-UKMu4uAU5UmcxdzaBfhkTRBM+3d6gsD5lts/1fHOQ1ZCwikC7nzEPClhtO3b3HgW' https://cdn.jsdelivr.net; style-src 'sha384-JmalHHmnnsAGTpkLNIpJuU44MiCNoRwhT0FUSHwEMTgrdxDrAN1PCkcz0jGs4zc0'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-tlRsxQQlj92dAaGahUsX/ye8ODr3K3nBu3KYJeKaz4qINSfFnBo/qbg4Xy6qBGoe' https://cdn.jsdelivr.net; style-src 'sha384-JmalHHmnnsAGTpkLNIpJuU44MiCNoRwhT0FUSHwEMTgrdxDrAN1PCkcz0jGs4zc0'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -789,13 +789,15 @@
         )
           throw Error("Cognito token claims did not match this deployment.");
         tokens = next;
-        const self = await rpc("session.get", {});
-        setSession(self);
-        await loadAgents(self.defaultProjectId);
+        runtimeSessionId = crypto.randomUUID();
+        const workspace = await rpc("workspace.get", {});
+        setSession(workspace.session);
+        setAgents(workspace.agents);
       }
       async function signOut() {
         const config = deployment();
         tokens = null;
+        runtimeSessionId = crypto.randomUUID();
         setSession(null);
         setAgents([]);
         setMessages([]);
@@ -810,7 +812,8 @@
       }
 
       // 2. The product API owns AWS authorization, state changes, and metering.
-      const runtimeControlSession = crypto.randomUUID();
+      // One opaque Runtime session per signed-in browser; Memory sessions stay per conversation.
+      let runtimeSessionId = crypto.randomUUID();
       const runtimeUrl = (config) =>
         `https://bedrock-agentcore.${config.region}.amazonaws.com/runtimes/${encodeURIComponent(config.runtime)}/invocations?qualifier=DEFAULT`;
       async function rpc(command, input) {
@@ -823,7 +826,7 @@
           headers: {
             "Content-Type": "application/json",
             Authorization: "Bearer " + access,
-            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeControlSession,
+            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSessionId,
           },
           body: JSON.stringify({
             v: 1,
@@ -836,15 +839,6 @@
         if (!response.ok || !result.ok)
           throw Error(result.error?.message || command + " failed");
         return result.data;
-      }
-      async function loadAgents(projectId) {
-        if (!projectId) return;
-        try {
-          const result = await rpc("agents.list", { projectId });
-          setAgents(result.items || result.agents || []);
-        } catch (cause) {
-          setError(cause.message);
-        }
       }
       async function send() {
         const message = draft().trim(),
@@ -866,7 +860,7 @@
             headers: {
               "Content-Type": "application/json",
               Authorization: "Bearer " + (await accessToken()),
-              "x-amzn-bedrock-agentcore-runtime-session-id": `a_${agent.id}_${conversationId()}`,
+              "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSessionId,
             },
             body: JSON.stringify({ v: 1, command: "chat.send", input: {
               projectId: self.defaultProjectId,
@@ -964,21 +958,17 @@
         setView({ route, loading: true });
         try {
           if (route === "users") {
-            const [users, defaults] = await Promise.all([
-              rpc("users.list", {}),
-              rpc("defaults.get", {}),
-            ]);
-            if (request === viewRequest) setView({ route, ...users, defaults });
+            const users = await rpc("users.list", {});
+            if (request === viewRequest) setView({ route, ...users });
           } else if (route === "agents") {
             const result = await rpc("models.list", {});
             if (request === viewRequest) setView({ route, ...result });
           } else if (route === "usage") {
-            const [summary, detail] = await Promise.all([
-              rpc("usage.summary", {}),
-              rpc("usage.list", { range: usageRange(), sort: usageSort(), scope: usageScope() }),
-            ]);
+            const detail = await rpc("usage.get", {
+              range: usageRange(), sort: usageSort(), scope: usageScope(),
+            });
             if (request === viewRequest)
-              setView({ route, ...summary, items: detail.items, nextCursor: detail.nextCursor });
+              setView({ route, ...detail });
           } else {
             const result = await rpc(route + ".list", {});
             if (request === viewRequest) setView({ route, ...result });
@@ -1024,9 +1014,8 @@
             systemPrompt: form.get("systemPrompt"),
             codeInterpreter: form.has("codeInterpreter"),
           });
-          const list = await rpc("agents.list", { projectId: session().defaultProjectId });
-          setAgents(list.items);
-          setSelectedAgent(list.items.find((agent) => agent.id === result.id));
+          setAgents((items) => [...items, result]);
+          setSelectedAgent(result);
           setConversationId(crypto.randomUUID());
           setMessages([]);
           setModal(null);

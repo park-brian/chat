@@ -14,6 +14,7 @@
     "test:live": "node scripts/sync-csp.js --check && node ../test.js index.html --story login --live-stack",
     "test:runtime": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime --live-stack",
     "test:runtime-chat": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-chat --live-stack",
+    "test:runtime-ui": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-ui --live-stack",
     "test:runtime-tool": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-tool --live-stack",
     "bench:runtime": "node ../test.js index.html --story runtime-benchmark --live-stack"
   },
