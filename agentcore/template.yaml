@@ -317,6 +317,7 @@ Resources:
     Condition: HasControllerCode
     Properties:
       AgentRuntimeName: !Sub '${ResourcePrefix}_controller'
+      PlatformVersion: V2
       Description: Cognito-scoped product API and direct model loop; no Harness or Lambda needed.
       AgentRuntimeArtifact:
         CodeConfiguration:
