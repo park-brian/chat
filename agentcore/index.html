@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-xRWhIue77y70+0QwkMymJuyQGiqV+ffMClo9btxYsD9SvzgmP5/EWoB2oPT825Ad' https://cdn.jsdelivr.net; style-src 'sha384-/N/SE7C2XRv//nah4LgSQpaXeSt826viaWeYUuH3uhJYfG0xUl0GLmQ3MQ0hQS0T'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-YI3gTSqBFY6hVO7Edif9pmz/n+TdXgrE7BrHLUbFqVu7RZ2Me8r1EAV3RCjygIty' https://cdn.jsdelivr.net; style-src 'sha384-0uGIx2Ip1BbdBQBGXyQ+5xVRibP7jnRrZyS8gGSUn+Zxw0EXmgpSAWnOI3QViESy'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -445,6 +445,20 @@
         background: #fbfcfa;
         color: #263a2d;
         font-size: 12px;
+      }
+      .field .check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .field input[type="checkbox"] {
+        width: auto;
+        padding: 0;
+        margin: 0;
+        accent-color: #176c53;
+      }
+      .field .help {
+        margin: 0;
       }
       .field small {
         color: #89978c;
@@ -1484,17 +1498,23 @@
               createAgent(new FormData(event.currentTarget));
             }}>
               <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" name="name" required maxlength="80" /></div>
-              <div class="field"><label for="agent-model">Model</label><select id="agent-model" name="modelId" required>
+              <div class="field"><label for="agent-model">Model</label><select id="agent-model" name="modelId" required
+                onChange=${(event) => {
+                  const tool = event.currentTarget.form.elements.codeInterpreter;
+                  tool.disabled = event.currentTarget.value.startsWith("gemini-");
+                  if (tool.disabled) tool.checked = false;
+                }}>
                 <${For} each=${modelCompanies}>${(company) => html`
                   <optgroup label=${company}>
                     <${For} each=${() => (view()?.route === "agents" ? view()?.items || [] : [])
                       .filter((model) => modelCompany(model) === company)}>
-                      ${(model) => html`<option value=${model.id} disabled=${!model.active}>${model.name}${model.active ? "" : " · needs adapter"}</option>`}<//>
+                      ${(model) => html`<option value=${model.id} disabled=${!model.active}>${model.name}${model.active ? "" : " · not configured"}</option>`}<//>
                   </optgroup>`}<//>
               </select></div>
               <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3"></textarea></div>
               <div class="field"><label for="agent-max-output">Maximum output tokens per model turn</label><input id="agent-max-output" name="maxOutputTokens" type="number" min="16" max="4096" step="1" value="4096" required /></div>
-              <div class="field"><label><input type="checkbox" name="codeInterpreter" /> Enable managed Code Interpreter</label></div>
+              <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" /> Enable managed Code Interpreter</label>
+                <p class="help">Code Interpreter currently supports Bedrock models only.</p></div>
               <div class="actions"><button class="primary" type="submit">Create agent</button></div>
             </form>
             <${Show}

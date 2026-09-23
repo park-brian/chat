@@ -292,6 +292,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
     cleanup,
     readUserControl,
     controllerUrl,
+    hasGemini: Boolean(outputs.GeminiCredentialArn),
     trackChat: (agentId, sessionId) => chatSessions.push(`a_${agentId}_${sessionId}`),
     readChat: async (agentId, sessionId) => memory.send(new memoryApi.ListEventsCommand({
       memoryId: outputs.MemoryArn, actorId: `${sub}/main`,
@@ -352,8 +353,13 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     await dialog.locator("#agent-model option[value='test.echo']").waitFor({ state: "attached" });
     await dialog.locator("#agent-model option[value='global.openai.gpt-6-luna']")
       .waitFor({ state: "attached" });
-    if (!(await dialog.locator("#agent-model option[value='gemini-3.8-flash']").isDisabled()))
-      throw new Error("Gemini must remain disabled until its adapter exists");
+    if (await dialog.locator("#agent-model option[value='gemini-3.8-flash']").isDisabled() === fixture.hasGemini)
+      throw new Error("Gemini dropdown availability must match the stack credential");
+    if (fixture.hasGemini) {
+      await dialog.locator("#agent-model").selectOption("gemini-3.8-flash");
+      if (!(await dialog.locator('input[name="codeInterpreter"]').isDisabled()))
+        throw new Error("Gemini cannot offer the unimplemented Code Interpreter bridge");
+    }
     if (screenshot)
       await page.evaluate(async () => {
         const { _screenshot } = await import("./tests.js");
@@ -400,16 +406,18 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (story === "runtime-model") {
       const catalog = (await import("./models.json", { with: { type: "json" } })).default;
       const selected = process.env.AGENTCORE_TEST_MODEL;
-      if (selected && !catalog.some((model) => model.transport === "bedrock" && model.id === selected))
-        throw new Error("AGENTCORE_TEST_MODEL must name a checked-in Bedrock model");
+      if (selected && !catalog.some((model) =>
+        ["bedrock", "gemini"].includes(model.transport) && model.id === selected))
+        throw new Error("AGENTCORE_TEST_MODEL must name a checked-in live model");
       for (const { id: modelId } of catalog.filter((model) =>
-        model.transport === "bedrock" && (!selected || model.id === selected))) {
+        (selected ? model.id === selected : model.transport === "bedrock"))) {
       const ids = await page.evaluate(async ({ url, token, modelId }) => {
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "agents.put", input: {
-          projectId: "main", name: "Capped model smoke", modelId, maxOutputTokens: 64,
+          projectId: "main", name: "Capped model smoke", modelId,
+          maxOutputTokens: modelId.startsWith("gemini-") ? 256 : 64,
         } }) });
         if (!response.ok) throw Error("Could not create model smoke agent");
         return { agentId: (await response.json()).data.id, sessionId: crypto.randomUUID() };
@@ -429,9 +437,29 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       }, { url: fixture.controllerUrl, token: accessToken, ids });
       if (result.status !== 200 || !result.stream.includes('"type":"message.done"'))
         throw new Error("Real-model turn incomplete: " + result.stream.slice(-1000));
+      if (modelId === "gemini-3.8-flash" &&
+        result.stream.includes("output limit before producing a visible reply"))
+        throw new Error("Gemini smoke used all tokens on thinking");
       const usage = await fixture.readUsage();
       if (!(usage.Items || []).some((row) => row.modelId?.S === modelId))
         throw new Error("Real-model usage row missing");
+      if (modelId === "gemini-3.8-flash") {
+        const followUp = await page.evaluate(async ({ url, token, ids }) => {
+          const response = await fetch(url, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
+          }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            projectId: "main", ...ids, requestId: crypto.randomUUID(),
+            message: "Reply SECOND only.",
+          } }) });
+          return { status: response.status, stream: await response.text() };
+        }, { url: fixture.controllerUrl, token: accessToken, ids });
+        if (followUp.status !== 200 || !followUp.stream.includes('"type":"message.done"'))
+          throw new Error("Gemini follow-up incomplete: " + followUp.stream.slice(-1000));
+        const events = await fixture.readChat(ids.agentId, ids.sessionId);
+        if ((events.events || []).length < 2)
+          throw new Error("Gemini follow-up was not retained in Memory");
+      }
       console.log("REAL_MODEL " + JSON.stringify({ modelId, elapsedMs: result.elapsedMs }));
       }
       return;
@@ -692,9 +720,9 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   await page.getByRole("button", { name: /View agents/ }).click();
   await page.getByRole("dialog").locator("#agent-model option[value='global.openai.gpt-6-luna']")
     .waitFor({ state: "attached" });
-  if (!(await page.getByRole("dialog")
-    .locator("#agent-model option[value='gemini-3.8-flash']").isDisabled()))
-    throw new Error("Unimplemented Gemini adapter must not be selectable");
+  if (await page.getByRole("dialog")
+    .locator("#agent-model option[value='gemini-3.8-flash']").isDisabled() === fixture.hasGemini)
+    throw new Error("Gemini dropdown availability must match the stack credential");
   await page.getByRole("dialog").getByRole("button", { name: "Close dialog" }).click();
   await page.getByRole("button", { name: /Usage/ }).first().click();
   await page.getByRole("dialog").getByText(/Not yet metered|\$0\.00/).first().waitFor();

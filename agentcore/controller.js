@@ -19,6 +19,7 @@ import {
 } from "@aws-sdk/client-dynamodb";
 import {
   BedrockAgentCoreClient, CreateEventCommand, ListEventsCommand,
+  GetResourceApiKeyCommand,
   StartCodeInterpreterSessionCommand, InvokeCodeInterpreterCommand,
   StopCodeInterpreterSessionCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
@@ -89,7 +90,9 @@ async function approvedModel(modelId) {
   if (modelId === "test.echo")
     return process.env.SCRIPTED_MODEL === "true" ? { id: modelId } : null;
   const model = suggestedModels.find((entry) => entry.id === modelId);
-  return model?.transport === "bedrock" && Number.isSafeInteger(model.inputRate) &&
+  return (model?.transport === "bedrock" ||
+    (model?.transport === "gemini" && process.env.GEMINI_PROVIDER)) &&
+    Number.isSafeInteger(model.inputRate) &&
     Number.isSafeInteger(model.outputRate) ? model : null;
 }
 
@@ -220,8 +223,11 @@ async function invoke(body, identity) {
       typeof codeInterpreter !== "boolean" ||
       !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 16 || maxOutputTokens > 4096)
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    if (!(await approvedModel(modelId)))
+    const model = await approvedModel(modelId);
+    if (!model)
       return { status: 400, data: { ok: false, error: { code: "MODEL_UNAVAILABLE" } } };
+    if (model.transport === "gemini" && codeInterpreter)
+      return { status: 400, data: { ok: false, error: { code: "TOOL_UNAVAILABLE" } } };
     const id = randomUUID();
     const agent = { id, name: name.trim(), modelId, systemPrompt,
       codeInterpreter, maxOutputTokens, createdAt: new Date().toISOString() };
@@ -299,7 +305,8 @@ async function invoke(body, identity) {
   }
   if (body.command === "models.list") {
     const items = suggestedModels.map((model) =>
-      ({ ...model, active: model.transport === "bedrock" }));
+      ({ ...model, active: model.transport === "bedrock" ||
+        (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER)) }));
     if (process.env.SCRIPTED_MODEL === "true")
       items.unshift({ id: "test.echo", name: "Scripted echo (test only)", active: true });
     return { status: 200, data: { ok: true, data: { items } } };
@@ -371,7 +378,77 @@ async function invoke(body, identity) {
   return { status: 200, data: { ok: true, data: await getSession(identity) } };
 }
 
-async function runModel(config, messages, emit) {
+async function runGemini(config, messages, emit, workloadToken) {
+  if (!workloadToken) throw Error("Missing runtime workload token");
+  const { apiKey } = await memory.send(new GetResourceApiKeyCommand({
+    resourceCredentialProviderName: process.env.GEMINI_PROVIDER,
+    workloadIdentityToken: workloadToken,
+  }));
+  const body = {
+    contents: messages.map(({ role, content }) => ({
+      role: role === "assistant" ? "model" : "user",
+      parts: content.map(({ text }) => ({ text })),
+    })),
+    ...(config.systemPrompt && { systemInstruction: { parts: [{ text: config.systemPrompt }] } }),
+    generationConfig: { maxOutputTokens: config.maxOutputTokens || 4096,
+      ...(config.maxOutputTokens < 256 && { thinkingConfig: { thinkingLevel: "low" } }) },
+  };
+  const reply = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.modelId)}:streamGenerateContent?alt=sse`,
+    { method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(120000) },
+  );
+  if (!reply.ok) {
+    const error = Error(`Gemini HTTP ${reply.status}`);
+    error.name = "GeminiHttpError";
+    throw error;
+  }
+  if (!reply.body) throw Error("Gemini response had no stream");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let reported;
+  for await (const chunk of reply.body) {
+    buffer += decoder.decode(chunk, { stream: true }).replace(/\r/g, "");
+    if (buffer.length > 1048576) throw Error("Gemini event exceeded limit");
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const data = frame.split("\n").filter((line) => line.startsWith("data: "))
+        .map((line) => line.slice(6)).join("\n");
+      if (!data) continue;
+      const event = JSON.parse(data);
+      for (const part of event.candidates?.[0]?.content?.parts || []) {
+        if (part.text && !part.thought) {
+          text += part.text;
+          emit({ type: "message.delta", text: part.text });
+        }
+      }
+      if (event.usageMetadata) reported = event.usageMetadata;
+    }
+  }
+  if (buffer.trim()) throw Error("Gemini stream ended mid-event");
+  if (!reported) throw Error("Gemini did not report token usage");
+  if (!text) {
+    text = "The model reached its output limit before producing a visible reply.";
+    emit({ type: "message.delta", text });
+  }
+  const inputTokens = reported.promptTokenCount || 0;
+  const cacheReadInputTokens = reported.cachedContentTokenCount || 0;
+  const outputTokens = (reported.candidatesTokenCount || 0) +
+    (reported.thoughtsTokenCount || 0);
+  if (cacheReadInputTokens > inputTokens) throw Error("Invalid Gemini cache meter");
+  return { text, usage: {
+    inputTokens: inputTokens - cacheReadInputTokens, outputTokens,
+    totalTokens: reported.totalTokenCount || inputTokens + outputTokens,
+    cacheReadInputTokens, cacheWriteInputTokens: 0,
+  }, toolCalls: [] };
+}
+
+async function runModel(config, messages, emit, workloadToken) {
+  if (config.modelId === "gemini-3.8-flash")
+    return runGemini(config, messages, emit, workloadToken);
   const toolConfig = config.codeInterpreter ? { tools: [{ toolSpec: {
     name: "execute_code",
     description: "Execute Python, JavaScript, or TypeScript in an isolated managed Code Interpreter.",
@@ -471,7 +548,7 @@ async function runModel(config, messages, emit) {
   }
 }
 
-async function chat(input, identity, response) {
+async function chat(input, identity, response, workloadToken) {
   const { projectId, agentId, sessionId, requestId, message } = input;
   const uuid = /^[0-9a-f-]{36}$/i;
   if (projectId !== "main" || !uuid.test(agentId || "") ||
@@ -524,7 +601,7 @@ async function chat(input, identity, response) {
   const emit = (event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
   const started = Date.now();
   try {
-    const result = await runModel(config, messages, emit);
+    const result = await runModel(config, messages, emit, workloadToken);
     const costMicroUsd = modelCost(result.usage, model);
     const occurredAt = new Date().toISOString();
     const receipt = { version: 1, requestId, agentId, conversationId: sessionId,
@@ -598,7 +675,8 @@ async function chat(input, identity, response) {
         ? "The model is busy. Please try again."
         : "Agent turn failed";
     emit({ type: "error", message,
-      ...(process.env.SCRIPTED_MODEL === "true" && { diagnostic: error.name }) });
+      ...(process.env.SCRIPTED_MODEL === "true" && {
+        diagnostic: error.name, detail: error.message?.slice(0, 300) }) });
   } finally {
     response.end();
   }
@@ -650,7 +728,8 @@ createServer(async (request, response) => {
       });
     }
     if (body?.v === 1 && body.command === "chat.send")
-      return await chat(body.input || {}, identity, response);
+      return await chat(body.input || {}, identity, response,
+        request.headers.workloadaccesstoken);
     const result = await invoke(body, identity);
     respond(response, result.status, result.data);
   } catch {

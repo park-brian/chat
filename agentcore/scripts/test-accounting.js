@@ -12,5 +12,9 @@ assert.equal(modelCost({ inputTokens: 100, outputTokens: 20,
   { inputRate: 3000000, outputRate: 15000000,
     cacheReadRate: 300000, cacheWriteRate: 3750000 }), 650);
 assert.equal(modelCost({ inputTokens: 1, outputTokens: 0 }, { inputRate: 250000 }), 0);
+// Gemini reports cache reads inside promptTokenCount; its adapter separates them.
+assert.equal(modelCost({ inputTokens: 75, cacheReadInputTokens: 25,
+  outputTokens: 10, cacheWriteInputTokens: 0 },
+{ inputRate: 750000, cacheReadRate: 75000, outputRate: 3750000 }), 96);
 assert.throws(() => modelCost({ inputTokens: -1, outputTokens: 1 }, { inputRate: 1 }), /Invalid/);
-console.log("PASS: on-demand UTC periods and separate Bedrock cache meters");
+console.log("PASS: on-demand UTC periods and provider-normalized cache meters");

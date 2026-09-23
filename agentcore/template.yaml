@@ -40,9 +40,15 @@ Parameters:
     Default: 'false'
     AllowedValues: ['false', 'true']
     Description: Disposable test stacks only; never enable scripted inference in production.
+  GeminiApiKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Optional Google Gemini key, stored by AgentCore Identity; never put it in code or browser settings.
 
 Conditions:
   HasControllerCode: !Not [!Equals [!Ref ControllerCodeKey, '']]
+  HasGemini: !Not [!Equals [!Ref GeminiApiKey, '']]
 
 Resources:
   UserPool:
@@ -218,6 +224,16 @@ Resources:
       Tags:
         app: agentcore-chat
         stack: !Ref AWS::StackName
+  GeminiCredential:
+    Type: AWS::BedrockAgentCore::ApiKeyCredentialProvider
+    Condition: HasGemini
+    Properties:
+      Name: !Sub '${ResourcePrefix}-gemini'
+      ApiKeySecretSource: MANAGED
+      ApiKey: !Ref GeminiApiKey
+      Tags:
+        - {Key: app, Value: agentcore-chat}
+        - {Key: stack, Value: !Ref 'AWS::StackName'}
   ControllerRole:
     Type: AWS::IAM::Role
     Condition: HasControllerCode
@@ -243,6 +259,22 @@ Resources:
               - Effect: Allow
                 Action: [bedrock-agentcore:CreateEvent, bedrock-agentcore:ListEvents]
                 Resource: !Ref Memory
+              - !If
+                - HasGemini
+                - Effect: Allow
+                  Action: [bedrock-agentcore:GetResourceApiKey]
+                  Resource:
+                    - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                    - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${ResourcePrefix}_controller-*'
+                    - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default'
+                    - !GetAtt GeminiCredential.CredentialProviderArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasGemini
+                - Effect: Allow
+                  Action: [secretsmanager:GetSecretValue]
+                  Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/apikey/${ResourcePrefix}-gemini-*'
+                - !Ref AWS::NoValue
               - Effect: Allow
                 Action: [bedrock-agentcore:StartCodeInterpreterSession, bedrock-agentcore:InvokeCodeInterpreter, bedrock-agentcore:StopCodeInterpreterSession]
                 Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1'
@@ -303,6 +335,7 @@ Resources:
         STORAGE: !Ref DefaultStorageBytes
         MEMORY: !GetAtt Memory.MemoryId
         SCRIPTED_MODEL: !Ref EnableScriptedModel
+        GEMINI_PROVIDER: !If [HasGemini, !Sub '${ResourcePrefix}-gemini', '']
       Tags: {app: agentcore-chat, stack: !Ref 'AWS::StackName'}
 
 Outputs:
@@ -315,6 +348,7 @@ Outputs:
   GatewayArn: {Value: !GetAtt Gateway.GatewayArn}
   PolicyEngineArn: {Value: !GetAtt PolicyEngine.PolicyEngineArn}
   ControllerArn: {Value: !If [HasControllerCode, !GetAtt Controller.AgentRuntimeArn, '']}
+  GeminiCredentialArn: {Value: !If [HasGemini, !GetAtt GeminiCredential.CredentialProviderArn, '']}
   ApplicationEntryUrl:
     Condition: HasControllerCode
     Value: !Sub '${ApplicationUrl}?region=${AWS::Region}&stack=${AWS::StackName}&pool=${UserPool}&client=${Client}&domain=https%3A%2F%2F${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com&scope=chat-api%2Faccess&runtime=${Controller.AgentRuntimeArn}'
