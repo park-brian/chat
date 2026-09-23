@@ -287,6 +287,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
     : null;
   return {
     entryUrl: entry.href,
+    publicEntryUrl: outputs.ApplicationEntryUrl,
     email,
     password,
     cleanup,

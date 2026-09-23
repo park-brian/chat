@@ -23,7 +23,7 @@ function options(argv) {
   const [target, ...flags] = argv;
   if (!target)
     throw new Error(
-      "Usage: node test.js <target.html> [--story name] [--screenshot] [--viewports desktop,mobile] [--headed] [--live-stack name --profile name --region name]",
+      "Usage: node test.js <target.html> [--story name] [--screenshot] [--viewports desktop,mobile] [--headed] [--live-stack name --profile name --region name [--published]]",
     );
   const result = {
     target,
@@ -32,6 +32,7 @@ function options(argv) {
     headed: false,
     viewports: ["desktop"],
     liveStack: null,
+    published: false,
     profile: null,
     region: null,
   };
@@ -42,6 +43,7 @@ function options(argv) {
     else if (flags[i] === "--viewports")
       result.viewports = flags[++i]?.split(",") ?? [];
     else if (flags[i] === "--live-stack") result.liveStack = flags[++i];
+    else if (flags[i] === "--published") result.published = true;
     else if (flags[i] === "--profile") result.profile = flags[++i];
     else if (flags[i] === "--region") result.region = flags[++i];
     else throw new Error("Unknown test option: " + flags[i]);
@@ -57,6 +59,8 @@ function options(argv) {
     throw new Error("Invalid story name");
   if (result.liveStack && (!result.profile || !result.region))
     throw new Error("Live stories require --profile and --region");
+  if (result.published && !result.liveStack)
+    throw new Error("--published requires a live stack");
   return { ...result, sizes };
 }
 
@@ -85,16 +89,19 @@ async function run(config = options(process.argv.slice(2))) {
         profile: config.profile,
         region: config.region,
       });
-    const liveUrl = fixture?.entryUrl ? new URL(fixture.entryUrl) : null;
+    const liveUrl = fixture?.entryUrl
+      ? new URL(config.published ? fixture.publicEntryUrl : fixture.entryUrl) : null;
     const port = liveUrl ? Number(liveUrl.port) : 0;
-    try {
-      server = await startServer(port, repository);
-    } catch (error) {
-      if (!liveUrl || error.code !== "EADDRINUSE") throw error;
-      const probe = await fetch(liveUrl.origin + liveUrl.pathname);
-      if (!probe.ok || !(await probe.text()).includes("AgentCore Chat"))
-        throw new Error("Existing local server does not serve the target app");
-      console.log("Using existing local server at " + liveUrl.origin);
+    if (!config.published) {
+      try {
+        server = await startServer(port, repository);
+      } catch (error) {
+        if (!liveUrl || error.code !== "EADDRINUSE") throw error;
+        const probe = await fetch(liveUrl.origin + liveUrl.pathname);
+        if (!probe.ok || !(await probe.text()).includes("AgentCore Chat"))
+          throw new Error("Existing local server does not serve the target app");
+        console.log("Using existing local server at " + liveUrl.origin);
+      }
     }
     const activePort = server?.address().port || port;
     const route = relativeTarget
