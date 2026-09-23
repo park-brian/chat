@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-KW0kNN6m5uHT0h4snmV9HkU40JACDReAV9GblAgzn80tHyzDs68vkq/0yV/K/kj+' https://cdn.jsdelivr.net; style-src 'sha384-FKqynOG3Jn1JdibVR9roPpE1zJat9u7xE7MNP/hXoI5WYwg86sq9gW7dtppjdZPK'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-/CdDmGbqHEhWExz2m5nEPeekkzJJrxiMRaoyNrDWw7k6gZW3RKAg63NchbVRwoDb' https://cdn.jsdelivr.net; style-src 'sha384-FKqynOG3Jn1JdibVR9roPpE1zJat9u7xE7MNP/hXoI5WYwg86sq9gW7dtppjdZPK'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -815,7 +815,16 @@
           throw Error("Cognito token claims did not match this deployment.");
         tokens = next;
         runtimeSessionId = crypto.randomUUID();
-        const workspace = await rpc("workspace.get", {});
+        let workspace;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          try {
+            workspace = await rpc("workspace.get", {});
+            break;
+          } catch (cause) {
+            if (cause.status !== 424 || attempt === 3) throw cause;
+            await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+          }
+        }
         setSession(workspace.session);
         setAgents(workspace.agents);
         setConversations(workspace.conversations.items);
@@ -864,8 +873,12 @@
           }),
         });
         const result = await response.json();
-        if (!response.ok || !result.ok)
-          throw Error(result.error?.message || result.error?.code || command + " failed");
+        if (!response.ok || !result.ok) {
+          const failure = Error(result.error?.message || result.error?.code ||
+            (response.status === 424 ? "Runtime is starting; try again in a moment." : command + " failed"));
+          failure.status = response.status;
+          throw failure;
+        }
         return result.data;
       }
       async function send() {
