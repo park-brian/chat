@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-ljXqCN3U73NmWMR2YoiXO6Od+ROQNIgiO3KpnsAnKMGlXLXsaiKv9g4rK1exDFUQ' https://cdn.jsdelivr.net; style-src 'sha384-Dx7vheeiYJWS4LDJ2DrL7IYlsXqlmsaweKDoNNchVPcynfTX+gZJTMAQHupBvnhd'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-jRhpDte9fiq1RtFWjvh7UNUm0LfrQpPZ4hPPMdt5VTQaN9GgOoojRicXeIHfvwTU' https://cdn.jsdelivr.net; style-src 'sha384-Dx7vheeiYJWS4LDJ2DrL7IYlsXqlmsaweKDoNNchVPcynfTX+gZJTMAQHupBvnhd'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -1070,8 +1070,12 @@
       }
       const [modal, setModal] = createSignal(null);
       const [editingAgent, setEditingAgent] = createSignal(null);
+      const [draftModelId, setDraftModelId] = createSignal(null);
       const [entry, setEntry] = createSignal("");
       const [view, setView] = createSignal(null);
+      const chosenModel = () => (view()?.route === "agents" ? view()?.items || [] : [])
+        .find((model) => model.id === (draftModelId() || editingAgent()?.modelId)) ||
+        view()?.items?.find((model) => model.active);
       const [usageRange, setUsageRange] = createSignal("30d");
       const [usageSort, setUsageSort] = createSignal("desc");
       const [usageScope, setUsageScope] = createSignal("self");
@@ -1102,7 +1106,10 @@
       };
       const openDialog = (route) => {
         setError("");
-        if (route === "agents") setEditingAgent(null);
+        if (route === "agents") {
+          setEditingAgent(null);
+          setDraftModelId(null);
+        }
         setModal(route);
         if (session()) loadView(route);
       };
@@ -1171,13 +1178,13 @@
             name: form.get("name"),
             modelId: form.get("modelId"),
             systemPrompt: form.get("systemPrompt"),
+            thinkingLevel: form.get("thinkingLevel") || undefined,
             codeInterpreter: form.has("codeInterpreter"),
             webSearch: form.has("webSearch"),
             browser: form.has("browser"),
             webSearchMaxResults: Number(form.get("webSearchMaxResults")),
             browserSessionSeconds: Number(form.get("browserSessionSeconds")),
             connectionIds: form.getAll("connectionId"),
-            maxOutputTokens: Number(form.get("maxOutputTokens")),
           });
           setAgents((items) => editing
             ? items.map((item) => item.id === result.id ? result : item)
@@ -1186,6 +1193,7 @@
             if (selectedAgent()?.id === result.id) setSelectedAgent(result);
           } else newChat(result);
           setEditingAgent(null);
+          setDraftModelId(null);
           setModal(null);
         } catch (cause) {
           setError(cause.message);
@@ -1619,8 +1627,9 @@
               <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" name="name" required maxlength="80" value=${() => editingAgent()?.name || ""} /></div>
               <div class="field"><label for="agent-model">Model</label><select id="agent-model" name="modelId" required
                 onChange=${(event) => {
+                  setDraftModelId(event.currentTarget.value);
                   for (const tool of event.currentTarget.form.querySelectorAll("[data-model-tool]")) {
-                    tool.disabled = event.currentTarget.value.startsWith("gemini-");
+                    tool.disabled = chosenModel()?.transport === "gemini";
                     if (tool.disabled) tool.checked = false;
                   }
                 }}>
@@ -1629,24 +1638,34 @@
                     <${For} each=${() => (view()?.route === "agents" ? view()?.items || [] : [])
                       .filter((model) => modelCompany(model) === company)}>
                       ${(model) => html`<option value=${model.id} disabled=${!model.active}
-                        selected=${() => editingAgent()?.modelId === model.id}>${model.name}${model.active ? "" : " · not configured"}</option>`}<//>
+                        selected=${() => (draftModelId() || editingAgent()?.modelId) === model.id}>${model.name}${model.active ? "" : " · not configured"}</option>`}<//>
                   </optgroup>`}<//>
               </select></div>
               <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3" value=${() => editingAgent()?.systemPrompt || ""}></textarea></div>
-              <div class="field"><label for="agent-max-output">Maximum output tokens per model turn</label><input id="agent-max-output" name="maxOutputTokens" type="number" min="16" max="4096" step="1" value=${() => editingAgent()?.maxOutputTokens || 4096} required /></div>
+              <div class="field"><label>Model capacity</label><p class="help">${() =>
+                `${chosenModel()?.contextTokens?.toLocaleString() || "—"} context · ${chosenModel()?.maxOutputTokens?.toLocaleString() || "—"} maximum output tokens per turn. The full output ceiling is used automatically; chat loads 20 recent Memory events.`}</p></div>
+              <${Show} when=${() => chosenModel()?.thinkingLevels?.length}>
+                <div class="field"><label for="agent-thinking">Thinking level</label>
+                  <select id="agent-thinking" name="thinkingLevel">
+                    <${For} each=${() => chosenModel()?.thinkingLevels || []}>
+                      ${(level) => html`<option value=${level} selected=${() =>
+                        level === ((editingAgent()?.modelId === chosenModel()?.id
+                          ? editingAgent()?.thinkingLevel : null) || chosenModel()?.defaultThinkingLevel)}>${level}</option>`}<//>
+                  </select></div>
+              <//>
               <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" data-model-tool
-                disabled=${() => editingAgent()?.modelId?.startsWith("gemini-")}
+                disabled=${() => chosenModel()?.transport === "gemini"}
                 checked=${() => Boolean(editingAgent()?.codeInterpreter)} /> Enable code workspace</label>
                 <p class="help">Python, Node, shell, AWS CLI and internet access in an isolated session. No account credentials are granted automatically. Bedrock models only for now.</p></div>
               <div class="field"><label class="check"><input type="checkbox" name="webSearch" data-model-tool
-                disabled=${() => editingAgent()?.modelId?.startsWith("gemini-")}
+                disabled=${() => chosenModel()?.transport === "gemini"}
                 checked=${() => Boolean(editingAgent()?.webSearch)} /> Enable web search</label>
                 <p class="help">Current public results through AgentCore Gateway. Source links appear beneath the reply.</p>
                 <label for="agent-search-results">Maximum results per search</label>
                 <input id="agent-search-results" name="webSearchMaxResults" type="number" min="1" max="25"
                   value=${() => editingAgent()?.webSearchMaxResults || 5} required /></div>
               <div class="field"><label class="check"><input type="checkbox" name="browser" data-model-tool
-                disabled=${() => editingAgent()?.modelId?.startsWith("gemini-")}
+                disabled=${() => chosenModel()?.transport === "gemini"}
                 checked=${() => Boolean(editingAgent()?.browser)} /> Enable browser</label>
                 <p class="help">An isolated public browser with visual navigation and screenshots. No site logins or saved browser profile. Sessions stop after each turn.</p>
                 <label for="agent-browser-timeout">Session timeout (seconds)</label>
@@ -1662,7 +1681,7 @@
                 </div><//>
               <div class="actions">
                 <${Show} when=${editingAgent}><button class="secondary" type="button"
-                  onClick=${(event) => setEditingAgent(null)}>Cancel edit</button><//>
+                  onClick=${() => { setEditingAgent(null); setDraftModelId(null); }}>Cancel edit</button><//>
                 <button class="primary" type="submit">${() => editingAgent() ? "Save agent" : "Create agent"}</button>
               </div>
             </form>
@@ -1681,7 +1700,7 @@
                         setModal(null);
                       }}>Open chat</button>
                       <button class="secondary" type="button"
-                        onClick=${() => setEditingAgent(agent)}>Edit</button>
+                        onClick=${() => { setEditingAgent(agent); setDraftModelId(agent.modelId); }}>Edit</button>
                     </div>
                   </div>`}<//>
               </div><//

@@ -22,6 +22,12 @@ assert.deepEqual(new Set(models.map((model) => model.company)),
   new Set(["Anthropic", "OpenAI", "Google"]));
 for (const model of models) {
   assert.match(model.source, /^https:\/\//);
+  assert.ok(Number.isSafeInteger(model.contextTokens) && model.contextTokens >= 65536);
+  assert.ok(Number.isSafeInteger(model.maxOutputTokens) &&
+    model.maxOutputTokens > 4096 && model.maxOutputTokens <= model.contextTokens);
+  assert.ok(Array.isArray(model.thinkingLevels) && model.thinkingLevels.length);
+  assert.equal(new Set(model.thinkingLevels).size, model.thinkingLevels.length);
+  assert.ok(model.thinkingLevels.includes(model.defaultThinkingLevel));
   if (model.transport === "bedrock") {
     assert.equal(validModelId(model.id, region, account), true);
     for (const rate of ["inputRate", "outputRate", "cacheReadRate", "cacheWriteRate"])

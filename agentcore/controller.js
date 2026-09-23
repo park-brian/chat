@@ -1,7 +1,7 @@
 // One AgentCore Runtime owns product control and the configured agent loop.
 // AgentCore validates the Cognito JWT before forwarding its Authorization header.
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { SignatureV4 } from "@smithy/signature-v4";
 import { Hash } from "@smithy/hash-node";
@@ -29,10 +29,21 @@ import {
   StartBrowserSessionCommand, InvokeBrowserCommand, StopBrowserSessionCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
 
+const scriptedModel = { id: "test.echo", name: "Scripted echo (test only)",
+  transport: "scripted", contextTokens: 1000000, maxOutputTokens: 128000,
+  thinkingLevels: [], active: true };
 const idp = new CognitoIdentityProviderClient({});
 const db = new DynamoDBClient({});
 const memory = new BedrockAgentCoreClient({});
 const bedrock = new BedrockRuntimeClient({});
+// V2 may restore workers from one snapshot, including random state. Mix fresh
+// clock time with uncached entropy so separate sessions cannot reuse a key.
+const uuid = () => {
+  const hex = createHash("sha256")
+    .update(`${randomUUID({ disableEntropyCache: true })}:${Date.now()}:${process.hrtime.bigint()}`)
+    .digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+};
 const S = (value) => ({ S: String(value) });
 const N = (value) => ({ N: String(value) });
 const key = (pk, sk) => ({ pk: S(pk), sk: S(sk) });
@@ -94,7 +105,7 @@ async function defaults() {
 
 async function approvedModel(modelId) {
   if (modelId === "test.echo")
-    return process.env.SCRIPTED_MODEL === "true" ? { id: modelId } : null;
+    return process.env.SCRIPTED_MODEL === "true" ? scriptedModel : null;
   const model = suggestedModels.find((entry) => entry.id === modelId);
   return (model?.transport === "bedrock" ||
     (model?.transport === "gemini" && process.env.GEMINI_PROVIDER)) &&
@@ -227,7 +238,7 @@ async function invoke(body, identity) {
           url.search || url.hash || jiraUrl.length > 500 ||
           !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(jiraEmail || ""))))
         return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-      const item = { id: randomUUID(), name: name.trim(), kind, apiKey,
+      const item = { id: uuid(), name: name.trim(), kind, apiKey,
         createdAt: new Date().toISOString(),
         ...(kind === "jira" && { jiraUrl: url.href.replace(/\/$/, ""), jiraEmail }) };
       let visible;
@@ -320,7 +331,7 @@ async function invoke(body, identity) {
       return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
     const { projectId, id: existingId, revision, name, modelId,
       systemPrompt = "", codeInterpreter = false, webSearch = false, browser = false,
-      connectionIds = [], maxOutputTokens = 4096,
+      connectionIds = [], thinkingLevel,
       webSearchMaxResults = 5, browserSessionSeconds = 300 } = body.input;
     if (projectId !== "main" || typeof name !== "string" || !name.trim() || name.length > 80 ||
       typeof modelId !== "string" || !modelId || modelId.length > 512 ||
@@ -332,7 +343,6 @@ async function invoke(body, identity) {
       (connectionIds.length && !codeInterpreter) ||
       (existingId !== undefined && (!uuidPattern.test(existingId || "") ||
         !Number.isSafeInteger(revision) || revision < 0)) ||
-      !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 16 || maxOutputTokens > 4096 ||
       !Number.isSafeInteger(webSearchMaxResults) || webSearchMaxResults < 1 || webSearchMaxResults > 25 ||
       !Number.isSafeInteger(browserSessionSeconds) || browserSessionSeconds < 60 ||
       browserSessionSeconds > 900)
@@ -340,6 +350,11 @@ async function invoke(body, identity) {
     const model = await approvedModel(modelId);
     if (!model)
       return { status: 400, data: { ok: false, error: { code: "MODEL_UNAVAILABLE" } } };
+    const selectedThinkingLevel = thinkingLevel ?? model.defaultThinkingLevel;
+    if (model.thinkingLevels.length
+      ? !model.thinkingLevels.includes(selectedThinkingLevel)
+      : thinkingLevel !== undefined)
+      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
     if (model.transport === "gemini" && (codeInterpreter || webSearch || browser))
       return { status: 400, data: { ok: false, error: { code: "TOOL_UNAVAILABLE" } } };
     if (connectionIds.length) {
@@ -349,7 +364,7 @@ async function invoke(body, identity) {
         new Set(selected.map((item) => item.kind)).size !== selected.length)
         return { status: 400, data: { ok: false, error: { code: "CONNECTION_UNAVAILABLE" } } };
     }
-    const id = existingId || randomUUID();
+    const id = existingId || uuid();
     let createdAt = new Date().toISOString();
     let legacyRevision = false;
     if (existingId) {
@@ -363,7 +378,8 @@ async function invoke(body, identity) {
       legacyRevision = !current.Item.revision;
     }
     const agent = { id, name: name.trim(), modelId, systemPrompt,
-      codeInterpreter, webSearch, browser, connectionIds, maxOutputTokens,
+      codeInterpreter, webSearch, browser, connectionIds,
+      ...(selectedThinkingLevel && { thinkingLevel: selectedThinkingLevel }),
       webSearchMaxResults, browserSessionSeconds, createdAt,
       revision: existingId ? revision + 1 : 0 };
     try {
@@ -373,7 +389,8 @@ async function invoke(body, identity) {
           systemPrompt: S(systemPrompt), codeInterpreter: { BOOL: codeInterpreter },
           webSearch: { BOOL: webSearch }, browser: { BOOL: browser },
           connectionIds: { L: connectionIds.map(S) },
-          maxOutputTokens: N(maxOutputTokens), createdAt: S(createdAt),
+          ...(selectedThinkingLevel && { thinkingLevel: S(selectedThinkingLevel) }),
+          createdAt: S(createdAt),
           webSearchMaxResults: N(webSearchMaxResults),
           browserSessionSeconds: N(browserSessionSeconds),
           revision: N(agent.revision) },
@@ -457,7 +474,7 @@ async function invoke(body, identity) {
       ({ ...model, active: model.transport === "bedrock" ||
         (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER)) }));
     if (process.env.SCRIPTED_MODEL === "true")
-      items.unshift({ id: "test.echo", name: "Scripted echo (test only)", active: true });
+      items.unshift(scriptedModel);
     return { status: 200, data: { ok: true, data: { items } } };
   }
   const admin = identity.role === "Administrators";
@@ -527,7 +544,7 @@ async function invoke(body, identity) {
   return { status: 200, data: { ok: true, data: await getSession(identity) } };
 }
 
-async function runGemini(config, messages, emit, workloadToken) {
+async function runGemini(config, model, level, messages, emit, workloadToken) {
   if (!workloadToken) throw Error("Missing runtime workload token");
   const { apiKey } = await memory.send(new GetResourceApiKeyCommand({
     resourceCredentialProviderName: process.env.GEMINI_PROVIDER,
@@ -539,8 +556,8 @@ async function runGemini(config, messages, emit, workloadToken) {
       parts: content.map(({ text }) => ({ text })),
     })),
     ...(config.systemPrompt && { systemInstruction: { parts: [{ text: config.systemPrompt }] } }),
-    generationConfig: { maxOutputTokens: config.maxOutputTokens || 4096,
-      ...(config.maxOutputTokens < 256 && { thinkingConfig: { thinkingLevel: "low" } }) },
+    generationConfig: { maxOutputTokens: model.maxOutputTokens,
+      thinkingConfig: { thinkingLevel: level } },
   };
   const reply = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.modelId)}:streamGenerateContent?alt=sse`,
@@ -664,7 +681,7 @@ const gatewaySigner = new SignatureV4({
 
 async function searchWeb(query, maxResults) {
   const endpoint = new URL("/mcp", process.env.GATEWAY_URL);
-  const body = JSON.stringify({ jsonrpc: "2.0", id: randomUUID(),
+  const body = JSON.stringify({ jsonrpc: "2.0", id: uuid(),
     method: "tools/call", params: { name: "Search___WebSearch",
       arguments: { query, maxResults } } });
   const signed = await gatewaySigner.sign({
@@ -747,9 +764,11 @@ async function browserAction(sessionId, input) {
     { image: { format: "png", source: { bytes: screenshot.data } } }];
 }
 
-async function runModel(config, messages, emit, workloadToken, scope) {
+async function runModel(config, model, messages, emit, workloadToken, scope) {
+  const level = model.thinkingLevels.includes(config.thinkingLevel)
+    ? config.thinkingLevel : model.defaultThinkingLevel;
   if (config.modelId === "gemini-3.8-flash")
-    return runGemini(config, messages, emit, workloadToken);
+    return runGemini(config, model, level, messages, emit, workloadToken);
   const tools = [];
   if (config.codeInterpreter) tools.push(
     { toolSpec: {
@@ -806,7 +825,13 @@ async function runModel(config, messages, emit, workloadToken, scope) {
               config.webSearch ? "Web Search returns current results. Base factual claims on the returned sources and cite their URLs." : "",
               config.browser ? "Browser actions return screenshots. Inspect each screenshot and avoid entering private credentials." : "",
             ].filter(Boolean).join("\n\n") }] : undefined,
-            inferenceConfig: { maxTokens: config.maxOutputTokens || 4096 }, toolConfig,
+            inferenceConfig: { maxTokens: model.maxOutputTokens }, toolConfig,
+            ...(model.company === "Anthropic" && { additionalModelRequestFields: {
+              thinking: { type: "adaptive" }, output_config: { effort: level },
+            } }),
+            ...(model.company === "OpenAI" && { additionalModelRequestFields: {
+              reasoning: { effort: level },
+            } }),
           }))).stream;
       const content = [];
       let stopReason;
@@ -818,6 +843,19 @@ async function runModel(config, messages, emit, workloadToken, scope) {
         }
         if (event.contentBlockDelta) {
           const { contentBlockIndex, delta } = event.contentBlockDelta;
+          if (delta.reasoningContent) {
+            const block = content[contentBlockIndex] ||= {
+              reasoningContent: { reasoningText: { text: "" } },
+            };
+            const reasoning = delta.reasoningContent;
+            if (reasoning.redactedContent)
+              block.reasoningContent = { redactedContent: reasoning.redactedContent };
+            else {
+              const prior = block.reasoningContent.reasoningText;
+              if (reasoning.text) prior.text += reasoning.text;
+              if (reasoning.signature) prior.signature = reasoning.signature;
+            }
+          }
           if (delta.text) {
             content[contentBlockIndex] ||= { text: "" };
             content[contentBlockIndex].text += delta.text;
@@ -867,7 +905,7 @@ async function runModel(config, messages, emit, workloadToken, scope) {
           if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
           toolSession = (await memory.send(new StartCodeInterpreterSessionCommand({
             codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID,
-            name: `chat-${randomUUID().slice(0, 8)}`, sessionTimeoutSeconds: 900,
+            name: `chat-${uuid().slice(0, 8)}`, sessionTimeoutSeconds: 900,
           }))).sessionId;
           const workspace = await initializeWorkspace(toolSession, scope);
           envPath = workspace.path;
@@ -887,7 +925,7 @@ async function runModel(config, messages, emit, workloadToken, scope) {
             } else {
               if (!browserSession) browserSession = (await memory.send(
                 new StartBrowserSessionCommand({ browserIdentifier: browserId,
-                  name: `chat-${randomUUID().slice(0, 8)}`,
+                  name: `chat-${uuid().slice(0, 8)}`,
                   sessionTimeoutSeconds: config.browserSessionSeconds || 300,
                   viewPort: { width: 1000, height: 700 } }))).sessionId;
               content = await browserAction(browserSession, tool.input);
@@ -1021,7 +1059,7 @@ async function chat(input, identity, response, workloadToken) {
   const emit = (event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
   const started = Date.now();
   try {
-    const result = await runModel(config, messages, emit, workloadToken,
+    const result = await runModel(config, model, messages, emit, workloadToken,
       { sub: identity.sub, projectId, agentId, sessionId,
         connectionIds: config.connectionIds || [] });
     const costMicroUsd = modelCost(result.usage, model);

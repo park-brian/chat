@@ -583,37 +583,47 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (story === "runtime-model") {
       const catalog = (await import("./models.json", { with: { type: "json" } })).default;
       const selected = process.env.AGENTCORE_TEST_MODEL;
+      const toolStory = process.env.AGENTCORE_TEST_WEB === "1";
       if (selected && !catalog.some((model) =>
         ["bedrock", "gemini"].includes(model.transport) && model.id === selected))
         throw new Error("AGENTCORE_TEST_MODEL must name a checked-in live model");
+      if (toolStory && (!selected || selected.startsWith("gemini-")))
+        throw new Error("AGENTCORE_TEST_WEB requires one Bedrock AGENTCORE_TEST_MODEL");
       for (const { id: modelId } of catalog.filter((model) =>
         (selected ? model.id === selected : model.transport === "bedrock"))) {
-      const ids = await page.evaluate(async ({ url, token, modelId }) => {
+      const ids = await page.evaluate(async ({ url, token, modelId, toolStory }) => {
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "agents.put", input: {
-          projectId: "main", name: "Capped model smoke", modelId,
-          maxOutputTokens: modelId.startsWith("gemini-") ? 256 : 64,
+          projectId: "main", name: "Full-ceiling model smoke", modelId,
+          thinkingLevel: toolStory ? "high" : "low", webSearch: toolStory,
         } }) });
-        if (!response.ok) throw Error("Could not create model smoke agent");
-        return { agentId: (await response.json()).data.id, sessionId: crypto.randomUUID() };
-      }, { url: fixture.controllerUrl, token: accessToken, modelId });
+        const body = await response.json();
+        if (!response.ok || !body.ok)
+          throw Error(`Could not create model smoke agent: ${response.status} ${body.error?.code || ""}`);
+        return { agentId: body.data.id, sessionId: crypto.randomUUID() };
+      }, { url: fixture.controllerUrl, token: accessToken, modelId, toolStory });
       fixture.trackChat(ids.agentId, ids.sessionId);
-      const result = await page.evaluate(async ({ url, token, ids }) => {
+      const result = await page.evaluate(async ({ url, token, ids, toolStory }) => {
         const started = performance.now();
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
           "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
         }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
           projectId: "main", ...ids, requestId: crypto.randomUUID(),
-          message: "Reply with OK only.",
+          message: toolStory
+            ? "Use web_search to find the official Amazon Bedrock AgentCore documentation, then answer with one short sentence and a source."
+            : "Reply with OK only.",
         } }) });
         return { status: response.status, stream: await response.text(),
           elapsedMs: Math.round(performance.now() - started) };
-      }, { url: fixture.controllerUrl, token: accessToken, ids });
+      }, { url: fixture.controllerUrl, token: accessToken, ids, toolStory });
       if (result.status !== 200 || !result.stream.includes('"type":"message.done"'))
         throw new Error("Real-model turn incomplete: " + result.stream.slice(-1000));
+      if (toolStory && (!result.stream.includes('"name":"web_search","isError":false') ||
+        !result.stream.includes("Sources:")))
+        throw new Error("Real-model tool continuation incomplete: " + result.stream.slice(-1200));
       if (modelId === "gemini-3.8-flash" &&
         result.stream.includes("output limit before producing a visible reply"))
         throw new Error("Gemini smoke used all tokens on thinking");
@@ -917,9 +927,51 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       );
     if ((await fixture.readUserControl())?.budgetMicroUsd?.N !== "5000000")
       throw new Error("CodeZip Runtime did not persist the default user limit");
+    const configured = await page.evaluate(async ({ url, token }) => {
+      const call = async (command, input) => {
+        const response = await fetch(url, { method: "POST", headers: {
+          authorization: `Bearer ${token}`, "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": `model-config-${crypto.randomUUID()}`,
+        }, body: JSON.stringify({ v: 1, command, input }) });
+        return response.json();
+      };
+      const catalog = await call("models.list", {});
+      const model = catalog.data?.items?.find((item) =>
+        item.id === "global.openai.gpt-6-luna");
+      const created = await call("agents.put", { projectId: "main",
+        name: "Model config smoke", modelId: model?.id,
+        thinkingLevel: "low", maxOutputTokens: 16 });
+      const more = [];
+      for (let i = 0; i < 3; i++)
+        more.push(await call("agents.put", { projectId: "main",
+          name: `Model config smoke ${i}`, modelId: model?.id, thinkingLevel: "low" }));
+      const rejected = await call("agents.put", { projectId: "main",
+        name: "Invalid thinking", modelId: model?.id, thinkingLevel: "unsupported" });
+      return { model, created, more, rejected };
+    }, { url: fixture.controllerUrl, token: accessToken });
+    if (!configured.model || configured.model.maxOutputTokens <= 4096 ||
+      configured.model.contextTokens < configured.model.maxOutputTokens ||
+      !configured.model?.thinkingLevels?.includes("low") ||
+      configured.created?.data?.thinkingLevel !== "low" ||
+      configured.more.some((item) => !item.ok) ||
+      new Set([configured.created, ...configured.more].map((item) => item.data?.id)).size !== 4 ||
+      "maxOutputTokens" in (configured.created?.data || {}) ||
+      configured.rejected?.error?.code !== "VALIDATION_FAILED")
+      throw new Error("Model catalog/config contract failed: " +
+        JSON.stringify(configured).slice(0, 1200));
     return;
   }
-  await page.getByRole("button", { name: "Account" }).last().click();
+  const openManage = async (name) => {
+    if (page.viewportSize().width < 761) {
+      await page.getByRole("button", { name: "Open menu" }).click();
+      await page.getByRole("dialog").getByRole("button", { name, exact: true }).click();
+    } else {
+      await page.getByRole("button", {
+        name: name === "Agents" ? /View agents/ : new RegExp(name),
+      }).last().click();
+    }
+  };
+  await openManage("Account");
   await page.getByRole("dialog").getByText(fixture.email).waitFor();
   await page.getByRole("dialog").getByText("Administrators").waitFor();
   if (screenshot)
@@ -931,7 +983,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .getByRole("dialog")
     .getByRole("button", { name: "Close", exact: true })
     .click();
-  await page.getByRole("button", { name: /Users/ }).first().click();
+  await openManage("Users");
   await page.getByRole("dialog").getByText(fixture.email).waitFor();
   await page.getByRole("dialog").getByText("Account defaults").waitFor();
   const ownLimits = page
@@ -962,14 +1014,35 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .getByRole("dialog")
     .getByRole("button", { name: "Close dialog" })
     .click();
-  await page.getByRole("button", { name: /View agents/ }).click();
+  await openManage("Agents");
   await page.getByRole("dialog").locator("#agent-model option[value='global.openai.gpt-6-luna']")
     .waitFor({ state: "attached" });
+  await page.getByRole("dialog").locator("#agent-model")
+    .selectOption("global.openai.gpt-6-luna");
+  await page.getByRole("dialog").getByText(/128,000 maximum output tokens/).waitFor();
+  const thinking = page.getByRole("dialog").locator("#agent-thinking");
+  if (!(await thinking.locator('option[value="max"]').count()) ||
+    (await thinking.inputValue()) !== "medium")
+    throw new Error("OpenAI model thinking choices were not loaded from the catalog");
+  if (screenshot) {
+    await thinking.scrollIntoViewIfNeeded();
+    await page.evaluate(async () => {
+      const { _screenshot } = await import("./tests.js");
+      await _screenshot("live-model-settings", document.querySelector("dialog[open]"));
+    });
+  }
   if (await page.getByRole("dialog")
     .locator("#agent-model option[value='gemini-3.8-flash']").isDisabled() === fixture.hasGemini)
     throw new Error("Gemini dropdown availability must match the stack credential");
+  if (fixture.hasGemini) {
+    await page.getByRole("dialog").locator("#agent-model").selectOption("gemini-3.8-flash");
+    await page.getByRole("dialog").getByText(/65,536 maximum output tokens/).waitFor();
+    if (await thinking.locator('option[value="max"]').count() ||
+      (await thinking.inputValue()) !== "medium")
+      throw new Error("Gemini thinking choices must be model-specific");
+  }
   await page.getByRole("dialog").getByRole("button", { name: "Close dialog" }).click();
-  await page.getByRole("button", { name: /Usage/ }).first().click();
+  await openManage("Usage");
   await page.getByRole("dialog").getByText(/Not yet metered|\$0\.00/).first().waitFor();
   await page.getByRole("dialog").locator("#usage-range").selectOption("90d");
   await page.getByRole("dialog").locator("#usage-sort").selectOption("asc");
