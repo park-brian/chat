@@ -339,6 +339,14 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     !uiInvocations[0].runtimeSession)
     throw new Error("Sign-in must load the workspace in one sticky Runtime invocation");
   if (story === "runtime-ui") {
+    const chooseConversation = async (name) => {
+      if (page.viewportSize().width < 761) {
+        await page.getByRole("button", { name: "Open menu" }).click();
+        await page.getByRole("dialog").getByRole("button", { name }).first().click();
+      } else {
+        await page.getByRole("button", { name }).first().click();
+      }
+    };
     await page.getByRole("button", { name: "Choose an agent" }).click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#agent-model option[value='test.echo']").waitFor({ state: "attached" });
@@ -359,15 +367,26 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     await message.fill("hello ui");
     await page.getByRole("button", { name: "Send ↑" }).click();
     await page.locator(".message-text").getByText("Echo: hello ui").waitFor();
-    await page.getByRole("button", { name: "Smoke UI agent" }).first().click();
+    await page.getByRole("button", { name: "Send ↑" }).waitFor();
+    await chooseConversation("New chat");
     await message.fill("second ui");
     await page.getByRole("button", { name: "Send ↑" }).click();
     await page.locator(".message-text").getByText("Echo: second ui").waitFor();
+    await page.getByRole("button", { name: "Send ↑" }).waitFor();
+    await chooseConversation("hello ui");
+    await page.locator(".message-text").getByText("Echo: hello ui").waitFor();
     const chats = uiInvocations.filter((item) => item.command === "chat.send");
     if (chats.length !== 2 || chats[0].input.sessionId === chats[1].input.sessionId ||
       uiInvocations.some((item) => item.command === "agents.list") ||
       uiInvocations.some((item) => item.runtimeSession !== uiInvocations[0].runtimeSession))
       throw new Error("UI did not reuse one Runtime session across control and conversations");
+    await page.reload();
+    await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+    await chooseConversation("hello ui");
+    await page.locator(".message-text").getByText("Echo: hello ui").waitFor();
+    if (!uiInvocations.some((item) => item.command === "conversations.get" &&
+      item.input.conversationId === chats[0].input.sessionId))
+      throw new Error("Reload did not reopen saved Memory events");
     if (screenshot)
       await page.evaluate(async () => {
         const { _screenshot } = await import("./tests.js");
@@ -534,6 +553,10 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           call("usage.list", { range: "30d", sort: "asc" }),
           call("usage.list", { range: "90d", sort: "desc" }),
         ]);
+        const conversations = await call("conversations.list", { projectId: "main" });
+        const reopened = await call("conversations.get", {
+          projectId: "main", agentId, conversationId: sessionId,
+        });
         let combined;
         for (let attempt = 0; attempt < 8; attempt++) {
           combined = await call("usage.list", { range: "30d", scope: "all" });
@@ -541,7 +564,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           await new Promise((resolve) => setTimeout(resolve, 250));
         }
         return { agentId, sessionId, requestId, status: response.status, stream,
-          followupStatus: followup.status, followupStream, newest, oldest, ninety, combined };
+          followupStatus: followup.status, followupStream, newest, oldest, ninety, combined,
+          conversations, reopened };
       }, { url: fixture.controllerUrl, token: accessToken, toolStory });
       if (result.agentId && result.sessionId) fixture.trackChat(result.agentId, result.sessionId);
       if (toolStory) {
@@ -565,10 +589,21 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         fixture.readChat(result.agentId, result.sessionId), fixture.readUsage(),
       ]);
       const replies = events.events?.map((event) => event.payload?.[1]?.conversational?.content?.text);
+      const receipts = events.events?.map((event) => event.payload?.[2]?.json?.content);
       if (replies?.[0] !== "History: hello runtime | history?" ||
         replies?.[1] !== "Echo: hello runtime" ||
+        receipts?.length !== 2 || receipts.some((receipt) =>
+          receipt?.version !== 1 || receipt?.conversationId !== result.sessionId ||
+          receipt?.usage?.inputTokens !== 10) ||
         usage.Items?.length !== 2 || usage.Items.some((item) => item.inputTokens?.N !== "10"))
         throw new Error("Runtime chat did not persist Memory and metered usage");
+      if (result.conversations.status !== 200 ||
+        !result.conversations.body.data.items.some((item) => item.id === result.sessionId) ||
+        result.reopened.status !== 200 ||
+        result.reopened.body.data.messages.map((item) => item.text).join("|") !==
+          "hello runtime|Echo: hello runtime|history?|History: hello runtime | history?")
+        throw new Error("Conversation index or Memory reopen failed: " +
+          JSON.stringify({ conversations: result.conversations, reopened: result.reopened }));
       const newest = result.newest.body.data?.items || [];
       const oldest = result.oldest.body.data?.items || [];
       if ([result.newest, result.oldest, result.ninety, result.combined]

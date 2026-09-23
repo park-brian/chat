@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-be5r09cETG1QhEmGxsGimj8NllqQBgaMqIoP1sYSlsO6ayshIBZTsLQltfDqvxVl' https://cdn.jsdelivr.net; style-src 'sha384-JmalHHmnnsAGTpkLNIpJuU44MiCNoRwhT0FUSHwEMTgrdxDrAN1PCkcz0jGs4zc0'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-xRWhIue77y70+0QwkMymJuyQGiqV+ffMClo9btxYsD9SvzgmP5/EWoB2oPT825Ad' https://cdn.jsdelivr.net; style-src 'sha384-/N/SE7C2XRv//nah4LgSQpaXeSt826viaWeYUuH3uhJYfG0xUl0GLmQ3MQ0hQS0T'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -106,7 +106,7 @@
         background: transparent;
         color: #4a5e50;
         text-align: left;
-        font-size: 13px;
+        font-size: 14px;
         font-weight: 650;
       }
       .nav:hover,
@@ -146,7 +146,7 @@
         background: #ffffffb5;
       }
       .top-title {
-        font-size: 14px;
+        font-size: 16px;
         font-weight: 750;
       }
       .top-sub {
@@ -195,7 +195,8 @@
         color: #124e3e;
       }
       .mobile-brand,
-      .mobile-menu {
+      .mobile-menu,
+      .mobile-agent {
         display: none;
       }
       .content {
@@ -207,6 +208,12 @@
         width: min(760px, 100%);
         margin: auto;
         padding: 40px 24px;
+      }
+      .message-state {
+        display: block;
+        margin-top: 6px;
+        color: #8a6b39;
+        font-size: 12px;
       }
       .welcome {
         text-align: center;
@@ -288,8 +295,8 @@
         display: flex;
         gap: 13px;
         margin: 25px 0;
-        font-size: 13px;
-        line-height: 1.7;
+        font-size: 15px;
+        line-height: 1.6;
       }
       .avatar {
         display: grid;
@@ -308,7 +315,7 @@
         color: #657168;
       }
       .message b {
-        font-size: 12px;
+        font-size: 13px;
       }
       .message-text {
         white-space: pre-wrap;
@@ -337,7 +344,7 @@
         padding: 3px;
         color: #203829;
         background: transparent;
-        font-size: 13px;
+        font-size: 15px;
         line-height: 1.55;
       }
       .composer textarea::placeholder {
@@ -350,7 +357,7 @@
         gap: 12px;
       }
       .hint {
-        font-size: 10px;
+        font-size: 11px;
         color: #9ca99e;
       }
       .send {
@@ -359,7 +366,7 @@
         padding: 8px 15px;
         background: #176c53;
         color: white;
-        font-size: 12px;
+        font-size: 14px;
         font-weight: 750;
       }
       .send:hover {
@@ -540,6 +547,14 @@
         .top-sub,
         .top .link-button {
           display: none;
+        }
+        .mobile-agent {
+          display: block;
+          padding: 8px 17px;
+          border-bottom: 1px solid #e2e9e3;
+          color: #527060;
+          font-size: 13px;
+          font-weight: 650;
         }
         .conversation {
           padding: 25px 17px;
@@ -793,6 +808,8 @@
         const workspace = await rpc("workspace.get", {});
         setSession(workspace.session);
         setAgents(workspace.agents);
+        setConversations(workspace.conversations.items);
+        setConversationCursor(workspace.conversations.nextCursor);
       }
       async function signOut() {
         const config = deployment();
@@ -800,6 +817,7 @@
         runtimeSessionId = crypto.randomUUID();
         setSession(null);
         setAgents([]);
+        setConversations([]);
         setMessages([]);
         if (config) {
           const url = new URL("/logout", config.domain);
@@ -844,16 +862,19 @@
         const message = draft().trim(),
           agent = selectedAgent(),
           self = session(),
-          config = deployment();
-        if (!message || !agent || !self || !config || sending()) return;
+          config = deployment(),
+          activeId = conversationId();
+        if (!message || !agent || !self || !config || sending() ||
+          loadingConversation() || uncertainConversationId() === activeId) return;
         setDraft("");
         setError("");
         setSending(true);
         setMessages((items) => [
           ...items,
           { role: "user", text: message },
-          { role: "assistant", text: "" },
+          { role: "assistant", text: "", status: "pending" },
         ]);
+        let completed = false, failed = false;
         try {
           const response = await fetch(runtimeUrl(config), {
             method: "POST",
@@ -865,7 +886,7 @@
             body: JSON.stringify({ v: 1, command: "chat.send", input: {
               projectId: self.defaultProjectId,
               agentId: agent.id,
-              sessionId: conversationId(),
+              sessionId: activeId,
               requestId: crypto.randomUUID(), message,
             } }),
           });
@@ -896,12 +917,30 @@
                       : item,
                   ),
                 );
-              if (event.type === "error")
+              if (event.type === "message.done") {
+                completed = true;
+                setMessages((items) => items.map((item, i) =>
+                  i === items.length - 1 ? { ...item, status: "complete" } : item));
+                setConversations((items) => {
+                  const previous = items.find((item) => item.id === activeId);
+                  return [{ id: activeId, agentId: agent.id,
+                    title: previous?.title || message.replace(/\s+/g, " ").slice(0, 80),
+                    lastActivityAt: new Date().toISOString() },
+                  ...items.filter((item) => item.id !== activeId)];
+                });
+              }
+              if (event.type === "error") {
+                failed = true;
                 throw Error(event.message || "The agent stopped unexpectedly.");
+              }
             }
           }
+          if (!completed) throw Error("Connection ended before confirmation. Reopen this chat to check whether the turn was saved.");
         } catch (cause) {
           setError(cause.message);
+          if (!failed) setUncertainConversationId(activeId);
+          setMessages((items) => items.map((item, i) =>
+            i === items.length - 1 ? { ...item, status: failed ? "failed" : "uncertain" } : item));
         } finally {
           setSending(false);
         }
@@ -911,9 +950,84 @@
       const [agents, setAgents] = createSignal([]);
       const [selectedAgent, setSelectedAgent] = createSignal(null);
       const [conversationId, setConversationId] = createSignal(crypto.randomUUID());
+      const [conversations, setConversations] = createSignal([]);
+      const [conversationCursor, setConversationCursor] = createSignal(null);
+      const [olderCursor, setOlderCursor] = createSignal(null);
+      const [uncertainConversationId, setUncertainConversationId] = createSignal(null);
       const [messages, setMessages] = createSignal([]);
       const [draft, setDraft] = createSignal("");
       const [sending, setSending] = createSignal(false);
+      const [loadingConversation, setLoadingConversation] = createSignal(false);
+      let conversationRequest = 0;
+      function newChat(agent = selectedAgent()) {
+        ++conversationRequest;
+        setSelectedAgent(agent);
+        setConversationId(crypto.randomUUID());
+        setOlderCursor(null);
+        setUncertainConversationId(null);
+        setMessages([]);
+        setError("");
+        setLoadingConversation(false);
+      }
+      async function openConversation(item) {
+        if (sending()) return;
+        const agent = agents().find((entry) => entry.id === item.agentId);
+        if (!agent) return;
+        const request = ++conversationRequest;
+        setSelectedAgent(agent);
+        setConversationId(item.id);
+        setOlderCursor(null);
+        setMessages([]);
+        setError("");
+        setLoadingConversation(true);
+        try {
+          const page = await rpc("conversations.get", {
+            projectId: "main", agentId: agent.id, conversationId: item.id,
+          });
+          if (request === conversationRequest) {
+            setMessages(page.messages);
+            setOlderCursor(page.nextCursor);
+            setUncertainConversationId(null);
+          }
+        } catch (cause) {
+          if (request === conversationRequest) setError(cause.message);
+        } finally {
+          if (request === conversationRequest) setLoadingConversation(false);
+        }
+      }
+      function selectAgent(agent) {
+        if (sending()) return;
+        const recent = conversations().find((item) => item.agentId === agent.id);
+        if (recent) openConversation(recent);
+        else newChat(agent);
+      }
+      async function moreConversations() {
+        const cursor = conversationCursor();
+        if (!cursor) return;
+        try {
+          const page = await rpc("conversations.list", { projectId: "main", cursor });
+          setConversations((items) => [...items, ...page.items.filter((item) =>
+            !items.some((existing) => existing.id === item.id))]);
+          setConversationCursor(page.nextCursor);
+        } catch (cause) {
+          setError(cause.message);
+        }
+      }
+      async function moreMessages() {
+        const cursor = olderCursor(), agent = selectedAgent(), id = conversationId();
+        if (!cursor || !agent || sending()) return;
+        try {
+          const page = await rpc("conversations.get", {
+            projectId: "main", agentId: agent.id, conversationId: id, cursor,
+          });
+          if (id === conversationId()) {
+            setMessages((items) => [...page.messages, ...items]);
+            setOlderCursor(page.nextCursor);
+          }
+        } catch (cause) {
+          setError(cause.message);
+        }
+      }
       const [modal, setModal] = createSignal(null);
       const [entry, setEntry] = createSignal("");
       const [view, setView] = createSignal(null);
@@ -1011,9 +1125,7 @@
             maxOutputTokens: Number(form.get("maxOutputTokens")),
           });
           setAgents((items) => [...items, result]);
-          setSelectedAgent(result);
-          setConversationId(crypto.randomUUID());
-          setMessages([]);
+          newChat(result);
           setModal(null);
         } catch (cause) {
           setError(cause.message);
@@ -1050,7 +1162,27 @@
       function modalBody(route) {
         if (route === "menu")
           return html`<div class="rail-list">
-            <${For} each=${Object.keys(names).filter((name) => name !== "menu")}
+            <${Show} when=${session}>
+              <div class="eyebrow">Agents</div>
+              <${For} each=${agents}>${(agent) => html`
+                <button class="nav" onClick=${(e) => {
+                  selectAgent(agent); setModal(null);
+                }}>${agent.name}</button>`}<//>
+              <div class="eyebrow">Conversations</div>
+              <button class="nav" onClick=${(e) => {
+                newChat(); setModal(null);
+              }}>＋ New chat</button>
+              <${For} each=${conversations}>${(item) => html`
+                <button class="nav" onClick=${(e) => {
+                  openConversation(item); setModal(null);
+                }}>${item.title}</button>`}<//>
+              <${Show} when=${conversationCursor}>
+                <button class="nav" onClick=${(e) => moreConversations()}>
+                  More conversations</button><//>
+            <//>
+            <div class="eyebrow">Manage</div>
+            <${For} each=${Object.keys(names).filter((name) =>
+              !["menu", "deployment"].includes(name))}
               >${(name) => html`<button class="nav" onClick=${(e) => openDialog(name)}>${names[name]}</button>`}<//
             >
           </div>`;
@@ -1375,9 +1507,7 @@
                     html`<button
                       class="nav"
                       onClick=${(e) => {
-                        setSelectedAgent(agent);
-                        setConversationId(crypto.randomUUID());
-                        setMessages([]);
+                        selectAgent(agent);
                         setModal(null);
                       }}
                     >
@@ -1450,6 +1580,21 @@
                 </button>
               </div>
             </section>
+            <${Show} when=${session}>
+              <section>
+                <div class="eyebrow">Conversations</div>
+                <div class="rail-list">
+                  <button class="nav" onClick=${(e) => newChat()}
+                    disabled=${sending}>＋ New chat</button>
+                  <${For} each=${conversations}>${(item) => html`
+                    <button class=${() => "nav" + (conversationId() === item.id ? " active" : "")}
+                      onClick=${(e) => openConversation(item)} disabled=${sending}
+                      title=${item.title}>${item.title}</button>`}<//>
+                  <${Show} when=${conversationCursor}>
+                    <button class="nav" onClick=${(e) => moreConversations()}>More conversations</button><//>
+                </div>
+              </section><//
+            >
             <section class="rail-bottom">
               <div class="eyebrow">Manage</div>
               <div class="rail-list">
@@ -1503,8 +1648,15 @@
                 Account
               </button>
             </header>
+            <div class="mobile-agent">${() => selectedAgent()?.name || "Choose an agent"}</div>
             <div class="content">
               <div class="conversation">
+                <${Show} when=${olderCursor}>
+                  <button class="link-button" onClick=${(e) => moreMessages()}>Load earlier messages</button><//
+                >
+                <${Show} when=${loadingConversation}>
+                  <div class="empty">Opening conversation…</div><//
+                >
                 <${Show} when=${() => !messages().length}
                   ><div class="welcome">
                     <div class="welcome-icon">✦</div>
@@ -1555,6 +1707,12 @@
                       <div>
                         <b>${item.role === "user" ? "You" : "Agent"}</b>
                         <div class="message-text">${item.text}</div>
+                        <${Show} when=${() => item.status && item.status !== "complete"}>
+                          <small class="message-state">${() =>
+                            item.status === "pending" ? "Working…" :
+                            item.status === "failed" ? "Turn failed" :
+                            "Outcome uncertain · reopen to check"}</small><//
+                        >
                       </div>
                     </article>`}<//
                 >
@@ -1576,7 +1734,8 @@
                       send();
                     }
                   }}
-                  disabled=${() => !selectedAgent() || sending()}
+                  disabled=${() => !selectedAgent() || sending() || loadingConversation() ||
+                    uncertainConversationId() === conversationId()}
                 ></textarea>
                 <div class="composer-foot">
                   <span class="hint"
@@ -1585,7 +1744,8 @@
                   <button
                     class="send"
                     onClick=${(e) => send()}
-                    disabled=${() => !selectedAgent() || !draft().trim() || sending()}
+                    disabled=${() => !selectedAgent() || !draft().trim() || sending() ||
+                      loadingConversation() || uncertainConversationId() === conversationId()}
                   >
                     ${() => (sending() ? "Working…" : "Send ↑")}
                   </button>

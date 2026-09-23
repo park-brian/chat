@@ -29,6 +29,8 @@ CloudFormation template.yaml creates a Cognito user pool, managed-login domain a
 
 Bootstrap: create the stack with blank ControllerCodeKey; upload the deterministic ZIP into its SharedObjects output; update that same stack with the key; wait for Runtime READY; take ApplicationEntryUrl. Later code iterations reuse the stack and update only the key. Do not create/destroy a stack per browser test. Preserve the stack during development, then delete the exact disposable stack and inspect/delete only its retained bucket and versions. The browser should gain a guided CloudFormation administration dialog after auth/stack APIs are proven in browser CORS; no privileged deployment credentials should be mixed with the Cognito session.
 
+The persistent eaap/us-east-1 production stack is agentcore-chat-prod, with EnableScriptedModel=false. Retrieve its current pasteable URL using aws cloudformation describe-stacks --profile eaap --region us-east-1 --stack-name agentcore-chat-prod --query "Stacks[0].Outputs[?OutputKey=='ApplicationEntryUrl'].OutputValue|[0]" --output text. A production Cognito-to-Runtime control smoke passed with a disposable administrator; that account was removed. The first permanent administrator still needs to be invited using an owner-supplied email. Production stack and bucket must not be included in disposable test cleanup.
+
 ## Application protocol, implemented
 
 POST /invocations accepts version 1, command, input, and optional requestId. Control calls return an ok/data or stable error code JSON object. chat.send returns SSE message.delta, tool.done, message.done, or error. One Runtime session header is sent by the browser. No arbitrary AWS SDK call is exposed.
@@ -37,10 +39,11 @@ Implemented commands:
 
 | Command | Permission | Effect |
 | --- | --- | --- |
-| workspace.get | signed-in | Initialize/read own session plus the initial project agent list in one invocation |
+| workspace.get | signed-in | Initialize/read own session, project agents, and recent conversations in one invocation |
 | session.get | signed-in | Initialize/read own control row and account defaults |
 | agents.list, agents.put | own project; put denies Auditors | Query/create agent config in sub/main; put returns the committed config |
 | models.list | signed-in | Fixed checked-in catalog for the agent dropdown; test echo only in disposable mode |
+| conversations.list, conversations.get | owner | Page recent metadata from the existing sparse index; reopen message pages from AgentCore Memory |
 | users.list, users.invite, users.setLimits | Administrators | Cognito users/groups and per-user budget/storage overrides; list includes defaults |
 | defaults.get, defaults.set | Administrators | Account budget, storage, UTC reset cadence with revision check |
 | usage.summary | signed-in | Strongly read own current-period committed model spend and unpriced-tool count |
@@ -49,6 +52,8 @@ Implemented commands:
 | chat.send | own agent; denies Auditors | Budget admit, recent Memory context, direct Bedrock/tool stream, Memory event, atomic usage commit |
 
 Current dialog routes: Account, Agents, Users, Usage. Skills and Integrations are visible navigation entries but not functional management yet; they must say so plainly. One native dialog hosts all routes; no page-level control sprawl. The checked-in [models.json](../models.json) is the sole model list for the agent dropdown. Five Bedrock profile IDs were observed in eaap/us-east-1 on 2026-09-22. Their standard/global rates were checked against each model's [AWS agreement-offer rate card](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_ListFoundationModelAgreementOffers.html); usage still calls total spend estimated because long-context tiers, managed tools and other charges are not fully reconciled. An account listing and even one initial successful call do not prove lasting access: AWS can permit a first third-party invocation while a Marketplace subscription is pending, then deny later calls if agreement prerequisites fail. In eaap, Fable 5.1 and Sonnet 5 agreements were available; Opus 5.5, GPT-6 Sol and GPT-6 Luna reported NOT_AVAILABLE after initial successful smoke turns. Do not claim the latter three are production-ready in that account until an AWS administrator reviews/accepts the applicable terms and Marketplace permissions. Gemini 3.8 Flash remains visibly disabled until its adapter and credential flow exist; its introductory price expires at the end of 2026. Usage shows current reset-period summary separately from a last-30/90-days ledger filter, order selector, admin all-users selector, and Load more.
+
+Saved conversation metadata is one per-session row under the owner/project key, indexed by last activity in the existing sparse time index; messages remain only in Memory. The page can list/reopen them after login or reload, and mobile navigation uses the same modal. A turn is visibly pending until message.done; an interrupted stream is marked uncertain and cannot be silently resent in that conversation before reopening. Each Memory event now also contains a JSON receipt with request identity, reported token meters, rate snapshot, estimated cost, and tool facts. The receipt is recovery evidence, not the budget ledger. On-demand idempotent repair of a Memory-success/table-failure split is still unimplemented, so a turn with missing navigation metadata cannot yet be reopened from the UI. Conversation index reads are eventually consistent; direct reopen is strongly scoped and reads Memory. AgentCore may surface a Runtime 404 as HTTP 424 to browser callers.
 
 ## Usage and budget invariants
 

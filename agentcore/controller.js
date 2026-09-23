@@ -101,6 +101,34 @@ async function listAgents(identity) {
   return (page.Items || []).map(unpack);
 }
 
+async function listConversations(identity, cursor) {
+  let start;
+  if (cursor) {
+    try {
+      if (typeof cursor !== "string" || cursor.length > 2000) throw Error();
+      start = JSON.parse(Buffer.from(cursor, "base64url").toString());
+      if (start.gsi1pk?.S !== `CONVERSATIONS#${identity.sub}/main` ||
+        start.pk?.S !== `PROJECT#${identity.sub}/main` ||
+        !/^CONVERSATION#[0-9a-f-]{36}$/i.test(start.sk?.S || "")) throw Error();
+    } catch {
+      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    }
+  }
+  const page = await db.send(new QueryCommand({
+    TableName: process.env.TABLE, IndexName: "UsageByTime",
+    KeyConditionExpression: "gsi1pk = :pk",
+    ExpressionAttributeValues: { ":pk": S(`CONVERSATIONS#${identity.sub}/main`) },
+    ExclusiveStartKey: start, Limit: 30, ScanIndexForward: false,
+  }));
+  return { status: 200, data: { ok: true, data: {
+    items: (page.Items || []).map(unpack).filter((row) => row.expiresAt > Date.now() / 1000)
+      .map(({ id, agentId, title, createdAt, lastActivityAt }) =>
+        ({ id, agentId, title, createdAt, lastActivityAt })),
+    nextCursor: page.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null,
+  } } };
+}
+
 async function getSession(identity) {
   const [user, limits] = await Promise.all([
     idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL, Username: identity.sub })),
@@ -140,8 +168,46 @@ async function invoke(body, identity) {
   if (body.command === "workspace.get") {
     if (Object.keys(body.input).length)
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    const [session, agents] = await Promise.all([getSession(identity), listAgents(identity)]);
-    return { status: 200, data: { ok: true, data: { session, agents } } };
+    const [session, agents, conversations] = await Promise.all([
+      getSession(identity), listAgents(identity), listConversations(identity),
+    ]);
+    return { status: 200, data: { ok: true,
+      data: { session, agents, conversations: conversations.data.data } } };
+  }
+  if (body.command === "conversations.list") {
+    if (body.input.projectId !== "main")
+      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    return listConversations(identity, body.input.cursor);
+  }
+  if (body.command === "conversations.get") {
+    const { projectId, agentId, conversationId, cursor } = body.input;
+    const uuid = /^[0-9a-f-]{36}$/i;
+    if (projectId !== "main" || !uuid.test(agentId || "") ||
+      !uuid.test(conversationId || "") ||
+      (cursor !== undefined && (typeof cursor !== "string" || cursor.length > 4000)))
+      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: key(`PROJECT#${identity.sub}/main`, `CONVERSATION#${conversationId}`),
+      ConsistentRead: true }));
+    if (!row.Item || row.Item.agentId?.S !== agentId ||
+      Number(row.Item.expiresAt?.N || 0) <= Date.now() / 1000)
+      return { status: 404, data: { ok: false, error: { code: "NOT_FOUND" } } };
+    const page = await memory.send(new ListEventsCommand({
+      memoryId: process.env.MEMORY, actorId: `${identity.sub}/main`,
+      sessionId: `a_${agentId}_${conversationId}`,
+      includePayloads: true, maxResults: 100, nextToken: cursor,
+    }));
+    return { status: 200, data: { ok: true, data: {
+      conversation: unpack(row.Item),
+      messages: (page.events || []).toReversed().flatMap((event) =>
+        (event.payload || []).flatMap((payload) => {
+          const entry = payload.conversational;
+          return entry?.content?.text && ["USER", "ASSISTANT"].includes(entry.role)
+            ? [{ role: entry.role.toLowerCase(), text: entry.content.text, status: "complete" }]
+            : [];
+        })),
+      nextCursor: page.nextToken || null,
+    } } };
   }
   if (body.command === "agents.put") {
     if (identity.role === "Auditors")
@@ -461,12 +527,20 @@ async function chat(input, identity, response) {
     const result = await runModel(config, messages, emit);
     const costMicroUsd = modelCost(result.usage, model);
     const occurredAt = new Date().toISOString();
+    const receipt = { version: 1, requestId, agentId, conversationId: sessionId,
+      modelId: config.modelId, occurredAt, usage: result.usage, costMicroUsd,
+      rates: { inputRate: model.inputRate || 0, outputRate: model.outputRate || 0,
+        cacheReadRate: model.cacheReadRate || 0, cacheWriteRate: model.cacheWriteRate || 0 },
+      pricingQuality: model.pricingQuality || "unknown",
+      toolCalls: result.toolCalls.map(({ name, occurredAt, latencyMs, isError }) =>
+        ({ name, occurredAt, latencyMs, isError })) };
     await memory.send(new CreateEventCommand({
       memoryId: process.env.MEMORY, actorId, sessionId: memorySessionId,
       eventTimestamp: new Date(), clientToken: requestId, extractionMode: "SKIP",
       payload: [
         { conversational: { role: "USER", content: { text: message } } },
         { conversational: { role: "ASSISTANT", content: { text: result.text } } },
+        { json: { content: receipt } },
       ] }));
     await db.send(new TransactWriteItemsCommand({ TransactItems: [
       { Put: { TableName: process.env.TABLE,
@@ -493,6 +567,16 @@ async function chat(input, identity, response) {
         UpdateExpression: "ADD costMicroUsd :cost, unpricedToolCalls :tools, estimatedModelCalls :one",
         ExpressionAttributeValues: { ":cost": N(costMicroUsd), ":tools": N(result.toolCalls.length),
           ":one": N(1) } } },
+      { Update: { TableName: process.env.TABLE,
+        Key: key(`PROJECT#${identity.sub}/main`, `CONVERSATION#${sessionId}`),
+        UpdateExpression: "SET id = :id, agentId = :agent, title = if_not_exists(title, :title), createdAt = if_not_exists(createdAt, :time), lastActivityAt = :time, gsi1pk = :index, gsi1sk = :sort, expiresAt = :expiry",
+        ExpressionAttributeValues: {
+          ":id": S(sessionId), ":agent": S(agentId),
+          ":title": S(message.trim().replace(/\s+/g, " ").slice(0, 80)),
+          ":time": S(occurredAt), ":index": S(`CONVERSATIONS#${identity.sub}/main`),
+          ":sort": S(`${occurredAt}#${sessionId}`),
+          ":expiry": N(Math.floor(Date.now() / 1000) + 30 * 86400),
+        } } },
       ...result.toolCalls.map((tool, index) => ({ Put: { TableName: process.env.TABLE,
         Item: { pk: S(`USER#${identity.sub}`),
           sk: S(`USAGE#${tool.occurredAt}#${requestId}#TOOL#${index}`),
@@ -503,7 +587,8 @@ async function chat(input, identity, response) {
           quality: S("unpriced") },
         ConditionExpression: "attribute_not_exists(pk)" } })),
     ] }));
-    emit({ type: "message.done", usage: result.usage, costMicroUsd,
+    emit({ type: "message.done", requestId, conversationId: sessionId,
+      usage: result.usage, costMicroUsd,
       unpricedToolCalls: result.toolCalls.length, latencyMs: Date.now() - started });
   } catch (error) {
     console.error("Chat failed", error.name, error.$metadata?.httpStatusCode || "");
