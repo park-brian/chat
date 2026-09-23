@@ -10,13 +10,15 @@ export async function* scriptedStream(messages) {
     : `Echo: ${prompt}`;
   yield { messageStart: { role: "assistant" } };
   const code = prompt.startsWith("run-code:") && !toolResult ? prompt.slice(9).trim() : null;
+  const javascript = prompt.startsWith("run-js:") && !toolResult ? prompt.slice(7).trim() : null;
   const command = prompt.startsWith("run-command:") && !toolResult ? prompt.slice(12).trim() : null;
-  yield { contentBlockStart: { contentBlockIndex: 0, start: code || command
+  yield { contentBlockStart: { contentBlockIndex: 0, start: code || javascript || command
     ? { toolUse: { toolUseId: "scripted-tool-1", name: command ? "execute_command" : "execute_code" } } : {} } };
-  yield { contentBlockDelta: { contentBlockIndex: 0, delta: code || command
-    ? { toolUse: { input: JSON.stringify(command ? { command } : { language: "python", code }) } }
+  yield { contentBlockDelta: { contentBlockIndex: 0, delta: code || javascript || command
+    ? { toolUse: { input: JSON.stringify(command ? { command } :
+      { language: javascript ? "javascript" : "python", code: javascript || code }) } }
     : { text: reply } } };
   yield { contentBlockStop: { contentBlockIndex: 0 } };
-  yield { messageStop: { stopReason: code || command ? "tool_use" : "end_turn" } };
+  yield { messageStop: { stopReason: code || javascript || command ? "tool_use" : "end_turn" } };
   yield { metadata: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } };
 }

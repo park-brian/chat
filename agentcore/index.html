@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-gsdyd8Mt/CdHOaDJhVQDUJTLvx7T0R8X1/nvx30HcIf8of4ilHcFObWUlDCW792+' https://cdn.jsdelivr.net; style-src 'sha384-0uGIx2Ip1BbdBQBGXyQ+5xVRibP7jnRrZyS8gGSUn+Zxw0EXmgpSAWnOI3QViESy'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-KW0kNN6m5uHT0h4snmV9HkU40JACDReAV9GblAgzn80tHyzDs68vkq/0yV/K/kj+' https://cdn.jsdelivr.net; style-src 'sha384-FKqynOG3Jn1JdibVR9roPpE1zJat9u7xE7MNP/hXoI5WYwg86sq9gW7dtppjdZPK'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -434,17 +434,19 @@
         margin-bottom: 16px;
       }
       .field label {
-        font-size: 11px;
+        font-size: 12px;
         font-weight: 750;
       }
-      .field input {
+      .field input,
+      .field select,
+      .field textarea {
         width: 100%;
         padding: 11px 12px;
         border: 1px solid #d7e3da;
         border-radius: 9px;
         background: #fbfcfa;
         color: #263a2d;
-        font-size: 12px;
+        font-size: 13px;
       }
       .field .check {
         display: flex;
@@ -462,7 +464,7 @@
       }
       .field small {
         color: #89978c;
-        font-size: 10px;
+        font-size: 11px;
         line-height: 1.5;
       }
       .actions {
@@ -518,14 +520,8 @@
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 10px;
       }
-      .field select {
-        width: 100%;
-        padding: 11px 12px;
-        border: 1px solid #d7e3da;
-        border-radius: 9px;
-        background: #fbfcfa;
-        color: #263a2d;
-        font-size: 12px;
+      .field textarea {
+        resize: vertical;
       }
       @media (max-width: 760px) {
         .layout {
@@ -869,7 +865,7 @@
         });
         const result = await response.json();
         if (!response.ok || !result.ok)
-          throw Error(result.error?.message || command + " failed");
+          throw Error(result.error?.message || result.error?.code || command + " failed");
         return result.data;
       }
       async function send() {
@@ -1043,11 +1039,13 @@
         }
       }
       const [modal, setModal] = createSignal(null);
+      const [editingAgent, setEditingAgent] = createSignal(null);
       const [entry, setEntry] = createSignal("");
       const [view, setView] = createSignal(null);
       const [usageRange, setUsageRange] = createSignal("30d");
       const [usageSort, setUsageSort] = createSignal("desc");
       const [usageScope, setUsageScope] = createSignal("self");
+      const [connectionKind, setConnectionKind] = createSignal("github");
       const [error, setError] = createSignal("");
       const [loading, setLoading] = createSignal(
         Boolean(initial || query.has("code")),
@@ -1068,18 +1066,19 @@
         account: "Your Cognito session",
         agents: "Project · Runtime configurations",
         skills: "Project · skill storage",
-        integrations: "Account · Gateway and credentials",
+        integrations: "Project · code connections",
         usage: "Account · metering",
         users: "Account · access",
       };
       const openDialog = (route) => {
         setError("");
+        if (route === "agents") setEditingAgent(null);
         setModal(route);
         if (session()) loadView(route);
       };
       let viewRequest = 0;
       async function loadView(route) {
-        if (!["users", "usage", "agents"].includes(route)) return;
+        if (!["users", "usage", "agents", "integrations"].includes(route)) return;
         const request = ++viewRequest;
         setView({ route, loading: true });
         try {
@@ -1087,7 +1086,12 @@
             const users = await rpc("users.list", {});
             if (request === viewRequest) setView({ route, ...users });
           } else if (route === "agents") {
-            const result = await rpc("models.list", {});
+            const [models, connections] = await Promise.all([
+              rpc("models.list", {}), rpc("connections.list", { projectId: "main" }),
+            ]);
+            if (request === viewRequest) setView({ route, ...models, connections: connections.items });
+          } else if (route === "integrations") {
+            const result = await rpc("connections.list", { projectId: "main" });
             if (request === viewRequest) setView({ route, ...result });
           } else if (route === "usage") {
             const detail = await rpc("usage.get", {
@@ -1130,17 +1134,53 @@
       async function createAgent(form) {
         setError("");
         try {
+          const editing = editingAgent();
           const result = await rpc("agents.put", {
             projectId: session().defaultProjectId,
+            ...(editing && { id: editing.id, revision: editing.revision || 0 }),
             name: form.get("name"),
             modelId: form.get("modelId"),
             systemPrompt: form.get("systemPrompt"),
             codeInterpreter: form.has("codeInterpreter"),
+            connectionIds: form.getAll("connectionId"),
             maxOutputTokens: Number(form.get("maxOutputTokens")),
           });
-          setAgents((items) => [...items, result]);
-          newChat(result);
+          setAgents((items) => editing
+            ? items.map((item) => item.id === result.id ? result : item)
+            : [...items, result]);
+          if (editing) {
+            if (selectedAgent()?.id === result.id) setSelectedAgent(result);
+          } else newChat(result);
+          setEditingAgent(null);
           setModal(null);
+        } catch (cause) {
+          setError(cause.message);
+        }
+      }
+      async function saveConnection(event, id) {
+        event.preventDefault();
+        const form = event.currentTarget, fields = new FormData(form);
+        setError("");
+        try {
+          await rpc(id ? "connections.rotate" : "connections.put", id
+            ? { projectId: "main", id, apiKey: fields.get("apiKey") }
+            : { projectId: "main", name: fields.get("name"),
+              kind: fields.get("kind"), apiKey: fields.get("apiKey"),
+              jiraUrl: fields.get("jiraUrl") || "",
+              jiraEmail: fields.get("jiraEmail") || "" });
+          form.reset();
+          setConnectionKind("github");
+          await loadView("integrations");
+        } catch (cause) {
+          setError(cause.message);
+        }
+      }
+      async function removeConnection(item) {
+        if (!confirm(`Delete ${item.name}? Agents using it will stop until reconfigured.`)) return;
+        setError("");
+        try {
+          await rpc("connections.delete", { projectId: "main", id: item.id });
+          await loadView("integrations");
         } catch (cause) {
           setError(cause.message);
         }
@@ -1487,6 +1527,51 @@
             <${Show} when=${() => !view()?.items?.length}><div class="empty">No requests in this range.</div><//>
             <${Show} when=${() => view()?.nextCursor}><div class="actions">
               <button class="secondary" onClick=${moreUsage}>Load more</button></div><//>`;
+        if (route === "integrations")
+          return html`<p class="help">
+              Connections belong to your Cognito user in the main project. Keys
+              are never shown again in this UI. An agent receives a connection
+              only when you explicitly grant it; code in its public-network
+              workspace can then read and transmit that credential.
+            </p>
+            <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+              <h3 class="section-title">Add connection</h3>
+              <form onSubmit=${(event) => saveConnection(event)}>
+                <div class="field"><label for="connection-name">Name</label>
+                  <input id="connection-name" name="name" maxlength="80" required /></div>
+                <div class="field"><label for="connection-kind">Service</label>
+                  <select id="connection-kind" name="kind" value=${connectionKind}
+                    onChange=${(event) => setConnectionKind(event.currentTarget.value)}>
+                    <option value="github">GitHub token</option>
+                    <option value="jira">Jira API token</option>
+                  </select></div>
+                <${Show} when=${() => connectionKind() === "jira"}>
+                  <div class="field"><label for="jira-url">Jira HTTPS URL</label>
+                    <input id="jira-url" name="jiraUrl" type="url" placeholder="https://example.atlassian.net" required /></div>
+                  <div class="field"><label for="jira-email">Jira email</label>
+                    <input id="jira-email" name="jiraEmail" type="email" required /></div><//>
+                <div class="field"><label for="connection-key">API key or token</label>
+                  <input id="connection-key" name="apiKey" type="password"
+                    autocomplete="new-password" spellcheck="false" required /></div>
+                <div class="actions"><button class="primary" type="submit">Save connection</button></div>
+              </form><//>
+            <h3 class="section-title">Saved connections</h3>
+            <${For} each=${() => view()?.route === "integrations" ? view()?.items || [] : []}>
+              ${(item) => html`<div class="item">
+                <strong>${item.name}</strong>
+                <small>${item.kind === "jira" ? "Jira · " + item.jiraUrl : "GitHub"} · ${new Date(item.createdAt).toLocaleDateString()}</small>
+                <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+                  <form onSubmit=${(event) => saveConnection(event, item.id)}>
+                    <div class="field"><label>Replace token</label>
+                      <input name="apiKey" type="password" autocomplete="new-password"
+                        spellcheck="false" required /></div>
+                    <div class="actions"><button class="secondary" type="submit">Rotate</button>
+                      <button class="secondary" type="button"
+                        onClick=${(event) => removeConnection(item)}>Delete</button></div>
+                  </form><//>
+              </div>`}<//>
+            <${Show} when=${() => !view()?.items?.length}>
+              <div class="empty">No connections yet.</div><//>`;
         if (route === "agents")
           return html` <p class="help">
               Each agent is a configuration in this project. One AgentCore Runtime
@@ -1497,7 +1582,7 @@
               event.preventDefault();
               createAgent(new FormData(event.currentTarget));
             }}>
-              <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" name="name" required maxlength="80" /></div>
+              <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" name="name" required maxlength="80" value=${() => editingAgent()?.name || ""} /></div>
               <div class="field"><label for="agent-model">Model</label><select id="agent-model" name="modelId" required
                 onChange=${(event) => {
                   const tool = event.currentTarget.form.elements.codeInterpreter;
@@ -1508,32 +1593,46 @@
                   <optgroup label=${company}>
                     <${For} each=${() => (view()?.route === "agents" ? view()?.items || [] : [])
                       .filter((model) => modelCompany(model) === company)}>
-                      ${(model) => html`<option value=${model.id} disabled=${!model.active}>${model.name}${model.active ? "" : " · not configured"}</option>`}<//>
+                      ${(model) => html`<option value=${model.id} disabled=${!model.active}
+                        selected=${() => editingAgent()?.modelId === model.id}>${model.name}${model.active ? "" : " · not configured"}</option>`}<//>
                   </optgroup>`}<//>
               </select></div>
-              <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3"></textarea></div>
-              <div class="field"><label for="agent-max-output">Maximum output tokens per model turn</label><input id="agent-max-output" name="maxOutputTokens" type="number" min="16" max="4096" step="1" value="4096" required /></div>
-              <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" /> Enable code workspace</label>
+              <div class="field"><label for="agent-prompt">Instructions</label><textarea id="agent-prompt" name="systemPrompt" rows="3" value=${() => editingAgent()?.systemPrompt || ""}></textarea></div>
+              <div class="field"><label for="agent-max-output">Maximum output tokens per model turn</label><input id="agent-max-output" name="maxOutputTokens" type="number" min="16" max="4096" step="1" value=${() => editingAgent()?.maxOutputTokens || 4096} required /></div>
+              <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" checked=${() => Boolean(editingAgent()?.codeInterpreter)} /> Enable code workspace</label>
                 <p class="help">Python, Node, shell, AWS CLI and internet access in an isolated session. No account credentials are granted automatically. Bedrock models only for now.</p></div>
-              <div class="actions"><button class="primary" type="submit">Create agent</button></div>
+              <${Show} when=${() => view()?.connections?.length}>
+                <div class="field"><label>Grant connections to this agent</label>
+                  <${For} each=${() => view()?.connections || []}>${(item) => html`
+                    <label class="check"><input type="checkbox" name="connectionId" value=${item.id}
+                      checked=${() => Boolean(editingAgent()?.connectionIds?.includes(item.id))} />
+                      ${item.name} · ${item.kind}</label>`}<//>
+                  <p class="help">Enable code workspace to use a grant. Generated code can read the selected keys.</p>
+                </div><//>
+              <div class="actions">
+                <${Show} when=${editingAgent}><button class="secondary" type="button"
+                  onClick=${(event) => setEditingAgent(null)}>Cancel edit</button><//>
+                <button class="primary" type="submit">${() => editingAgent() ? "Save agent" : "Create agent"}</button>
+              </div>
             </form>
             <${Show}
               when=${() => agents().length}
               fallback=${html`<div class="empty">No agents found in this project.</div>`}
             >
               <div class="rail-list">
-                <${For} each=${agents}
-                  >${(agent) =>
-                    html`<button
-                      class="nav"
-                      onClick=${(e) => {
+                <${For} each=${agents}>${(agent) => html`
+                  <div class="item">
+                    <strong>${agent.name || agent.agentName || agent.id}</strong>
+                    <small>${agent.modelId}</small>
+                    <div class="actions">
+                      <button class="secondary" type="button" onClick=${() => {
                         selectAgent(agent);
                         setModal(null);
-                      }}
-                    >
-                      ${agent.name || agent.agentName || agent.id}
-                    </button>`}<//
-                >
+                      }}>Open chat</button>
+                      <button class="secondary" type="button"
+                        onClick=${() => setEditingAgent(agent)}>Edit</button>
+                    </div>
+                  </div>`}<//>
               </div><//
             >`;
         return html`<p class="help">

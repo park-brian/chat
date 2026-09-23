@@ -308,21 +308,32 @@ export async function createLiveFixture({ stackName, profile, region }) {
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-ui", "runtime-model", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
   const uiInvocations = [];
+  const uiErrors = [];
+  const runtimeFailures = [];
+  page.on("response", async (reply) => {
+    if (reply.url().includes("/runtimes/") && reply.status() >= 400)
+      runtimeFailures.push(`${reply.status()} ${(await reply.text().catch(() => "")).slice(0, 300)}`);
+  });
   page.on("request", (request) => {
     if (!request.url().includes("/runtimes/")) return;
     const body = request.postDataJSON();
-    if (story === "runtime-ui" && body?.command === "chat.send")
+    if (["runtime-ui", "runtime-connections"].includes(story) && body?.command === "chat.send")
       fixture.trackChat(body.input.agentId, body.input.sessionId);
     uiInvocations.push({ command: body?.command, input: body?.input,
       runtimeSession: request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"] });
   });
+  if (story === "runtime-ui") page.on("response", async (reply) => {
+    if (reply.request().postDataJSON()?.command !== "chat.send") return;
+    const body = await reply.text().catch(() => "");
+    if (body.includes('"type":"error"')) uiErrors.push(body.slice(0, 1000));
+  });
   const tokenResponse =
-    ["runtime", "runtime-chat", "runtime-tool", "runtime-model", "runtime-benchmark"].includes(story)
+    ["runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)
       ? page.waitForResponse((response) =>
           response.url().includes("/oauth2/token"),
         )
@@ -335,19 +346,41 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .locator('button[type="submit"], input[type="submit"]')
     .first()
     .click();
-  await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+  await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 })
+    .catch(async () => {
+      throw new Error(`Workspace did not open: ${(await page.locator('[role="alert"]').allTextContents()).join(" | ")}; ${runtimeFailures.join(" | ")}`);
+    });
   if (uiInvocations.length !== 1 || uiInvocations[0].command !== "workspace.get" ||
     !uiInvocations[0].runtimeSession)
     throw new Error("Sign-in must load the workspace in one sticky Runtime invocation");
   if (story === "runtime-ui") {
+    const label = page.viewportSize().width < 761 ? "mobile" : "desktop";
+    const firstMessage = `hello ${label}`;
+    const secondMessage = `second ${label}`;
     const chooseConversation = async (name) => {
       if (page.viewportSize().width < 761) {
         await page.getByRole("button", { name: "Open menu" }).click();
-        await page.getByRole("dialog").getByRole("button", { name }).first().click();
+        const menu = page.getByRole("dialog");
+        const target = menu.getByRole("button", { name }).first();
+        if (!(await target.count()))
+          throw new Error(`Mobile menu missing ${name}: ${(await menu.locator("button").allTextContents()).join(" | ")}`);
+        await target.click();
       } else {
         await page.getByRole("button", { name }).first().click();
       }
     };
+    await chooseConversation("Integrations");
+    const connectionDialog = page.getByRole("dialog");
+    await connectionDialog.locator("#connection-name").fill(`UI GitHub ${label}`);
+    await connectionDialog.locator("#connection-key").fill("ui-test-token");
+    await connectionDialog.getByRole("button", { name: "Save connection" }).click();
+    await connectionDialog.getByText(`UI GitHub ${label}`).last().waitFor();
+    if (screenshot)
+      await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-connections", document.querySelector("dialog[open]"));
+      });
+    await connectionDialog.getByRole("button", { name: "Close dialog" }).click();
     await page.getByRole("button", { name: "Choose an agent" }).click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#agent-model option[value='test.echo']").waitFor({ state: "attached" });
@@ -365,22 +398,48 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         const { _screenshot } = await import("./tests.js");
         await _screenshot("live-agent-models", document.querySelector("dialog[open]"));
       });
-    await dialog.locator("#agent-name").fill("Smoke UI agent");
+    await dialog.locator("#agent-name").fill(`Smoke UI ${label}`);
     await dialog.locator("#agent-model").selectOption("test.echo");
+    await dialog.locator('input[name="codeInterpreter"]').check();
+    await dialog.locator('input[name="connectionId"]').last().check();
     await dialog.getByRole("button", { name: "Create agent" }).click();
-    await dialog.waitFor({ state: "hidden" });
+    await dialog.waitFor({ state: "hidden", timeout: 12000 }).catch(async () => {
+      throw new Error(`Agent create stayed open: ${(await dialog.locator('[role="alert"]').allTextContents()).join(" | ")}`);
+    });
+    await chooseConversation("Agents");
+    const editor = page.getByRole("dialog");
+    await editor.locator(".item").filter({ hasText: `Smoke UI ${label}` })
+      .getByRole("button", { name: "Edit" }).last().click();
+    if (!(await editor.locator('input[name="connectionId"]').last().isChecked()))
+      throw new Error("Agent edit lost its saved connection grant");
+    const editedModel = await editor.locator("#agent-model").inputValue();
+    const editedTool = await editor.locator('input[name="codeInterpreter"]').isChecked();
+    if (editedModel !== "test.echo" || !editedTool)
+      throw new Error(`Agent edit lost model/tool: ${editedModel} / ${editedTool}`);
+    await editor.locator("#agent-name").fill(`Smoke UI ${label} revised`);
+    await editor.getByRole("button", { name: "Save agent" }).click();
+    await editor.waitFor({ state: "hidden", timeout: 12000 }).catch(async () => {
+      throw new Error(`Agent edit stayed open: ${(await editor.locator('[role="alert"]').allTextContents()).join(" | ")}`);
+    });
     const message = page.locator('textarea[aria-label="Message"]');
-    await message.fill("hello ui");
+    await message.fill(firstMessage);
     await page.getByRole("button", { name: "Send ↑" }).click();
-    await page.locator(".message-text").getByText("Echo: hello ui").waitFor();
-    await page.getByRole("button", { name: "Send ↑" }).waitFor();
+    await page.locator(".message-text").getByText(`Echo: ${firstMessage}`).waitFor()
+      .catch(async (error) => {
+        throw new Error(`Edited agent chat failed: ${(await page.locator('[role="alert"]').allTextContents()).join(" | ")}; ${error.message}`);
+      });
+    await page.locator(".message.assistant .message-state").last()
+      .waitFor({ state: "hidden", timeout: 12000 }).catch(async () => {
+        throw new Error(`First chat did not complete: ${(await page.locator('[role="alert"]').allTextContents()).join(" | ")}; ${uiErrors.join(" | ")}`);
+      });
     await chooseConversation("New chat");
-    await message.fill("second ui");
+    await message.fill(secondMessage);
     await page.getByRole("button", { name: "Send ↑" }).click();
-    await page.locator(".message-text").getByText("Echo: second ui").waitFor();
-    await page.getByRole("button", { name: "Send ↑" }).waitFor();
-    await chooseConversation("hello ui");
-    await page.locator(".message-text").getByText("Echo: hello ui").waitFor();
+    await page.locator(".message-text").getByText(`Echo: ${secondMessage}`).waitFor();
+    await page.locator(".message.assistant .message-state").last()
+      .waitFor({ state: "hidden" });
+    await chooseConversation(firstMessage);
+    await page.locator(".message-text").getByText(`Echo: ${firstMessage}`).waitFor();
     const chats = uiInvocations.filter((item) => item.command === "chat.send");
     if (chats.length !== 2 || chats[0].input.sessionId === chats[1].input.sessionId ||
       uiInvocations.some((item) => item.command === "agents.list") ||
@@ -388,8 +447,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       throw new Error("UI did not reuse one Runtime session across control and conversations");
     await page.reload();
     await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
-    await chooseConversation("hello ui");
-    await page.locator(".message-text").getByText("Echo: hello ui").waitFor();
+    await chooseConversation(firstMessage);
+    await page.locator(".message-text").getByText(`Echo: ${firstMessage}`).waitFor();
     if (!uiInvocations.some((item) => item.command === "conversations.get" &&
       item.input.conversationId === chats[0].input.sessionId))
       throw new Error("Reload did not reopen saved Memory events");
@@ -400,9 +459,115 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       });
     return;
   }
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-model", "runtime-benchmark"].includes(story)) {
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
+    if (story === "runtime-connections") {
+      const result = await page.evaluate(async ({ url, token, realKey }) => {
+        const rawKey = `test-${crypto.randomUUID()}'$"`;
+        const nextKey = `rotated-${crypto.randomUUID()} '"$`;
+        const runtimeSession = `connection-${crypto.randomUUID()}`;
+        const digest = async (value) => [...new Uint8Array(
+          await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))]
+          .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+        const call = async (command, input) => {
+          const response = await fetch(url, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
+          }, body: JSON.stringify({ v: 1, command, input }) });
+          const text = await response.text();
+          return { status: response.status, text, body: JSON.parse(text) };
+        };
+        const chat = async (agentId, message) => {
+          const sessionId = crypto.randomUUID();
+          const response = await fetch(url, { method: "POST", headers: {
+            authorization: `Bearer ${token}`, "content-type": "application/json",
+            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
+          }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            projectId: "main", agentId, sessionId,
+            requestId: crypto.randomUUID(), message,
+          } }) });
+          return { status: response.status, text: await response.text() };
+        };
+        const created = await call("connections.put", {
+          projectId: "main", name: "GitHub smoke", kind: "github", apiKey: rawKey,
+        });
+        if (created.status !== 200 || created.text.includes(rawKey))
+          throw Error("Connection creation failed or leaked its key");
+        const id = created.body.data.id;
+        const listed = await call("connections.list", { projectId: "main" });
+        if (listed.status !== 200 || listed.text.includes(rawKey) ||
+          !listed.body.data.items.some((item) => item.id === id))
+          throw Error("Connection list was missing or leaked its key");
+        const denied = await call("agents.put", { projectId: "main",
+          name: "Unauthorized grant", modelId: "test.echo", codeInterpreter: true,
+          connectionIds: [crypto.randomUUID()] });
+        if (denied.body.error?.code !== "CONNECTION_UNAVAILABLE")
+          throw Error(`Unknown connection grant: ${denied.status} ${denied.text.slice(0, 400)}`);
+        const agent = await call("agents.put", { projectId: "main",
+          name: "Connected smoke", modelId: "test.echo", codeInterpreter: true,
+          connectionIds: [id] });
+        if (agent.status !== 200) throw Error("Connected agent creation failed");
+        const agentId = agent.body.data.id;
+        const py = await chat(agentId,
+          'run-code: import os, hashlib; print(hashlib.sha256(os.environ["GITHUB_TOKEN"].encode()).hexdigest())');
+        if (py.status !== 200 || !py.text.includes(await digest(rawKey)) ||
+          !py.text.includes('"type":"message.done"'))
+          throw Error("Python did not receive the granted token");
+        const js = await chat(agentId,
+          'run-js: console.log(Boolean(process.env.GITHUB_TOKEN), process.env.GITHUB_TOKEN.length)');
+        if (js.status !== 200 || !js.text.includes(`true ${rawKey.length}`) ||
+          !js.text.includes('"type":"message.done"'))
+          throw Error("Node did not receive the granted token");
+        const leaked = await chat(agentId,
+          'run-code: import os; print(os.environ["GITHUB_TOKEN"])');
+        if (leaked.status !== 200 || leaked.text.includes(rawKey) ||
+          !leaked.text.includes("[redacted]"))
+          throw Error("Tool output exposed the granted token");
+        const rotated = await call("connections.rotate", {
+          projectId: "main", id, apiKey: nextKey,
+        });
+        if (rotated.status !== 200 || rotated.text.includes(nextKey))
+          throw Error("Rotation failed or leaked its key");
+        const shell = await chat(agentId,
+          'run-command: printf %s "$GITHUB_TOKEN" | sha256sum');
+        if (shell.status !== 200 || !shell.text.includes(await digest(nextKey)) ||
+          !shell.text.includes('"type":"message.done"'))
+          throw Error("Shell did not receive the rotated token");
+        const deleted = await call("connections.delete", { projectId: "main", id });
+        const revoked = await chat(agentId, "run-code: print('should not run')");
+        if (deleted.status !== 200 || revoked.status !== 200 ||
+          !revoked.text.includes("CONNECTION_REVOKED"))
+          throw Error("Deleted grant remained usable");
+        const streams = [py.text, js.text, leaked.text, shell.text];
+        if (realKey) {
+          const realConnection = await call("connections.put", {
+            projectId: "main", name: "Live GitHub verification",
+            kind: "github", apiKey: realKey,
+          });
+          if (realConnection.status !== 200 || realConnection.text.includes(realKey))
+            throw Error("Real GitHub connection failed or leaked its key");
+          const realId = realConnection.body.data.id;
+          const realAgent = await call("agents.put", { projectId: "main",
+            name: "Live GitHub read", modelId: "test.echo", codeInterpreter: true,
+            connectionIds: [realId] });
+          if (realAgent.status !== 200) throw Error("Real GitHub agent creation failed");
+          const real = await chat(realAgent.body.data.id,
+            'run-code: import os, requests; r=requests.get("https://api.github.com/user",headers={"Authorization":"Bearer "+os.environ["GITHUB_TOKEN"],"Accept":"application/vnd.github+json"},timeout=10); print("GitHub status",r.status_code)');
+          if (real.status !== 200 || !real.text.includes("GitHub status 200") ||
+            !real.text.includes('"type":"message.done"'))
+            throw Error("Real GitHub /user read failed");
+          const removed = await call("connections.delete", { projectId: "main", id: realId });
+          if (removed.status !== 200) throw Error("Real GitHub cleanup failed");
+          streams.push(real.text);
+        }
+        return { streams };
+      }, { url: fixture.controllerUrl, token: accessToken,
+        realKey: process.env.GITHUB_PAT || null });
+      if (result.streams.some((stream) => !stream.includes('"type":"tool.done"')))
+        throw new Error("Connection tool usage was not observed");
+      return;
+    }
     if (story === "runtime-model") {
       const catalog = (await import("./models.json", { with: { type: "json" } })).default;
       const selected = process.env.AGENTCORE_TEST_MODEL;
@@ -745,9 +910,17 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   await page.getByRole("dialog").getByText(/Not yet metered|\$0\.00/).first().waitFor();
   await page.getByRole("dialog").locator("#usage-range").selectOption("90d");
   await page.getByRole("dialog").locator("#usage-sort").selectOption("asc");
+  const combinedUsage = page.waitForResponse((reply) =>
+    reply.request().postDataJSON()?.command === "usage.get" &&
+    reply.request().postDataJSON()?.input?.scope === "all");
   await page.getByRole("dialog").locator("#usage-scope").selectOption("all");
+  const combinedBody = await (await combinedUsage).json();
+  if (!combinedBody.ok) throw new Error("Combined usage read failed");
   await page.getByRole("dialog").getByText(/(Daily|Weekly|Monthly) ·/).waitFor();
-  await page.getByRole("dialog").getByText("No requests in this range.").waitFor();
+  if (combinedBody.data.items.length)
+    await page.getByRole("dialog").locator(".item").first().waitFor();
+  else
+    await page.getByRole("dialog").getByText("No requests in this range.").waitFor();
   if (uiInvocations.some((item) => ["usage.summary", "usage.list", "defaults.get"].includes(item.command)) ||
     uiInvocations.filter((item) => item.command === "usage.get").length !== 4)
     throw new Error("Usage and Users dialogs made avoidable Runtime invocations");
