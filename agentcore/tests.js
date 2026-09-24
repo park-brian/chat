@@ -447,8 +447,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (fixture.hasGemini) {
       await dialog.locator("#agent-model").selectOption("gemini-3.8-flash");
       for (const name of ["codeInterpreter", "webSearch", "browser"])
-        if (!(await dialog.locator(`input[name="${name}"]`).isDisabled()))
-          throw new Error("Gemini cannot offer an unimplemented managed-tool bridge");
+        if (await dialog.locator(`input[name="${name}"]`).isDisabled())
+          throw new Error("Configured Gemini must offer every AgentCore tool");
     }
     await dialog.locator("#agent-model").selectOption("global.openai.gpt-6-luna");
     if (!(await dialog.locator('input[name="browser"]').isDisabled()) ||
@@ -642,51 +642,83 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       const selected = process.env.AGENTCORE_TEST_MODEL;
       const toolStory = process.env.AGENTCORE_TEST_WEB === "1";
       const browserStory = process.env.AGENTCORE_TEST_BROWSER === "1";
+      const codeStory = process.env.AGENTCORE_TEST_CODE === "1";
+      const denyStory = process.env.AGENTCORE_TEST_DENY === "1";
       if (selected && !catalog.some((model) =>
         ["bedrock", "gemini"].includes(model.transport) && model.id === selected))
         throw new Error("AGENTCORE_TEST_MODEL must name a checked-in live model");
-      if (toolStory && (!selected || selected.startsWith("gemini-")))
-        throw new Error("AGENTCORE_TEST_WEB requires one Bedrock AGENTCORE_TEST_MODEL");
+      if ([toolStory, browserStory, codeStory, denyStory].filter(Boolean).length > 1)
+        throw new Error("Choose one live tool scenario");
+      if (denyStory && !selected)
+        throw new Error("AGENTCORE_TEST_DENY requires AGENTCORE_TEST_MODEL");
+      if (toolStory && !selected)
+        throw new Error("AGENTCORE_TEST_WEB requires AGENTCORE_TEST_MODEL");
       if (browserStory && (!selected ||
-        !catalog.find((model) => model.id === selected)?.browserTool || toolStory))
+        !catalog.find((model) => model.id === selected)?.browserTool))
         throw new Error("AGENTCORE_TEST_BROWSER requires one Browser-compatible AGENTCORE_TEST_MODEL");
+      if (codeStory && !selected)
+        throw new Error("AGENTCORE_TEST_CODE requires AGENTCORE_TEST_MODEL");
       for (const { id: modelId } of catalog.filter((model) =>
         (selected ? model.id === selected : model.transport === "bedrock"))) {
       const defaultModelId = browserStory
         ? "global.anthropic.claude-fable-5-1"
         : modelId === "global.openai.gpt-6-luna"
           ? "global.anthropic.claude-fable-5-1" : "global.openai.gpt-6-luna";
-      const ids = await page.evaluate(async ({ url, token, defaultModelId, toolStory, browserStory }) => {
+      const runtimeSessionId = `model-${crypto.randomUUID()}`;
+      const ids = await page.evaluate(async ({ url, token, defaultModelId, toolStory, browserStory, codeStory, runtimeSessionId }) => {
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
-          "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
+          "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSessionId,
         }, body: JSON.stringify({ v: 1, command: "agents.put", input: {
           projectId: "main", name: "Full-ceiling model smoke",
           modelId: defaultModelId, webSearch: toolStory, browser: browserStory,
+          codeInterpreter: codeStory,
         } }) });
         const body = await response.json();
         if (!response.ok || !body.ok)
           throw Error(`Could not create model smoke agent: ${response.status} ${body.error?.code || ""}`);
         return { agentId: body.data.id, sessionId: crypto.randomUUID() };
-      }, { url: fixture.controllerUrl, token: accessToken, defaultModelId, toolStory, browserStory });
+      }, { url: fixture.controllerUrl, token: accessToken, defaultModelId,
+        toolStory, browserStory, codeStory, runtimeSessionId });
       fixture.trackChat(ids.agentId, ids.sessionId);
-      const result = await page.evaluate(async ({ url, token, ids, modelId, toolStory, browserStory }) => {
+      const result = await page.evaluate(async ({ url, token, ids, modelId, toolStory, browserStory, codeStory, denyStory, runtimeSessionId }) => {
         const started = performance.now();
         const response = await fetch(url, { method: "POST", headers: {
           authorization: `Bearer ${token}`, "content-type": "application/json",
-          "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
+          "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSessionId,
         }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
           projectId: "main", ...ids, requestId: crypto.randomUUID(),
-          modelId, thinkingLevel: toolStory || browserStory ? "high" : "low",
+          modelId, thinkingLevel: toolStory || browserStory || codeStory ? "high" : "low",
           message: toolStory
             ? "Use web_search to find the official Amazon Bedrock AgentCore documentation, then answer with one short sentence and a source."
             : browserStory
-            ? "Use the browser tool to navigate to https://example.com/ and tell me the visible page title in one sentence."
+            ? modelId === "gemini-3.8-flash"
+              ? "Call browser to navigate to https://example.com/. Then call browser again with screenshot. Finally tell me the visible page title in one sentence."
+              : "Use the browser tool to navigate to https://example.com/ and tell me the visible page title in one sentence."
+            : codeStory
+            ? "Use execute_code with Python to print GEMINI_CODE_OK, then report that output."
+            : denyStory
+            ? "Use web_search to find the official AgentCore documentation, then answer briefly."
             : "Reply with OK only.",
         } }) });
         return { status: response.status, stream: await response.text(),
           elapsedMs: Math.round(performance.now() - started) };
-      }, { url: fixture.controllerUrl, token: accessToken, ids, modelId, toolStory, browserStory });
+      }, { url: fixture.controllerUrl, token: accessToken, ids, modelId,
+        toolStory, browserStory, codeStory, denyStory, runtimeSessionId });
+      if (denyStory && result.status === 200 &&
+        result.stream.includes('"type":"error"')) {
+        const [usage, events] = await Promise.all([
+          fixture.readUsage(), fixture.readChat(ids.agentId, ids.sessionId),
+        ]);
+        if (!result.stream.includes("The model could not form a valid tool call.") ||
+          result.stream.includes('"type":"tool.done"') ||
+          (usage.Items || []).some((row) => row.name?.S === "web_search") ||
+          (events.events || []).length)
+          throw new Error("An ungranted search executed or persisted after model error");
+        console.log("REAL_MODEL_DENIED " + JSON.stringify({ modelId,
+          elapsedMs: result.elapsedMs }));
+        continue;
+      }
       if (result.status !== 200 || !result.stream.includes('"type":"message.done"'))
         throw new Error("Real-model turn incomplete: " + result.stream.slice(-1000));
       if (toolStory && (!result.stream.includes('"name":"web_search","isError":false') ||
@@ -700,6 +732,14 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       if (browserStory && (!result.stream.includes('"name":"browser","isError":false') ||
         !/Example Domain/i.test(visibleText)))
         throw new Error("Real-model Browser continuation incomplete: " + result.stream.slice(-1600));
+      if (codeStory && (!result.stream.includes('"name":"execute_code","isError":false') ||
+        !visibleText.includes("GEMINI_CODE_OK")))
+        throw new Error("Real-model Code continuation incomplete: " + result.stream.slice(-1600));
+      if (denyStory && result.stream.includes('"type":"tool.done"'))
+        throw new Error("An ungranted managed tool ran");
+      if (browserStory && modelId === "gemini-3.8-flash" &&
+        result.stream.split('"name":"browser","isError":false').length < 3)
+        throw new Error("Gemini did not complete two signed Browser tool steps");
       if (modelId === "gemini-3.8-flash" &&
         result.stream.includes("output limit before producing a visible reply"))
         throw new Error("Gemini smoke used all tokens on thinking");
@@ -709,21 +749,35 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       ]);
       if (agent?.modelId?.S !== defaultModelId ||
         !(usage.Items || []).some((row) => row.modelId?.S === modelId) ||
+        ((toolStory || browserStory || codeStory) &&
+          !(usage.Items || []).some((row) => row.name?.S ===
+            (toolStory ? "web_search" : browserStory ? "browser" : "execute_code"))) ||
         !(events.events || []).some((event) =>
           event.payload?.[2]?.json?.content?.modelId === modelId))
         throw new Error("Per-turn model override changed the agent or lost attribution");
+      if (toolStory && !(events.events || []).some((event) =>
+        /Sources:[\s\S]*https:\/\//.test(
+          event.payload?.[1]?.conversational?.content?.text || "")))
+        throw new Error("Web Search citations were not retained in Memory");
+      if (denyStory && ((usage.Items || []).some((row) => row.name?.S === "web_search") ||
+        (events.events || []).some((event) =>
+          event.payload?.[2]?.json?.content?.toolCalls?.length)))
+        throw new Error("Ungranted Web Search appeared in usage or Memory");
+      if (modelId === "gemini-3.8-flash" && /thoughtSignature|inlineData/
+        .test(JSON.stringify(events.events || [])))
+        throw new Error("Gemini signature or screenshot escaped request-local history");
       if (modelId === "gemini-3.8-flash") {
-        const followUp = await page.evaluate(async ({ url, token, ids, modelId }) => {
+        const followUp = await page.evaluate(async ({ url, token, ids, modelId, runtimeSessionId }) => {
           const response = await fetch(url, { method: "POST", headers: {
             authorization: `Bearer ${token}`, "content-type": "application/json",
-            "x-amzn-bedrock-agentcore-runtime-session-id": `model-${crypto.randomUUID()}`,
+            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSessionId,
           }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
             projectId: "main", ...ids, requestId: crypto.randomUUID(),
             modelId, thinkingLevel: "low",
             message: "Reply SECOND only.",
           } }) });
           return { status: response.status, stream: await response.text() };
-        }, { url: fixture.controllerUrl, token: accessToken, ids, modelId });
+        }, { url: fixture.controllerUrl, token: accessToken, ids, modelId, runtimeSessionId });
         if (followUp.status !== 200 || !followUp.stream.includes('"type":"message.done"'))
           throw new Error("Gemini follow-up incomplete: " + followUp.stream.slice(-1000));
         const events = await fixture.readChat(ids.agentId, ids.sessionId);
@@ -1139,6 +1193,15 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (await thinking.locator('option[value="max"]').count() ||
       (await thinking.inputValue()) !== "medium")
       throw new Error("Gemini thinking choices must be model-specific");
+    if (await page.getByRole("dialog").locator('input[name="codeInterpreter"]').isDisabled() ||
+      await page.getByRole("dialog").locator('input[name="webSearch"]').isDisabled() ||
+      await page.getByRole("dialog").locator('input[name="browser"]').isDisabled())
+      throw new Error("Configured Gemini must offer all managed tools");
+    if (screenshot)
+      await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-gemini-tools", document.querySelector("dialog[open]"));
+      });
   }
   await page.getByRole("dialog").getByRole("button", { name: "Close dialog" }).click();
   await openManage("Usage");

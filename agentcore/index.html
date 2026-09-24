@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-kiMZFJVZajA6pIbCC8yO22+MolJJx6QJCDgOeDzxNhb763eyiKa9BGVPs5ZUjg+S' https://cdn.jsdelivr.net; style-src 'sha384-6gtzCXm/dOos6Ceb/92xliWcB8y9NP1IU7F5COe/zUddPYRSaGZ+U4zCmC+GvtRQ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-gvEQndP0Vic+9IpVPaRpHGa3L3kUEO94UNwiEcyh7hh21zd70bqpGABZQSGKpUtd' https://cdn.jsdelivr.net; style-src 'sha384-6gtzCXm/dOos6Ceb/92xliWcB8y9NP1IU7F5COe/zUddPYRSaGZ+U4zCmC+GvtRQ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -1030,9 +1030,7 @@
       const [selectedAgent, setSelectedAgent] = createSignal(null);
       const [composerChoice, setComposerChoice] = createSignal(null);
       const modelAllowed = (model, agent) => model.active &&
-        !(agent?.browser && !model.browserTool) &&
-        !(model.transport === "gemini" &&
-          (agent?.codeInterpreter || agent?.webSearch || agent?.browser));
+        !(agent?.browser && !model.browserTool);
       const composerModel = () => {
         const agent = selectedAgent();
         if (!agent) return null;
@@ -1687,8 +1685,7 @@
                 onChange=${(event) => {
                   setDraftModelId(event.currentTarget.value);
                   for (const tool of event.currentTarget.form.querySelectorAll("[data-model-tool]")) {
-                    tool.disabled = chosenModel()?.transport === "gemini" ||
-                      (tool.name === "browser" && !chosenModel()?.browserTool);
+                    tool.disabled = tool.name === "browser" && !chosenModel()?.browserTool;
                     if (tool.disabled) tool.checked = false;
                   }
                 }}>
@@ -1713,11 +1710,9 @@
                   </select></div>
               <//>
               <div class="field"><label class="check"><input type="checkbox" name="codeInterpreter" data-model-tool
-                disabled=${() => chosenModel()?.transport === "gemini"}
                 checked=${() => Boolean(editingAgent()?.codeInterpreter)} /> Enable code workspace</label>
-                <p class="help">Python, Node, shell, AWS CLI and internet access in an isolated session. No account credentials are granted automatically. Bedrock models only for now.</p></div>
+                <p class="help">Python, Node, shell, AWS CLI and internet access in an isolated session. No account credentials are granted automatically.</p></div>
               <div class="field"><label class="check"><input type="checkbox" name="webSearch" data-model-tool
-                disabled=${() => chosenModel()?.transport === "gemini"}
                 checked=${() => Boolean(editingAgent()?.webSearch)} /> Enable web search</label>
                 <p class="help">Current public results through AgentCore Gateway. Source links appear beneath the reply.</p>
                 <label for="agent-search-results">Maximum results per search</label>
@@ -1726,7 +1721,7 @@
               <div class="field"><label class="check"><input type="checkbox" name="browser" data-model-tool
                 disabled=${() => !chosenModel()?.browserTool}
                 checked=${() => Boolean(editingAgent()?.browser)} /> Enable browser</label>
-                <p class="help">Visual browsing needs a Claude model; GPT-6 can use Web Search instead. The isolated browser has no site logins or saved profile and stops after each turn.</p>
+                <p class="help">Visual browsing works with Claude or configured Gemini; GPT-6 can use Web Search instead. The isolated browser has no site logins or saved profile and stops after each turn.</p>
                 <label for="agent-browser-timeout">Session timeout (seconds)</label>
                 <input id="agent-browser-timeout" name="browserSessionSeconds" type="number" min="60" max="900"
                   value=${() => editingAgent()?.browserSessionSeconds || 300} required /></div>
@@ -1996,7 +1991,7 @@
                     uncertainConversationId() === conversationId()}
                 ></textarea>
                 <${Show} when=${() => selectedAgent()?.browser && !composerModel()?.browserTool}>
-                  <p class="help">Visual browsing needs Claude. Choose a Claude model before sending, or disable Browser in the agent settings.</p>
+                  <p class="help">Visual browsing needs Claude or configured Gemini. Choose one before sending, or disable Browser in the agent settings.</p>
                 <//>
                 <div class="composer-foot">
                   <${Show} when=${selectedAgent}

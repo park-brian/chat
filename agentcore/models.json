@@ -103,7 +103,7 @@
     "maxOutputTokens": 65536,
     "thinkingLevels": ["low", "medium", "high"],
     "defaultThinkingLevel": "medium",
-    "browserTool": false,
+    "browserTool": true,
     "source": "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
     "pricingSource": "https://ai.google.dev/gemini-api/docs/pricing",
     "pricingReviewedAt": "2026-09-22",

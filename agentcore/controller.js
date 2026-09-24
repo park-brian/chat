@@ -9,6 +9,8 @@ import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { BedrockRuntimeClient, ConverseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
 import { scriptedStream } from "./scripted-model.js";
 import { modelCost, periodKey } from "./accounting.js";
+import { geminiRequest, geminiFunctionResult, geminiStepCalls,
+  readGeminiStream } from "./gemini-protocol.js";
 import suggestedModels from "./models.json" with { type: "json" };
 import {
   CognitoIdentityProviderClient,
@@ -363,8 +365,7 @@ async function invoke(body, identity) {
       ? !model.thinkingLevels.includes(selectedThinkingLevel)
       : thinkingLevel !== undefined)
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    if ((model.transport === "gemini" && (codeInterpreter || webSearch || browser)) ||
-      (browser && !model.browserTool))
+    if (browser && !model.browserTool)
       return { status: 400, data: { ok: false, error: { code: "TOOL_UNAVAILABLE" } } };
     if (connectionIds.length) {
       const saved = (await credentials(identity)).items;
@@ -548,72 +549,53 @@ async function invoke(body, identity) {
   return { status: 200, data: { ok: true, data: await getSession(identity) } };
 }
 
-async function runGemini(config, model, level, messages, emit, workloadToken) {
+async function runGemini(config, model, level, messages, emit, workloadToken, tools) {
   if (!workloadToken) throw Error("Missing runtime workload token");
   const { apiKey } = await memory.send(new GetResourceApiKeyCommand({
     resourceCredentialProviderName: process.env.GEMINI_PROVIDER,
     workloadIdentityToken: workloadToken,
   }));
-  const body = {
-    contents: messages.map(({ role, content }) => ({
-      role: role === "assistant" ? "model" : "user",
-      parts: content.map(({ text }) => ({ text })),
-    })),
-    ...(config.systemPrompt && { systemInstruction: { parts: [{ text: config.systemPrompt }] } }),
-    generationConfig: { maxOutputTokens: model.maxOutputTokens,
-      thinkingConfig: { thinkingLevel: level } },
-  };
-  const reply = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.modelId)}:streamGenerateContent?alt=sse`,
-    { method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(120000) },
-  );
-  if (!reply.ok) {
-    const error = Error(`Gemini HTTP ${reply.status}`);
-    error.name = "GeminiHttpError";
-    throw error;
-  }
-  if (!reply.body) throw Error("Gemini response had no stream");
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const contents = messages.map(({ role, content }) => ({
+    role: role === "assistant" ? "model" : "user",
+    parts: content.map(({ text }) => ({ text })),
+  }));
+  const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0,
+    cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
   let text = "";
-  let reported;
-  for await (const chunk of reply.body) {
-    buffer += decoder.decode(chunk, { stream: true }).replace(/\r/g, "");
-    if (buffer.length > 1048576) throw Error("Gemini event exceeded limit");
-    let boundary;
-    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = frame.split("\n").filter((line) => line.startsWith("data: "))
-        .map((line) => line.slice(6)).join("\n");
-      if (!data) continue;
-      const event = JSON.parse(data);
-      for (const part of event.candidates?.[0]?.content?.parts || []) {
-        if (part.text && !part.thought) {
-          text += part.text;
-          emit({ type: "message.delta", text: part.text });
-        }
+  for (let turn = 0; turn < 8; turn++) {
+    const body = geminiRequest(model, level, contents, toolInstructions(config), tools.specs);
+    const reply = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.modelId)}:streamGenerateContent?alt=sse`,
+      { method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(120000) },
+    );
+    if (!reply.ok) throw Error(`Gemini HTTP ${reply.status}`);
+    const step = await readGeminiStream(reply.body, emit);
+    for (const name of Object.keys(usage)) usage[name] += step.usage[name];
+    text += step.visibleText;
+    const calls = geminiStepCalls(step);
+    if (calls.length) {
+      contents.push({ role: "model", parts: step.parts });
+      const results = [];
+      for (const call of calls) {
+        const result = await tools.execute(call.name, call.args || {});
+        results.push(geminiFunctionResult(call, result.content, result.isError));
       }
-      if (event.usageMetadata) reported = event.usageMetadata;
+      contents.push({ role: "user", parts: results });
+      continue;
     }
+    if (step.finishReason === "MAX_TOKENS") {
+      const notice = text ? "\n\n[Response truncated at the model output limit.]" :
+        "The model reached its output limit before producing a visible reply.";
+      emit({ type: "message.delta", text: notice });
+      text += notice;
+    }
+    if (!text) throw Error("Gemini returned no visible response");
+    const citations = tools.citations();
+    if (citations) emit({ type: "message.delta", text: citations });
+    return { text: text + citations, usage, toolCalls: tools.toolCalls };
   }
-  if (buffer.trim()) throw Error("Gemini stream ended mid-event");
-  if (!reported) throw Error("Gemini did not report token usage");
-  if (!text) {
-    text = "The model reached its output limit before producing a visible reply.";
-    emit({ type: "message.delta", text });
-  }
-  const inputTokens = reported.promptTokenCount || 0;
-  const cacheReadInputTokens = reported.cachedContentTokenCount || 0;
-  const outputTokens = (reported.candidatesTokenCount || 0) +
-    (reported.thoughtsTokenCount || 0);
-  if (cacheReadInputTokens > inputTokens) throw Error("Invalid Gemini cache meter");
-  return { text, usage: {
-    inputTokens: inputTokens - cacheReadInputTokens, outputTokens,
-    totalTokens: reported.totalTokenCount || inputTokens + outputTokens,
-    cacheReadInputTokens, cacheWriteInputTokens: 0,
-  }, toolCalls: [] };
+  throw Error("Agent turn limit reached");
 }
 
 async function interpreterCall(sessionId, name, args) {
@@ -779,37 +761,33 @@ async function browserAction(sessionId, input) {
     { image: { format: "png", source: { bytes: screenshot.data } } }];
 }
 
-async function runModel(config, model, messages, emit, workloadToken, scope) {
-  const level = model.thinkingLevels.includes(config.thinkingLevel)
-    ? config.thinkingLevel : model.defaultThinkingLevel;
-  if (config.modelId === "gemini-3.8-flash")
-    return runGemini(config, model, level, messages, emit, workloadToken);
-  const tools = [];
-  if (config.codeInterpreter) tools.push(
-    { toolSpec: {
+function toolSpecs(config) {
+  const specs = [];
+  if (config.codeInterpreter) specs.push(
+    {
       name: "execute_code",
       description: "Run Python, JavaScript, or TypeScript in an isolated public-network workspace. Session .env is loaded automatically.",
       inputSchema: { json: { type: "object", properties: {
         language: { type: "string", enum: ["python", "javascript", "typescript"] },
         code: { type: "string" },
       }, required: ["language", "code"] } },
-    } },
-    { toolSpec: {
+    },
+    {
       name: "execute_command",
       description: "Run a shell command in that workspace, with session .env loaded. Python, Node, curl, AWS CLI, pip and npm are installed; install other tools only when needed. Commands are capped at 120 seconds.",
       inputSchema: { json: { type: "object", properties: {
         command: { type: "string" },
       }, required: ["command"] } },
-    } },
+    },
   );
-  if (config.webSearch) tools.push({ toolSpec: {
+  if (config.webSearch) specs.push({
     name: "web_search",
     description: "Search the current public web. Cite source URLs in your answer. Queries are limited to 200 characters.",
     inputSchema: { json: { type: "object", properties: {
       query: { type: "string" },
     }, required: ["query"] } },
-  } });
-  if (config.browser) tools.push({ toolSpec: {
+  });
+  if (config.browser) specs.push({
     name: "browser",
     description: "Use an isolated public browser. Each action returns a screenshot to inspect. Navigate only to a public HTTPS URL; click uses screenshot coordinates. No authenticated browser profile is loaded.",
     inputSchema: { json: { type: "object", properties: {
@@ -817,29 +795,147 @@ async function runModel(config, model, messages, emit, workloadToken, scope) {
       url: { type: "string" }, x: { type: "integer" }, y: { type: "integer" },
       text: { type: "string" }, deltaY: { type: "integer" },
     }, required: ["action"] } },
-  } });
-  const toolConfig = tools.length ? { tools } : undefined;
-  const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0,
-    cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
+  });
+  return specs;
+}
+
+function toolInstructions(config) {
+  return [
+    config.systemPrompt,
+    "Use only the tools provided in this request. If a requested capability is unavailable, say so; do not invent tool results.",
+    config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
+    config.webSearch ? "Web Search returns current results. Base factual claims on the returned sources and cite their URLs." : "",
+    config.browser ? "Browser actions return screenshots. Inspect each screenshot and avoid entering private credentials." : "",
+  ].filter(Boolean).join("\n\n");
+}
+
+function toolSession(config, emit, scope) {
+  const specs = toolSpecs(config);
   const toolCalls = [];
-  let toolSession;
+  const sources = new Map();
+  let codeSession;
   let browserSession;
   let envPath;
   let envNames = [];
   let envValues = [];
-  const sources = new Map();
+  const execute = async (name, input) => {
+    if (toolCalls.length >= 8) throw Error("Agent tool call limit reached");
+    const isCode = name === "execute_code" &&
+      ["python", "javascript", "typescript"].includes(input?.language) &&
+      typeof input.code === "string" && input.code.length <= 20000;
+    const isCommand = name === "execute_command" &&
+      typeof input?.command === "string" && input.command.length <= 20000;
+    const isSearch = name === "web_search" && config.webSearch &&
+      typeof input?.query === "string" && input.query.trim().length > 0 &&
+      input.query.length <= 200;
+    const isBrowser = name === "browser" && config.browser &&
+      ["navigate", "click", "type", "scroll", "screenshot"].includes(input?.action);
+    if (!(isCode && config.codeInterpreter) && !(isCommand && config.codeInterpreter) &&
+      !isSearch && !isBrowser)
+      throw Error("Invalid tool request");
+    if ((isCode || isCommand) && !codeSession) {
+      if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
+      codeSession = (await memory.send(new StartCodeInterpreterSessionCommand({
+        codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID,
+        name: `chat-${uuid().slice(0, 8)}`, sessionTimeoutSeconds: 900,
+      }))).sessionId;
+      const workspace = await initializeWorkspace(codeSession, scope);
+      envPath = workspace.path;
+      envNames = workspace.names;
+      envValues = workspace.values;
+    }
+    const started = Date.now();
+    let content;
+    let isError = false;
+    if (isSearch || isBrowser) {
+      try {
+        if (isSearch) {
+          const result = await searchWeb(input.query.trim(), config.webSearchMaxResults || 5);
+          for (const { url, title } of result.sources) sources.set(url, title);
+          content = [{ text: result.text }];
+        } else {
+          if (!browserSession) browserSession = (await browserSend(
+            new StartBrowserSessionCommand({ browserIdentifier: browserId,
+              name: `chat-${uuid().slice(0, 8)}`, clientToken: uuid(),
+              sessionTimeoutSeconds: config.browserSessionSeconds || 300,
+              viewPort: { width: 1000, height: 700 } }))).sessionId;
+          content = await browserAction(browserSession, input);
+        }
+      } catch (error) {
+        console.error("Managed tool failed", name, error.name,
+          error.$metadata?.httpStatusCode || "");
+        isError = true;
+        content = [{ text: `${isSearch ? "Web Search" : "Browser"} could not complete that action.` }];
+      }
+    } else {
+      const pythonEnv = envNames.length ? `import os, base64
+for _name in ${JSON.stringify(envNames)}:
+    os.environ[_name] = base64.b64decode(os.environ.pop(_name + "_B64")).decode("utf-8")
+` : "";
+      const nodeEnv = envNames.length ? `for (const name of ${JSON.stringify(envNames)}) {
+  process.env[name] = Buffer.from(process.env[name + "_B64"], "base64").toString("utf8");
+  delete process.env[name + "_B64"];
+}
+` : "";
+      const shellEnv = envNames.map((name) =>
+        `export ${name}="$(printf '%s' "$${name}_B64" | base64 -d)"; unset ${name}_B64; `).join("");
+      const args = isCode ? {
+        language: input.language,
+        runtime: input.language === "python" ? "python" : "nodejs",
+        code: input.language === "python"
+          ? `from dotenv import load_dotenv\nload_dotenv(${JSON.stringify(envPath)}, override=True)\n${pythonEnv}${input.code}`
+          : `process.loadEnvFile(${JSON.stringify(envPath)});\n${nodeEnv}${input.code}`,
+      } : { command: `set -a; . ${shellQuote(envPath)}; set +a; ${shellEnv}timeout 120s sh -lc ${shellQuote(input.command)}` };
+      const result = await interpreterCall(codeSession,
+        isCode ? "executeCode" : "executeCommand", args);
+      isError = result.isError;
+      const safeOutput = envValues.reduce((text, value) =>
+        text.replaceAll(value, "[redacted]")
+          .replaceAll(Buffer.from(value, "utf8").toString("base64"), "[redacted]"),
+      result.output || "(no output)");
+      content = [{ text: safeOutput }];
+    }
+    toolCalls.push({ name, latencyMs: Date.now() - started,
+      occurredAt: new Date().toISOString(), isError });
+    emit({ type: "tool.done", name, isError });
+    return { content, isError };
+  };
+  const citations = () => sources.size ? "\n\nSources:\n" + [...sources]
+    .map(([url, title]) => `- ${title}: ${url}`).join("\n") : "";
+  const close = async () => {
+    if (browserSession) await browserSend(new StopBrowserSessionCommand({
+      browserIdentifier: browserId, sessionId: browserSession,
+    })).catch(() => console.error("Could not stop Browser session"));
+    if (codeSession) await memory.send(new StopCodeInterpreterSessionCommand({
+      codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID, sessionId: codeSession,
+    })).catch(() => console.error("Could not stop Code Interpreter session"));
+  };
+  return { specs, toolCalls, execute, citations, close };
+}
+
+async function runModel(config, model, messages, emit, workloadToken, scope) {
+  const level = model.thinkingLevels.includes(config.thinkingLevel)
+    ? config.thinkingLevel : model.defaultThinkingLevel;
+  const tools = toolSession(config, emit, scope);
+  if (model.transport === "gemini") {
+    try {
+      return await runGemini(config, model, level, messages, emit, workloadToken, tools);
+    } finally {
+      await tools.close();
+    }
+  }
+  const toolConfig = tools.specs.length
+    ? { tools: tools.specs.map((toolSpec) => ({ toolSpec })) } : undefined;
+  const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0,
+    cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
   try {
     for (let turn = 0; turn < 8; turn++) {
       const stream = config.modelId === "test.echo"
         ? scriptedStream(messages)
         : (await bedrock.send(new ConverseStreamCommand({
             modelId: config.modelId, messages,
-            system: config.systemPrompt || toolConfig ? [{ text: [
-              config.systemPrompt,
-              config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
-              config.webSearch ? "Web Search returns current results. Base factual claims on the returned sources and cite their URLs." : "",
-              config.browser ? "Browser actions return screenshots. Inspect each screenshot and avoid entering private credentials." : "",
-            ].filter(Boolean).join("\n\n") }] : undefined,
+            system: config.systemPrompt || toolConfig
+              ? [{ text: toolInstructions(config) }] : undefined,
             inferenceConfig: { maxTokens: model.maxOutputTokens }, toolConfig,
             ...(model.company === "Anthropic" && { additionalModelRequestFields: {
               thinking: { type: "adaptive" }, output_config: { effort: level },
@@ -890,11 +986,10 @@ async function runModel(config, model, messages, emit, workloadToken, scope) {
       }
       if (!metered) throw Error("Model did not report token usage");
       if (stopReason === "end_turn") {
-        const citations = sources.size ? "\n\nSources:\n" + [...sources]
-          .map(([url, title]) => `- ${title}: ${url}`).join("\n") : "";
+        const citations = tools.citations();
         if (citations) emit({ type: "message.delta", text: citations });
         return { text: content.map((part) => part?.text || "").join("") + citations,
-          usage, toolCalls };
+          usage, toolCalls: tools.toolCalls };
       }
       if (stopReason !== "tool_use" || !toolConfig) throw Error("Unsupported model stop reason");
       const requested = content.filter((part) => part?.toolUse).map((part) => part.toolUse);
@@ -902,103 +997,15 @@ async function runModel(config, model, messages, emit, workloadToken, scope) {
       messages.push({ role: "assistant", content });
       const results = [];
       for (const tool of requested) {
-        if (toolCalls.length >= 8) throw Error("Agent tool call limit reached");
-        const isCode = tool.name === "execute_code" &&
-          ["python", "javascript", "typescript"].includes(tool.input?.language) &&
-          typeof tool.input.code === "string" && tool.input.code.length <= 20000;
-        const isCommand = tool.name === "execute_command" &&
-          typeof tool.input?.command === "string" && tool.input.command.length <= 20000;
-        const isSearch = tool.name === "web_search" && config.webSearch &&
-          typeof tool.input?.query === "string" && tool.input.query.trim().length > 0 &&
-          tool.input.query.length <= 200;
-        const isBrowser = tool.name === "browser" && config.browser &&
-          ["navigate", "click", "type", "scroll", "screenshot"].includes(tool.input?.action);
-        if (!(isCode && config.codeInterpreter) && !(isCommand && config.codeInterpreter) &&
-          !isSearch && !isBrowser)
-          throw Error("Invalid tool request");
-        if ((isCode || isCommand) && !toolSession) {
-          if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
-          toolSession = (await memory.send(new StartCodeInterpreterSessionCommand({
-            codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID,
-            name: `chat-${uuid().slice(0, 8)}`, sessionTimeoutSeconds: 900,
-          }))).sessionId;
-          const workspace = await initializeWorkspace(toolSession, scope);
-          envPath = workspace.path;
-          envNames = workspace.names;
-          envValues = workspace.values;
-        }
-        const started = Date.now();
-        if (isSearch || isBrowser) {
-          let content;
-          let isError = false;
-          try {
-            if (isSearch) {
-              const result = await searchWeb(tool.input.query.trim(),
-                config.webSearchMaxResults || 5);
-              for (const { url, title } of result.sources) sources.set(url, title);
-              content = [{ text: result.text }];
-            } else {
-              if (!browserSession) browserSession = (await browserSend(
-                new StartBrowserSessionCommand({ browserIdentifier: browserId,
-                  name: `chat-${uuid().slice(0, 8)}`,
-                  clientToken: uuid(),
-                  sessionTimeoutSeconds: config.browserSessionSeconds || 300,
-                  viewPort: { width: 1000, height: 700 } }))).sessionId;
-              content = await browserAction(browserSession, tool.input);
-            }
-          } catch (error) {
-            console.error("Managed tool failed", tool.name, error.name,
-              error.$metadata?.httpStatusCode || "");
-            isError = true;
-            content = [{ text: `${isSearch ? "Web Search" : "Browser"} could not complete that action.` }];
-          }
-          toolCalls.push({ name: tool.name, latencyMs: Date.now() - started,
-            occurredAt: new Date().toISOString(), isError });
-          emit({ type: "tool.done", name: tool.name, isError });
-          results.push({ toolResult: { toolUseId: tool.toolUseId, content,
-            status: isError ? "error" : "success" } });
-          continue;
-        }
-        const pythonEnv = envNames.length ? `import os, base64
-for _name in ${JSON.stringify(envNames)}:
-    os.environ[_name] = base64.b64decode(os.environ.pop(_name + "_B64")).decode("utf-8")
-` : "";
-        const nodeEnv = envNames.length ? `for (const name of ${JSON.stringify(envNames)}) {
-  process.env[name] = Buffer.from(process.env[name + "_B64"], "base64").toString("utf8");
-  delete process.env[name + "_B64"];
-}
-` : "";
-        const shellEnv = envNames.map((name) =>
-          `export ${name}="$(printf '%s' "$${name}_B64" | base64 -d)"; unset ${name}_B64; `).join("");
-        const args = isCode ? {
-          language: tool.input.language,
-          runtime: tool.input.language === "python" ? "python" : "nodejs",
-          code: tool.input.language === "python"
-            ? `from dotenv import load_dotenv\nload_dotenv(${JSON.stringify(envPath)}, override=True)\n${pythonEnv}${tool.input.code}`
-            : `process.loadEnvFile(${JSON.stringify(envPath)});\n${nodeEnv}${tool.input.code}`,
-        } : { command: `set -a; . ${shellQuote(envPath)}; set +a; ${shellEnv}timeout 120s sh -lc ${shellQuote(tool.input.command)}` };
-        const { output, isError } = await interpreterCall(toolSession,
-          isCode ? "executeCode" : "executeCommand", args);
-        const safeOutput = envValues.reduce((text, value) =>
-          text.replaceAll(value, "[redacted]")
-            .replaceAll(Buffer.from(value, "utf8").toString("base64"), "[redacted]"),
-        output || "(no output)");
-        toolCalls.push({ name: tool.name, latencyMs: Date.now() - started,
-          occurredAt: new Date().toISOString(), isError });
-        emit({ type: "tool.done", name: tool.name, isError });
+        const result = await tools.execute(tool.name, tool.input);
         results.push({ toolResult: { toolUseId: tool.toolUseId,
-          content: [{ text: safeOutput }], status: isError ? "error" : "success" } });
+          content: result.content, status: result.isError ? "error" : "success" } });
       }
       messages.push({ role: "user", content: results });
     }
     throw Error("Agent turn limit reached");
   } finally {
-    if (browserSession) await browserSend(new StopBrowserSessionCommand({
-      browserIdentifier: browserId, sessionId: browserSession,
-    })).catch(() => console.error("Could not stop Browser session"));
-    if (toolSession) await memory.send(new StopCodeInterpreterSessionCommand({
-      codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID, sessionId: toolSession,
-    })).catch(() => console.error("Could not stop Code Interpreter session"));
+    await tools.close();
   }
 }
 
@@ -1060,9 +1067,7 @@ async function chat(input, identity, response, workloadToken) {
     ? !model.thinkingLevels.includes(turnThinkingLevel)
     : thinkingLevel !== undefined)
     return rejectChat(response, "VALIDATION_FAILED");
-  if ((model.transport === "gemini" &&
-    (config.codeInterpreter || config.webSearch || config.browser)) ||
-    (config.browser && !model.browserTool))
+  if (config.browser && !model.browserTool)
     return rejectChat(response, "TOOL_UNAVAILABLE");
   const turnConfig = { ...config, modelId: turnModelId, thinkingLevel: turnThinkingLevel };
   if (config.connectionIds?.length) {
@@ -1161,12 +1166,18 @@ async function chat(input, identity, response, workloadToken) {
       usage: result.usage, costMicroUsd,
       unpricedToolCalls: result.toolCalls.length, latencyMs: Date.now() - started });
   } catch (error) {
-    console.error("Chat failed", error.name, error.$metadata?.httpStatusCode || "");
+    console.error("Chat failed", error.name, error.$metadata?.httpStatusCode || "",
+      /^(Gemini |Inconsistent Gemini|Invalid Gemini|Incomplete Gemini|Agent turn limit)/
+        .test(error.message || "") ? error.message : "");
     const message = error.name === "AccessDeniedException"
       ? "Model access denied. An AWS administrator may need to enable its Marketplace agreement or Runtime role."
       : error.name === "ThrottlingException"
         ? "The model is busy. Please try again."
-        : "Agent turn failed";
+        : error.message === "Gemini stopped: MALFORMED_FUNCTION_CALL"
+          ? "The model could not form a valid tool call."
+          : error.message === "Invalid tool request"
+            ? "The model requested an unavailable tool."
+            : "Agent turn failed";
     emit({ type: "error", message,
       ...(process.env.SCRIPTED_MODEL === "true" && {
         diagnostic: error.name, stage: error.stage,
