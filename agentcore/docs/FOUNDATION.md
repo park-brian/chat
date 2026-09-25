@@ -1,6 +1,6 @@
 # Projects, paths, and objects
 
-Status: deployed to `agentcore-chat-prod` and GitHub Pages on 2026-09-25. The final Runtime ZIP is `controller/6795a908a8014e5915b6.zip`; desktop/mobile disposable-stack foundation stories and published-origin login passed. A real Gemini 3.8 Flash two-action Browser turn passed from the published origin. This document is the contract for the foundation slice; [PRODUCT-ROADMAP.md](PRODUCT-ROADMAP.md) owns later work.
+Status: earlier project/branch/object release, deployed to `agentcore-chat-prod` and GitHub Pages on 2026-09-25. Its Runtime ZIP was `controller/6795a908a8014e5915b6.zip`; desktop/mobile disposable-stack foundation stories, published-origin login, and a real Gemini two-action Browser turn passed then. [ROADMAP-CUTOVER.md](ROADMAP-CUTOVER.md) supersedes this file's 30-day Memory, completion-only accounting, file-only quota, and no-deletion statements for **new** conversations. Pre-cutoff dev conversations receive no archive backfill.
 
 ## Ownership and state
 

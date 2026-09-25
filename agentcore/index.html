@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-wxncZgPnGsbQOcNrapQlCo8brh5FJn8u41d0QHCf9snpltxFXLBr9mTIYMoiqW4h' https://cdn.jsdelivr.net; style-src 'sha384-PTd/Hmui+esmKYEnoXxuK3s1M14P6BhKBdRGVhzl+ZMECsUbxx+H5D/KYj7tDeAC'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-U66CDfz2O94DGxUfKKIfS5Hh1yL9JdtT59/kW57SC4qI4Lds5OnUPJi41fGb0j5x' https://cdn.jsdelivr.net; style-src 'sha384-k3Bol5qo0ayY53LrOdUQ3kwREPpnJofQ/Ey2SEsbnkdaSWHTsTQttwITUtGcP5F1'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -333,6 +333,18 @@
         text-decoration-thickness: 1px;
         text-underline-offset: 2px;
       }
+      .message-text pre {
+        margin: 12px 0;
+        padding: 14px 16px;
+        overflow-x: auto;
+        white-space: pre;
+        overflow-wrap: normal;
+        border: 1px solid #dce6dd;
+        border-radius: 10px;
+        background: #edf3ee;
+        color: #20372b;
+        font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
       .tool-activity {
         display: block;
         margin-top: 8px;
@@ -554,14 +566,16 @@
       .item {
         border-top: 1px solid #e9eee9;
         padding: 13px 0;
-        font-size: 12px;
+        font-size: 13px;
       }
       .item strong {
         display: block;
         overflow-wrap: anywhere;
       }
       .item small {
-        color: #87958a;
+        color: #64766a;
+        font-size: 12px;
+        line-height: 1.45;
       }
       .inline-fields {
         display: grid;
@@ -952,10 +966,11 @@
           self = session(),
           config = deployment(),
           activeId = conversationId(),
+          fileIds = agent?.codeInterpreter ? selectedFiles() : [],
           fork = forkFrom(),
           sendingBranchId = fork ? crypto.randomUUID() : branchId(),
           priorMessages = messages();
-        if (!message || !agent || !model || !modelAllowed(model, agent) ||
+        if (!message || !agent || agent.archived || !model || !modelAllowed(model, agent) ||
           !self || !config || sending() ||
           loadingConversation() || uncertainConversationId() === activeId) return;
         setDraft("");
@@ -985,6 +1000,7 @@
                 sourceBranchId: branchId() } :
                 { expectedHeadEventId: headEventId() }),
               modelId: model.id,
+              ...(fileIds.length && { fileIds }),
               ...(thinkingLevel && { thinkingLevel }),
             } }),
           });
@@ -1028,6 +1044,7 @@
                     ...(i === items.length - 1 && { status: "complete" }) } : item));
                 setBranchId(event.branchId || sendingBranchId);
                 setHeadEventId(event.eventId);
+                setSelectedFiles([]);
                 setForkFrom(null);
                 if (fork) setBranches((items) => [...items, {
                   id: sendingBranchId, name: `Alternative ${items.length}`,
@@ -1088,6 +1105,7 @@
         setProjectId(id);
         setAgents(workspace.agents);
         setConversations(workspace.conversations.items);
+        setSelectedFiles([]);
         setConversationCursor(workspace.conversations.nextCursor);
         newChat(null);
         showRoute(id);
@@ -1145,6 +1163,7 @@
       const [uncertainConversationId, setUncertainConversationId] = createSignal(null);
       const [messages, setMessages] = createSignal([]);
       const [draft, setDraft] = createSignal("");
+      const [selectedFiles, setSelectedFiles] = createSignal([]);
       const [sending, setSending] = createSignal(false);
       const [loadingConversation, setLoadingConversation] = createSignal(false);
       let conversationRequest = 0;
@@ -1188,12 +1207,41 @@
               ?.headEventId || page.messages.at(-1)?.eventId || null);
             setForkFrom(null);
             setOlderCursor(page.nextCursor);
-            setUncertainConversationId(null);
+            setUncertainConversationId(page.historyExpired || page.archiveIncomplete
+              ? item.id : null);
+            if (page.historyExpired) setError(
+              "This older development conversation has expired. Start a new chat.");
+            else if (page.archiveIncomplete) setError(
+              "Part of this saved conversation is unavailable. Continuing is disabled.");
           }
         } catch (cause) {
           if (request === conversationRequest) setError(cause.message);
         } finally {
           if (request === conversationRequest) setLoadingConversation(false);
+        }
+      }
+      async function deleteConversation() {
+        const id = conversationId(), agent = selectedAgent();
+        if (!agent || !conversations().some((item) => item.id === id) ||
+          !confirm("Delete this conversation and its saved history? Usage records remain."))
+          return;
+        setLoadingConversation(true);
+        setError("");
+        try {
+          let deleted = false;
+          for (let attempt = 0; attempt < 100; attempt++) {
+            const result = await rpc("conversations.delete", {
+              projectId: projectId(), conversationId: id, agentId: agent.id });
+            if (result.deleted) { deleted = true; break; }
+            if (!result.deleting) break;
+          }
+          if (!deleted) throw Error("Deletion is still in progress. Try again to finish cleanup.");
+          setConversations((items) => items.filter((item) => item.id !== id));
+          newChat(agent.archived ? null : agent);
+        } catch (cause) {
+          setError(cause.message);
+        } finally {
+          setLoadingConversation(false);
         }
       }
       function forkAt(index, retry = false) {
@@ -1251,8 +1299,19 @@
       const [usageRange, setUsageRange] = createSignal("30d");
       const [usageSort, setUsageSort] = createSignal("desc");
       const [usageScope, setUsageScope] = createSignal("self");
+      const [usageUser, setUsageUser] = createSignal(null);
+      const [usageDetail, setUsageDetail] = createSignal(null);
       const [usageProject, setUsageProject] = createSignal("all");
+      const [usageFilters, setUsageFilters] = createSignal({});
+      const usageQuery = () => ({
+        range: usageRange(), sort: usageSort(), scope: usageScope(),
+        ...usageFilters(),
+        ...(usageScope() === "self" && usageUser() &&
+          { userSub: usageUser().sub }),
+        ...(usageProject() !== "all" && { projectId: usageProject() }),
+      });
       const [connectionKind, setConnectionKind] = createSignal("github");
+      const [connectionChecks, setConnectionChecks] = createSignal({});
       const [error, setError] = createSignal("");
       const [loading, setLoading] = createSignal(
         Boolean(initial || query.has("code")),
@@ -1318,10 +1377,9 @@
             const result = await rpc("connections.list", { projectId: projectId() });
             if (request === viewRequest) setView({ route, ...result });
           } else if (route === "usage") {
+            setUsageDetail(null);
             const detail = await rpc("usage.get", {
-              range: usageRange(), sort: usageSort(), scope: usageScope(),
-              ...(usageProject() !== "all" && { projectId: usageProject() }),
-            });
+              ...usageQuery(), includeDaily: true });
             if (request === viewRequest)
               setView({ route, ...detail });
           }
@@ -1337,15 +1395,64 @@
         if (!cursor) return;
         const request = viewRequest;
         try {
-          const page = await rpc("usage.list", {
-            range: usageRange(), sort: usageSort(), scope: usageScope(), cursor,
-            ...(usageProject() !== "all" && { projectId: usageProject() }),
-          });
+          const page = await rpc("usage.list", { ...usageQuery(), cursor });
           if (request === viewRequest)
             setView((current) => ({ ...current, items: [...current.items, ...page.items],
               nextCursor: page.nextCursor }));
         } catch (cause) {
           if (request === viewRequest) setError(cause.message);
+        }
+      }
+      async function moreDaily() {
+        const cursor = view()?.daily?.nextCursor;
+        if (!cursor) return;
+        const request = viewRequest;
+        try {
+          const page = await rpc("usage.daily", { range: usageRange(),
+            scope: usageScope(), cursor,
+            ...(usageScope() === "self" && usageUser() &&
+              { userSub: usageUser().sub }) });
+          if (request === viewRequest)
+            setView((current) => ({ ...current, daily: {
+              items: [...current.daily.items, ...page.items],
+              nextCursor: page.nextCursor } }));
+        } catch (cause) {
+          if (request === viewRequest) setError(cause.message);
+        }
+      }
+      async function inspectUsage(item) {
+        setError("");
+        try {
+          setUsageDetail(await rpc("usage.request", { requestId: item.requestId,
+            ...(item.userSub && { userSub: item.userSub }) }));
+        } catch (cause) {
+          setError(cause.message);
+        }
+      }
+      async function moreUsers() {
+        const cursor = view()?.cursor;
+        if (!cursor) return;
+        const request = viewRequest;
+        try {
+          const page = await rpc("users.list", { cursor });
+          if (request === viewRequest)
+            setView((current) => ({ ...current,
+              items: [...current.items, ...page.items], cursor: page.cursor }));
+        } catch (cause) {
+          if (request === viewRequest) setError(cause.message);
+        }
+      }
+      async function setAgentArchived(agent, archived) {
+        setError("");
+        try {
+          const updated = await rpc("agents.setArchived", {
+            projectId: projectId(), id: agent.id,
+            revision: agent.revision || 0, archived });
+          setAgents((items) => items.map((item) =>
+            item.id === agent.id ? updated : item));
+          if (selectedAgent()?.id === agent.id) setSelectedAgent(updated);
+        } catch (cause) {
+          setError(cause.message);
         }
       }
       async function moreObjects() {
@@ -1390,8 +1497,14 @@
         if (!confirm(`Delete ${item.name}?`)) return;
         try {
           await rpc("objects.delete", { projectId: projectId(), id: item.id });
+          setSelectedFiles((ids) => ids.filter((id) => id !== item.id));
           await loadView("skills");
         } catch (cause) { setError(cause.message); }
+      }
+      function toggleSelectedFile(id) {
+        setSelectedFiles((ids) => ids.includes(id)
+          ? ids.filter((value) => value !== id)
+          : ids.length < 4 ? [...ids, id] : ids);
       }
       async function change(command, input, route) {
         setError("");
@@ -1447,6 +1560,7 @@
               jiraEmail: fields.get("jiraEmail") || "" });
           form.reset();
           setConnectionKind("github");
+          setConnectionChecks({});
           await loadView("integrations");
         } catch (cause) {
           setError(cause.message);
@@ -1457,8 +1571,22 @@
         setError("");
         try {
           await rpc("connections.delete", { projectId: projectId(), id: item.id });
+          setConnectionChecks({});
           await loadView("integrations");
         } catch (cause) {
+          setError(cause.message);
+        }
+      }
+      async function testConnection(item) {
+        setError("");
+        setConnectionChecks((checks) => ({ ...checks, [item.id]: { loading: true } }));
+        try {
+          const result = await rpc("connections.test", {
+            projectId: projectId(), id: item.id });
+          setConnectionChecks((checks) => ({ ...checks, [item.id]: result }));
+        } catch (cause) {
+          setConnectionChecks((checks) => ({ ...checks,
+            [item.id]: { connected: false } }));
           setError(cause.message);
         }
       }
@@ -1471,6 +1599,11 @@
         /amazon/.test(model.id) ? "Amazon" : "Other"
       );
       const gb = (bytes) => (Number(bytes || 0) / 1000000000).toFixed(2);
+      const messageSections = (value) => String(value || "")
+        .split(/(```[^\n]*\n[\s\S]*?(?:```|$))/g)
+        .filter(Boolean).map((part) => part.startsWith("```")
+          ? { code: part.replace(/^```[^\n]*\n/, "").replace(/\n?```$/, "") }
+          : { text: part });
       const periodLabel = (key) => {
         const [, cadence, date] = (key || "").split("#");
         return date ? cadence[0].toUpperCase() + cadence.slice(1) + " · " +
@@ -1495,7 +1628,7 @@
           return html`<div class="rail-list">
             <${Show} when=${session}>
               <div class="eyebrow">Agents</div>
-              <${For} each=${agents}>${(agent) => html`
+              <${For} each=${() => agents().filter((agent) => !agent.archived)}>${(agent) => html`
                 <button class="nav" onClick=${(e) => {
                   selectAgent(agent); setModal(null);
                 }}>${agent.name}</button>`}<//>
@@ -1638,6 +1771,12 @@
                 <small>${item.kind} · ${item.sizeBytes?.toLocaleString()} bytes</small>
                 <div class="actions"><button class="secondary" onClick=${() =>
                   downloadObject(item)}>Download</button>
+                  <${Show} when=${() => selectedAgent()?.codeInterpreter &&
+                    ["file", "artifact"].includes(item.kind)}>
+                    <button class="secondary" onClick=${() => toggleSelectedFile(item.id)}
+                      aria-pressed=${() => selectedFiles().includes(item.id)}>
+                      ${() => selectedFiles().includes(item.id) ?
+                        "Selected for next turn" : "Use next turn"}</button><//>
                   <${Show} when=${() => session()?.user?.role !== "Auditors"}>
                     <button class="secondary" onClick=${() => deleteObject(item)}>Delete</button><//>
                 </div></div>`}<//>
@@ -1764,8 +1903,26 @@
                 html`<div class="item">
                   <strong>${user.email}</strong
                   ><small
-                    >${user.status} ·
-                    ${user.enabled ? "Enabled" : "Disabled"}</small
+                    >${user.role || "No role"} · ${user.status} ·
+                    ${user.enabled ? "Enabled" : "Disabled"}${user.protected ? " · Bootstrap administrator" : ""}</small
+                  >
+                  <${Show} when=${!user.protected}>
+                    <div class="inline-fields">
+                      <div class="field"><label>Role</label>
+                        <select value=${user.role} onChange=${(event) =>
+                          change("users.setRole", { sub: user.sub,
+                            role: event.currentTarget.value }, "users")}>
+                          <option value="Members">Member</option>
+                          <option value="Auditors">Auditor</option>
+                          <option value="Administrators">Administrator</option>
+                        </select></div>
+                      <div class="field"><label>Access</label>
+                        <button class="secondary" type="button" onClick=${() =>
+                          change("users.setEnabled", { sub: user.sub,
+                            enabled: !user.enabled }, "users")}>
+                          ${user.enabled ? "Disable" : "Enable"}
+                        </button></div>
+                    </div><//
                   >
                   <form
                     onSubmit=${(event) => {
@@ -1779,6 +1936,8 @@
                             Math.round(Number(form.get("budget")) * 1000000),
                           storageBytes: form.has("inheritStorage") ? null :
                             Math.round(Number(form.get("storage")) * 1000000000),
+                          period: form.has("inheritPeriod") ? null :
+                            form.get("period"),
                         },
                         "users",
                       );
@@ -1818,15 +1977,39 @@
                           Use account default</label>
                       </div>
                     </div>
+                    <div class="field"><label>Budget reset cadence</label>
+                      <select name="period" disabled=${user.periodInherited}
+                        value=${user.period}>
+                        <option value="daily">Daily</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                      </select>
+                      <label class="check"><input type="checkbox" name="inheritPeriod"
+                        checked=${user.periodInherited} onChange=${(event) =>
+                          event.currentTarget.form.elements.period.disabled = event.currentTarget.checked} />
+                        Use account default</label>
+                    </div>
                     <small>${gb(user.storageUsedBytes)} GB saved</small>
                     <div class="actions">
                       <button class="secondary" type="submit">
                         Save limits
                       </button>
+                      <button class="secondary" type="button" onClick=${() => {
+                        setUsageUser(user);
+                        setUsageScope("self");
+                        openDialog("usage");
+                      }}>View usage</button>
+                      <button class="secondary" type="button" onClick=${() => {
+                        if (confirm("Start a new budget period for " + user.email + " now?"))
+                          change("users.startNewBudgetPeriod", { sub: user.sub }, "users");
+                      }}>Reset budget now</button>
                     </div>
                   </form>
                 </div>`}<//
             >
+            <${Show} when=${() => view()?.cursor}><div class="actions">
+              <button class="secondary" onClick=${moreUsers}>Load more people</button>
+            </div><//>
           <//>`;
         if (route === "usage")
           return html`<p class="help">
@@ -1834,26 +2017,42 @@
               Provider tiers, discounts and other AWS charges may differ.
               Unpriced managed-tool calls are shown separately, not guessed.
             </p>
+            <${Show} when=${usageUser}>
+              <div class="path-bar">Viewing ${() => usageUser()?.email}
+                <button class="message-action" onClick=${() => {
+                  setUsageUser(null); setUsageScope("self"); loadView("usage");
+                }}>My usage</button>
+              </div><//
+            >
             <dl>
               <div class="kv">
                 <dt>Budget period</dt>
                 <dd>${() => periodLabel(view()?.period)}</dd>
               </div>
               <div class="kv">
-                <dt>Cost</dt>
+                <dt>${() => usageScope() === "all" ? "My period cost" : "Period cost"}</dt>
                 <dd>
                   ${() => (view()?.quality === "unmetered" ? "Not yet metered" : "$" + dollars(view()?.costMicroUsd))}
                 </dd>
               </div>
               <div class="kv">
                 <dt>Budget</dt>
-                <dd>$${() => dollars(session()?.user?.budgetMicroUsd)}</dd>
+                <dd>$${() => dollars(view()?.budgetMicroUsd)}</dd>
               </div>
               <div class="kv">
                 <dt>Unpriced tool calls</dt>
                 <dd>${() => view()?.unpricedToolCalls || 0}</dd>
               </div>
+              <div class="kv">
+                <dt>${() => usageRange() === "90d" ? "Last 90 days" : "Last 30 days"}</dt>
+                <dd>${() => "$" + dollars((view()?.daily?.items || []).reduce(
+                  (sum, day) => sum + Number(day.costMicroUsd || 0), 0)) +
+                  (view()?.daily?.nextCursor ? " loaded so far" : " model estimate")}</dd>
+              </div>
             </dl>
+            <${Show} when=${() => view()?.daily?.nextCursor}>
+              <button class="secondary" onClick=${moreDaily}>Load more daily totals</button><//
+            >
             <h3 class="section-title">Requests and tools</h3>
             <div class="inline-fields">
               <div class="field"><label for="usage-range">Time range</label>
@@ -1869,8 +2068,10 @@
               <${Show} when=${() => session()?.user?.role === "Administrators"}>
                 <div class="field"><label for="usage-scope">People</label>
                   <select id="usage-scope" value=${usageScope} onChange=${(event) => {
-                    setUsageScope(event.currentTarget.value); loadView("usage");
-                  }}><option value="self">My usage</option><option value="all">All users</option></select>
+                    setUsageScope(event.currentTarget.value);
+                    if (event.currentTarget.value === "all") setUsageUser(null);
+                    loadView("usage");
+                  }}><option value="self">${() => usageUser() ? "Selected user" : "My usage"}</option><option value="all">All users</option></select>
                 </div><//
               >
               <div class="field"><label for="usage-project">Project</label>
@@ -1882,11 +2083,73 @@
                 </select>
               </div>
             </div>
+            <details>
+              <summary>Advanced filters</summary>
+              <form onSubmit=${(event) => {
+                event.preventDefault();
+                const values = Object.fromEntries([...new FormData(event.currentTarget)]
+                  .filter(([, value]) => String(value).trim())
+                  .map(([name, value]) => [name, String(value).trim()]));
+                setUsageFilters(values);
+                loadView("usage");
+              }}>
+                <div class="inline-fields">
+                  <div class="field"><label>From (UTC)</label>
+                    <input type="date" name="from" value=${() => usageFilters().from || ""} /></div>
+                  <div class="field"><label>To (UTC)</label>
+                    <input type="date" name="to" value=${() => usageFilters().to || ""} /></div>
+                  <div class="field"><label>Agent ID</label>
+                    <input name="agentId" value=${() => usageFilters().agentId || ""} /></div>
+                  <div class="field"><label>Request ID</label>
+                    <input name="requestId" value=${() => usageFilters().requestId || ""} /></div>
+                  <div class="field"><label>Tool name</label>
+                    <input name="tool" value=${() => usageFilters().tool || ""} /></div>
+                  <div class="field"><label>Kind</label>
+                    <select name="kind" value=${() => usageFilters().kind || ""}>
+                      <option value="">Any</option><option value="model">Model</option>
+                      <option value="tool">Tool</option></select></div>
+                  <div class="field"><label>Quality</label>
+                    <select name="quality" value=${() => usageFilters().quality || ""}>
+                      <option value="">Any</option><option value="estimated">Estimated</option>
+                      <option value="unpriced">Unpriced</option>
+                      <option value="unknown">Unknown</option></select></div>
+                  <div class="field"><label>Request status</label>
+                    <select name="status" value=${() => usageFilters().status || ""}>
+                      <option value="">Any</option><option value="completed">Completed</option>
+                      <option value="outcome_unknown">Unknown outcome</option>
+                      <option value="memory_failed">Memory failed</option>
+                      <option value="navigation_failed">Navigation failed</option>
+                      <option value="running">Running</option></select></div>
+                </div>
+                <div class="actions">
+                  <button class="secondary" type="submit">Apply filters</button>
+                  <button class="secondary" type="button" onClick=${() => {
+                    setUsageFilters({}); loadView("usage");
+                  }}>Clear</button>
+                </div>
+              </form>
+            </details>
             <${For} each=${() => view()?.route === "usage" ? view()?.items || [] : []}>
               ${(item) => html`<div class="item"><strong>${item.name || item.modelId || "Request"}</strong>
                 <small>${new Date(item.occurredAt).toLocaleString()} · ${usageScope() === "all" ? item.userSub + " · " : ""}
                 ${item.projectId || "main"} · ${item.quality === "unpriced" ? "Tool · unpriced" : "Model · " + item.inputTokens + " in / " + item.outputTokens + " out"}
-                · ${item.latencyMs} ms · $${(Number(item.costMicroUsd || 0) / 1000000).toFixed(6)}</small></div>`}<//>
+                ${item.latencyMs === undefined ? "" : " · " + item.latencyMs + " ms"}
+                · ${item.quality === "unpriced" ? "cost unpriced" :
+                  "$" + (Number(item.costMicroUsd || 0) / 1000000).toFixed(6) + " estimated"}</small>
+                <button class="secondary" type="button" onClick=${() => inspectUsage(item)}>
+                  Request detail</button></div>`}<//>
+            <${Show} when=${usageDetail}>
+              <div class="item"><strong>Request ${() => usageDetail()?.request?.requestId}</strong>
+                <small>${() => usageDetail()?.request?.status} ·
+                  $${() => dollars(usageDetail()?.request?.costMicroUsd)} model estimate ·
+                  ${() => usageDetail()?.request?.toolSteps || 0} unpriced tools</small>
+                <${For} each=${() => usageDetail()?.steps || []}>
+                  ${(step) => html`<small>${step.kind === "tool" ? step.name :
+                    step.modelId + " · " + step.inputTokens + " input / " +
+                      step.outputTokens + " output tokens"} ·
+                    ${step.quality} · ${step.quality === "unpriced" ? "cost unknown" :
+                      "$" + (Number(step.costMicroUsd || 0) / 1000000).toFixed(6) + " estimated"}</small>`}<//>
+              </div><//>
             <${Show} when=${() => !view()?.items?.length}><div class="empty">No requests in this range.</div><//>
             <${Show} when=${() => view()?.nextCursor}><div class="actions">
               <button class="secondary" onClick=${moreUsage}>Load more</button></div><//>`;
@@ -1923,6 +2186,16 @@
               ${(item) => html`<div class="item">
                 <strong>${item.name}</strong>
                 <small>${item.kind === "jira" ? "Jira · " + item.jiraUrl : "GitHub"} · ${new Date(item.createdAt).toLocaleDateString()}</small>
+                <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+                <div class="actions"><button class="secondary" type="button"
+                  onClick=${() => testConnection(item)}
+                  disabled=${() => connectionChecks()[item.id]?.loading}>Test connection</button>
+                  <small aria-live="polite">${() => {
+                    const check = connectionChecks()[item.id];
+                    return !check ? "" : check.loading ? "Checking…" :
+                      check.connected ? "Connected" + (check.account ? " as " + check.account : "") :
+                      "Could not connect" + (check.httpStatus ? " (HTTP " + check.httpStatus + ")" : "");
+                  }}</small></div><//>
                 <${Show} when=${() => session()?.user?.role !== "Auditors"}>
                   <form onSubmit=${(event) => saveConnection(event, item.id)}>
                     <div class="field"><label>Replace token</label>
@@ -2021,14 +2294,17 @@
                 <${For} each=${agents}>${(agent) => html`
                   <div class="item">
                     <strong>${agent.name || agent.agentName || agent.id}</strong>
-                    <small>${agent.modelId}</small>
+                    <small>${agent.modelId}${agent.archived ? " · Archived" : ""}</small>
                     <div class="actions">
-                      <button class="secondary" type="button" onClick=${() => {
+                      <button class="secondary" type="button" disabled=${agent.archived} onClick=${() => {
                         selectAgent(agent);
                         setModal(null);
                       }}>Open chat</button>
-                      <button class="secondary" type="button"
+                      <button class="secondary" type="button" disabled=${agent.archived}
                         onClick=${() => { setEditingAgent(agent); setDraftModelId(agent.modelId); }}>Edit</button>
+                      <button class="secondary" type="button"
+                        onClick=${() => setAgentArchived(agent, !agent.archived)}>
+                        ${agent.archived ? "Restore" : "Archive"}</button>
                     </div>
                   </div>`}<//>
               </div><//
@@ -2082,7 +2358,7 @@
             <section>
               <div class="eyebrow">Agents</div>
               <div class="rail-list">
-                <${For} each=${agents}
+                <${For} each=${() => agents().filter((agent) => !agent.archived)}
                   >${(agent) =>
                     html`<button
                       class="nav"
@@ -2184,6 +2460,11 @@
                     </select>
                   </div>
                 <//>
+                <${Show} when=${() => conversations().some((item) =>
+                  item.id === conversationId()) && !sending()}>
+                  <button class="link-button" onClick=${deleteConversation}>
+                    Delete conversation</button><//
+                >
                 <${Show} when=${olderCursor}>
                   <button class="link-button" onClick=${(e) => moreMessages()}>Load earlier messages</button><//
                 >
@@ -2245,10 +2526,13 @@
                             item.role === "assistant")}>
                             ${item.role === "user" ? "Edit · new path" : "Retry · new path"}
                           </button><//>
-                        <div class="message-text"><${For} each=${() => item.text.split(/(https:\/\/[^\s<>"']+)/g)}>
-                          ${(part) => /^https:\/\/[^\s<>"']+$/.test(part)
-                            ? html`<a href=${part} target="_blank" rel="noopener noreferrer">${part}</a>`
-                            : part}<//></div>
+                        <div class="message-text"><${For} each=${() => messageSections(item.text)}>
+                          ${(section) => section.code !== undefined
+                            ? html`<pre><code>${section.code}</code></pre>`
+                            : html`<${For} each=${() => section.text.split(/(https:\/\/[^\s<>"']+)/g)}>
+                              ${(part) => /^https:\/\/[^\s<>"']+$/.test(part)
+                                ? html`<a href=${part} target="_blank" rel="noopener noreferrer">${part}</a>`
+                                : part}<//>`}<//></div>
                         <${Show} when=${() => item.tools?.length}>
                           <small class="tool-activity"><${For} each=${() => item.tools || []}>
                             ${(tool, index) => `${index() ? " · " : ""}${tool.isError ? "Failed: " : "Used "}${{
@@ -2276,18 +2560,27 @@
                   <div class="path-bar">Editing an earlier turn creates a new path.
                     <button class="message-action" onClick=${() => setForkFrom(null)}>Cancel</button>
                   </div><//>
+                <${Show} when=${() => selectedAgent()?.codeInterpreter}>
+                  <div class="path-bar">
+                    <button class="message-action" onClick=${() => openDialog("skills")}>
+                      Files for this turn${() => selectedFiles().length ?
+                        " · " + selectedFiles().length + " selected" : ""}</button>
+                    <${Show} when=${() => selectedFiles().length}>
+                      <button class="message-action" onClick=${() => setSelectedFiles([])}>
+                        Clear</button><//>
+                  </div><//>
                 <textarea
                   aria-label="Message"
                   placeholder=${() => (selectedAgent() ? "Message your agent…" : "Choose an agent to start chatting")}
                   value=${draft}
                   onInput=${(e) => setDraft(e.currentTarget.value)}
                   onKeyDown=${(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
+                    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
                       e.preventDefault();
                       send();
                     }
                   }}
-                  disabled=${() => !selectedAgent() || sending() || loadingConversation() ||
+                  disabled=${() => !selectedAgent() || selectedAgent()?.archived || sending() || loadingConversation() ||
                     uncertainConversationId() === conversationId()}
                 ></textarea>
                 <${Show} when=${() => selectedAgent()?.browser && !composerModel()?.browserTool}>
@@ -2334,7 +2627,7 @@
                   <button
                     class="send"
                     onClick=${(e) => send()}
-                    disabled=${() => !selectedAgent() ||
+                    disabled=${() => !selectedAgent() || selectedAgent()?.archived ||
                       !modelAllowed(composerModel() || {}, selectedAgent()) ||
                       !draft().trim() || sending() ||
                       loadingConversation() || uncertainConversationId() === conversationId()}

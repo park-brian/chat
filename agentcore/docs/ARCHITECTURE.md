@@ -1,6 +1,6 @@
 # AgentCore Chat: Runtime-only architecture
 
-Status: authoritative structure, updated 2026-09-25. [FOUNDATION.md](FOUNDATION.md) owns implemented project, branch, object/quota, and migration details; [PRODUCT-ROADMAP.md](PRODUCT-ROADMAP.md) owns remaining work. Older PLAN, API-CONTRACT, IMPLEMENTATION, USAGE-RESOURCES, RUNTIME-DECISION, and STATUS documents record explorations; where they conflict, this document, FOUNDATION, and current code win. "Implemented" below means exercised in a disposable live AWS stack until production rollout is noted explicitly.
+Status: baseline deployed architecture, updated 2026-09-25. [ROADMAP-CUTOVER.md](ROADMAP-CUTOVER.md) supersedes this file for step-ledger accounting, administrator lifecycle, post-cutoff S3 history, conversation deletion, and their current rollout status. [FOUNDATION.md](FOUNDATION.md) records the earlier project/branch/object slice. Older sections below are retained for provenance; where they describe completed-turn-only charges, 30-day Memory, or file-only quota, use the cutover contract and current code instead. "Implemented" below means exercised in a disposable live AWS stack until production rollout is noted explicitly.
 
 ## Product in one sentence
 
