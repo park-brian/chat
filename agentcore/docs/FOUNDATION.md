@@ -1,6 +1,6 @@
 # Projects, paths, and objects
 
-Status: implemented in the single AgentCore Runtime and browser page; exercised on the reusable disposable stack on 2026-09-25. Production rollout is tracked in [ARCHITECTURE.md](ARCHITECTURE.md). This document is the contract for the foundation slice; [PRODUCT-ROADMAP.md](PRODUCT-ROADMAP.md) owns later work.
+Status: deployed to `agentcore-chat-prod` and GitHub Pages on 2026-09-25. The final Runtime ZIP is `controller/6795a908a8014e5915b6.zip`; desktop/mobile disposable-stack foundation stories and published-origin login passed. A real Gemini 3.8 Flash two-action Browser turn passed from the published origin. This document is the contract for the foundation slice; [PRODUCT-ROADMAP.md](PRODUCT-ROADMAP.md) owns later work.
 
 ## Ownership and state
 

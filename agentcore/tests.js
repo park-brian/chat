@@ -1356,7 +1356,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .click();
   await openManage("Users");
   await page.getByRole("dialog").getByText(fixture.email).waitFor();
-  await page.getByRole("dialog").getByText("Account defaults").waitFor();
+  await page.getByRole("dialog").getByRole("heading", {
+    name: "Account defaults" }).waitFor();
   const ownLimits = page
     .getByRole("dialog")
     .locator(".item")

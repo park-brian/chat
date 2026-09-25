@@ -2,7 +2,7 @@
 
 Status: ordered remaining work, updated 2026-09-25. [ARCHITECTURE.md](ARCHITECTURE.md) owns deployed structure and measured evidence; [FOUNDATION.md](FOUNDATION.md) owns implemented project, branch, object/quota, and migration contracts. Older milestones below are retained as design history; their foundation portions are now implemented, not pending. Proposed behavior is not implemented behavior.
 
-The foundation slice has passed live disposable-stack desktop/mobile stories: private projects and hiding, nested Memory branches with edit/retry heads, browser-to-S3 transfer and user quota, skill selection, and null-versus-zero overrides. The next release gate is production rollout plus published-origin verification. After that, prioritize billed-but-failed reconciliation, user lifecycle/pagination and usage detail, broader integration grants, agent archive and background runs. Project memberships, Git branching, Browser DOM/live view, and browser CloudFormation remain optional later work.
+The foundation slice has passed live disposable-stack desktop/mobile stories: private projects and hiding, nested and first-turn Memory alternatives with edit/retry heads, browser-to-S3 transfer and user quota, skill selection, and null-versus-zero overrides. Production rollout and published-origin desktop/mobile login passed on 2026-09-25, as did a real Gemini visual Browser turn. Next prioritize billed-but-failed reconciliation, user lifecycle/pagination and usage detail, broader integration grants, agent archive and background runs. Project memberships, Git branching, Browser DOM/live view, and browser CloudFormation remain optional later work.
 
 ## Product promise and present gap
 
