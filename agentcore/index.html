@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-U66CDfz2O94DGxUfKKIfS5Hh1yL9JdtT59/kW57SC4qI4Lds5OnUPJi41fGb0j5x' https://cdn.jsdelivr.net; style-src 'sha384-k3Bol5qo0ayY53LrOdUQ3kwREPpnJofQ/Ey2SEsbnkdaSWHTsTQttwITUtGcP5F1'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-6AxIWHTKuH+diJ8vK0TB0NQ0Uzk/9vt4uA4JclxXMjLHICdwtDozNaDeblflyq5I' https://cdn.jsdelivr.net; style-src 'sha384-k3Bol5qo0ayY53LrOdUQ3kwREPpnJofQ/Ey2SEsbnkdaSWHTsTQttwITUtGcP5F1'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -2131,7 +2131,7 @@
             </details>
             <${For} each=${() => view()?.route === "usage" ? view()?.items || [] : []}>
               ${(item) => html`<div class="item"><strong>${item.name || item.modelId || "Request"}</strong>
-                <small>${new Date(item.occurredAt).toLocaleString()} · ${usageScope() === "all" ? item.userSub + " · " : ""}
+                <small>${new Date(item.occurredAt).toLocaleString()} · ${usageScope() === "all" ? "user " + String(item.userSub || "unknown").slice(0, 8) + " · " : ""}
                 ${item.projectId || "main"} · ${item.quality === "unpriced" ? "Tool · unpriced" : "Model · " + item.inputTokens + " in / " + item.outputTokens + " out"}
                 ${item.latencyMs === undefined ? "" : " · " + item.latencyMs + " ms"}
                 · ${item.quality === "unpriced" ? "cost unpriced" :

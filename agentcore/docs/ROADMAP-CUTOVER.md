@@ -145,6 +145,22 @@ it. Saved interpreter outputs and a full credential transport/log audit are
 
 ## Verification and release rules
 
+2026-09-25 release evidence: `npm test` in both repository and
+`agentcore/` passed. Against reusable disposable
+`agentcore-chat-dev-roadmap`, `runtime-roadmap` passed desktop/mobile,
+`runtime-foundation` passed, and `runtime-connections` passed with an actual
+S3-selected file, Code Interpreter, cross-owner denial, a real GitHub
+current-user read, and disposable cleanup. Users/Usage desktop/mobile
+`_screenshot` captures were inspected and list typography adjusted.
+Production `agentcore-chat-prod` moved to content-addressed
+`controller/8b9e6857a2308b062183.zip` by a reviewed change set with **no
+resource replacements** and explicit `UsePreviousValue` for its NoEcho
+Gemini key. From the published GitHub Pages origin, the real Gemini Browser
+two-action turn plus follow-up and the desktop/mobile authenticated
+`login` story passed; smoke identities were removed in `finally`.
+This evidence does not qualify the unfinished background worker, OneDrive
+OAuth, customer STS integration, or arbitrary external-write recovery.
+
 Run `npm test` for fast protocol/buildless checks. `npm run test:roadmap --
 <disposable-stack> --profile eaap --region us-east-1` uses real Cognito,
 Runtime, Memory, DynamoDB, and S3 with scripted echo as the sole inference
