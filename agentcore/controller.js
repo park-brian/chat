@@ -7,7 +7,8 @@ import { SignatureV4 } from "@smithy/signature-v4";
 import { Hash } from "@smithy/hash-node";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { S3Client, CopyObjectCommand, DeleteObjectCommand,
-  GetObjectCommand, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+  GetObjectCommand, HeadObjectCommand, ListObjectsV2Command,
+  PutObjectCommand } from "@aws-sdk/client-s3";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { BedrockRuntimeClient, ConverseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
@@ -235,16 +236,47 @@ async function activateObject(identity, item, sizeBytes, versionId) {
 
 async function repairPendingObject(identity, item) {
   if (item.status !== "PENDING") return item;
+  const objectKeyName = savedKey(identity.sub, item.projectId, item.id);
+  // The role lists only users/* prefixes. Exact-key listing distinguishes a
+  // missing copy from AccessDenied without broad bucket enumeration.
+  const listed = await s3.send(new ListObjectsV2Command({
+    Bucket: process.env.BUCKET, Prefix: objectKeyName, MaxKeys: 1 }));
+  if (!listed.Contents?.some((entry) => entry.Key === objectKeyName)) return item;
+  const head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET,
+    Key: objectKeyName }));
+  if (!Number.isSafeInteger(head.ContentLength) ||
+    head.ContentLength > item.declaredBytes) return item;
+  return activateObject(identity, item, head.ContentLength, head.VersionId);
+}
+
+async function completeStagedObject(identity, item, expectedBytes = null) {
+  const recovered = await repairPendingObject(identity, item);
+  if (recovered.status === "ACTIVE") return recovered;
+  let head;
   try {
-    const head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET,
-      Key: savedKey(identity.sub, item.projectId, item.id) }));
-    if (!Number.isSafeInteger(head.ContentLength) ||
-      head.ContentLength > item.declaredBytes) return item;
-    return activateObject(identity, item, head.ContentLength, head.VersionId);
+    head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET,
+      Key: item.stageKey }));
   } catch (error) {
-    if (error.$metadata?.httpStatusCode === 404) return item;
+    if (error.$metadata?.httpStatusCode === 404)
+      throw Object.assign(new Error("Staging upload missing"), { code: "UPLOAD_MISSING" });
     throw error;
   }
+  const size = head.ContentLength;
+  if (!Number.isSafeInteger(size) || size < 1 || size > item.declaredBytes ||
+    (expectedBytes !== null && size !== expectedBytes))
+    throw Object.assign(new Error("Staging size mismatch"), { code: "UPLOAD_SIZE_MISMATCH" });
+  const storage = await storageState(identity);
+  if (storage.usedBytes + size > storage.limitBytes)
+    throw Object.assign(new Error("Storage limit reached"), { code: "QUOTA_EXCEEDED" });
+  const copy = await s3.send(new CopyObjectCommand({ Bucket: process.env.BUCKET,
+    Key: savedKey(identity.sub, item.projectId, item.id),
+    CopySource: `${process.env.BUCKET}/${item.stageKey}`,
+    MetadataDirective: "REPLACE", ContentType: item.contentType }));
+  const saved = await activateObject(identity, item, size, copy.VersionId);
+  await s3.send(new DeleteObjectCommand({ Bucket: process.env.BUCKET,
+    Key: item.stageKey, ...(head.VersionId && { VersionId: head.VersionId }) }))
+    .catch(() => console.error("Could not remove completed staging object"));
+  return saved;
 }
 
 async function project(identity, projectId) {
@@ -597,30 +629,15 @@ async function invoke(body, identity) {
         return { status: 200, data: { ok: true, data: { item: objectPublic(item) } } };
       if (item.status !== "PENDING" || item.expiresAt <= Date.now() / 1000)
         return missing();
-      let head;
       try {
-        head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET,
-          Key: item.stageKey }));
+        const saved = await completeStagedObject(identity, item);
+        return { status: 200, data: { ok: true, data: { item: objectPublic(saved) } } };
       } catch (error) {
-        if (error.$metadata?.httpStatusCode === 404)
-          return { status: 409, data: { ok: false, error: { code: "UPLOAD_MISSING" } } };
+        if (["UPLOAD_MISSING", "UPLOAD_SIZE_MISMATCH", "QUOTA_EXCEEDED"]
+          .includes(error.code))
+          return { status: 409, data: { ok: false, error: { code: error.code } } };
         throw error;
       }
-      const size = head.ContentLength;
-      if (!Number.isSafeInteger(size) || size < 1 || size > item.declaredBytes)
-        return { status: 409, data: { ok: false, error: { code: "UPLOAD_SIZE_MISMATCH" } } };
-      const storage = await storageState(identity);
-      if (storage.usedBytes + size > storage.limitBytes)
-        return { status: 409, data: { ok: false, error: { code: "QUOTA_EXCEEDED" } } };
-      const destination = savedKey(identity.sub, projectId, id);
-      const copy = await s3.send(new CopyObjectCommand({ Bucket: process.env.BUCKET,
-        Key: destination, CopySource: `${process.env.BUCKET}/${item.stageKey}`,
-        MetadataDirective: "REPLACE", ContentType: item.contentType }));
-      const saved = await activateObject(identity, item, size, copy.VersionId);
-      await s3.send(new DeleteObjectCommand({ Bucket: process.env.BUCKET,
-        Key: item.stageKey, ...(head.VersionId && { VersionId: head.VersionId }) }))
-        .catch(() => console.error("Could not remove completed staging object"));
-      return { status: 200, data: { ok: true, data: { item: objectPublic(saved) } } };
     }
     if (item.status === "PENDING") item = await repairPendingObject(identity, item);
     if (item.status !== "ACTIVE") return missing();
@@ -1618,6 +1635,105 @@ async function initializeWorkspace(sessionId, scope) {
       JSON.stringify(fileManifest)] };
 }
 
+async function saveInterpreterArtifact(sessionId, scope, input) {
+  const { path, name, contentType = "application/octet-stream",
+    idempotencyKey } = input;
+  if (typeof path !== "string" ||
+    !/^outputs\/[A-Za-z0-9._/-]{1,180}$/.test(path) ||
+    path.split("/").some((part) => part === "." || part === ".." || !part) ||
+    typeof name !== "string" || !name.trim() || name.length > 180 ||
+    /[\r\n\0]/.test(name) ||
+    typeof contentType !== "string" ||
+    !/^[\w.+-]+\/[\w.+-]+$/.test(contentType) ||
+    typeof idempotencyKey !== "string" ||
+    !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(idempotencyKey))
+    throw Object.assign(new Error("Invalid artifact request"), { code: "INVALID_ARTIFACT" });
+  const displayName = name.trim();
+  const digest = createHash("sha256").update(
+    `artifact:${scope.sub}:${scope.requestId}:${idempotencyKey}`).digest("hex");
+  const id = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+  const identity = { sub: scope.sub };
+  const savedRow = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+    Key: objectKey(scope.sub, id), ConsistentRead: true }));
+  let item = savedRow.Item && unpack(savedRow.Item);
+  if (item) {
+    if (item.requestId !== scope.requestId || item.saveKey !== idempotencyKey ||
+      item.projectId !== scope.projectId || item.name !== displayName ||
+      item.contentType !== contentType || item.sourcePath !== path)
+      throw Object.assign(new Error("Artifact key was already used differently"),
+        { code: "ARTIFACT_CONFLICT" });
+    if (item.status === "ACTIVE") return objectPublic(item);
+    if (item.status !== "PENDING")
+      throw Object.assign(new Error("Previously saved artifact was removed"),
+        { code: "ARTIFACT_CONFLICT" });
+    item = await repairPendingObject(identity, item);
+    if (item.status === "ACTIVE") return objectPublic(item);
+    try {
+      return objectPublic(await completeStagedObject(identity, item,
+        item.declaredBytes));
+    } catch (error) {
+      if (error.code !== "UPLOAD_MISSING") throw error;
+    }
+  }
+  const check = `from pathlib import Path
+p=Path(${JSON.stringify(path)})
+cwd=Path.cwd().resolve()
+root=cwd/"outputs"
+if root.is_symlink() or not root.is_dir(): raise SystemExit(2)
+target=(cwd/p).resolve(strict=True)
+if root not in target.parents or not target.is_file() or target.is_symlink():
+    raise SystemExit(2)
+print(target.stat().st_size)`;
+  const stat = await interpreterCall(sessionId, "executeCommand", {
+    command: `python3 -c ${shellQuote(check)}` });
+  const size = Number(stat.output.trim());
+  if (stat.isError || !/^\d+$/.test(stat.output.trim()) ||
+    !Number.isSafeInteger(size) || size < 1 || size > 100000000)
+    throw Object.assign(new Error("Output is missing or exceeds 100 MB"),
+      { code: "ARTIFACT_FILE_UNAVAILABLE" });
+  const storage = await storageState(identity);
+  if (storage.usedBytes + size > storage.limitBytes)
+    throw Object.assign(new Error("Storage quota reached"), { code: "QUOTA_EXCEEDED" });
+  if (!item) {
+    item = { id, projectId: scope.projectId, name: displayName, kind: "artifact",
+      contentType, declaredBytes: size, stageKey: uploadKey(scope.sub, id),
+      status: "PENDING", requestId: scope.requestId, saveKey: idempotencyKey,
+      sourcePath: path,
+      createdAt: new Date().toISOString(),
+      expiresAt: Math.floor(Date.now() / 1000) + 86400 };
+    try {
+      await db.send(new PutItemCommand({ TableName: process.env.TABLE,
+        Item: { ...objectKey(scope.sub, id),
+          ...Object.fromEntries(Object.entries(item).map(([field, value]) =>
+            [field, typeof value === "number" ? N(value) : S(value)])) },
+        ConditionExpression: "attribute_not_exists(pk)" }));
+    } catch (error) {
+      if (error.name !== "ConditionalCheckFailedException") throw error;
+      const raced = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+        Key: objectKey(scope.sub, id), ConsistentRead: true }));
+      if (raced.Item?.status?.S === "ACTIVE") return objectPublic(unpack(raced.Item));
+      throw Object.assign(new Error("Artifact save in progress"),
+        { code: "ARTIFACT_CONFLICT" });
+    }
+  } else if (item.declaredBytes !== size) {
+    throw Object.assign(new Error("Output changed during retry"),
+      { code: "ARTIFACT_CONFLICT" });
+  }
+  const upload = await createPresignedPost(s3, { Bucket: process.env.BUCKET,
+    Key: item.stageKey, Expires: 300,
+    Fields: { "Content-Type": contentType },
+    Conditions: [{ "Content-Type": contentType },
+      ["content-length-range", 1, size + 16384]] });
+  const fields = Object.entries(upload.fields).map(([field, value]) =>
+    `--form-string ${shellQuote(`${field}=${value}`)}`).join(" ");
+  const command = `curl --fail --silent --show-error --max-time 120 --output /dev/null --write-out '%{http_code}' ${fields} --form ${shellQuote(`file=@${path};type=${contentType}`)} ${shellQuote(upload.url)}`;
+  const sent = await interpreterCall(sessionId, "executeCommand", { command });
+  if (sent.isError || !/^(200|201|204)$/.test(sent.output.trim()))
+    throw Object.assign(new Error("Artifact upload outcome unknown"),
+      { code: "ARTIFACT_OUTCOME_UNKNOWN" });
+  return objectPublic(await completeStagedObject(identity, item, size));
+}
+
 const gatewaySigner = new SignatureV4({
   credentials: defaultProvider(), region: process.env.AWS_REGION,
   service: "bedrock-agentcore", sha256: Hash.bind(null, "sha256"),
@@ -1738,6 +1854,14 @@ function toolSpecs(config) {
       }, required: ["command"] } },
     },
   );
+  if (config.codeInterpreter && config.allowSaveOutputs) specs.push({
+    name: "save_artifact",
+    description: "Save one user-requested outputs/ file to private, quota-counted Files. First create the file in the code workspace. Reuse the same idempotencyKey when investigating an uncertain save.",
+    inputSchema: { json: { type: "object", properties: {
+      path: { type: "string" }, name: { type: "string" },
+      contentType: { type: "string" }, idempotencyKey: { type: "string" },
+    }, required: ["path", "name", "idempotencyKey"] } },
+  });
   if (config.webSearch) specs.push({
     name: "web_search",
     description: "Search the current public web. Cite source URLs in your answer. Queries are limited to 200 characters.",
@@ -1764,6 +1888,7 @@ function toolInstructions(config) {
       `Selected skill ${skill.name} (${skill.id}):\n${skill.text}`),
     "Use only the tools provided in this request. If a requested capability is unavailable, say so; do not invent tool results.",
     config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Selected skill files are in skill-<id>.md. When this turn has selected user files, selected-files.json lists their names and short-lived read-only download URLs; fetch only what you need and never print URLs. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
+    config.allowSaveOutputs ? "The user allowed saving outputs for this turn. Put only requested deliverables under outputs/ and call save_artifact for each file (100 MB maximum). Reuse an idempotencyKey for the same output; if the outcome is uncertain, check Files before trying again. Never save secrets or temporary files." : "",
     config.webSearch ? "Web Search returns current results. Base factual claims on the returned sources and cite their URLs." : "",
     config.browser ? "Browser actions return screenshots. Inspect each screenshot and avoid entering private credentials." : "",
   ].filter(Boolean).join("\n\n");
@@ -1790,8 +1915,11 @@ function toolSession(config, emit, scope, meter) {
       input.query.length <= 200;
     const isBrowser = name === "browser" && config.browser &&
       ["navigate", "click", "type", "scroll", "screenshot"].includes(input?.action);
+    const isSave = name === "save_artifact" &&
+      config.codeInterpreter && config.allowSaveOutputs &&
+      input && typeof input === "object";
     if (!(isCode && config.codeInterpreter) && !(isCommand && config.codeInterpreter) &&
-      !isSearch && !isBrowser)
+      !isSearch && !isBrowser && !isSave)
       throw Error("Invalid tool request");
     if ((isCode || isCommand) && !codeSession) {
       if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
@@ -1807,25 +1935,42 @@ function toolSession(config, emit, scope, meter) {
     const started = Date.now();
     let content;
     let isError = false;
-    if (isSearch || isBrowser) {
+    if (isSearch || isBrowser || isSave) {
       try {
         if (isSearch) {
           const result = await searchWeb(input.query.trim(), config.webSearchMaxResults || 5);
           for (const { url, title } of result.sources) sources.set(url, title);
           content = [{ text: result.text }];
-        } else {
+        } else if (isBrowser) {
           if (!browserSession) browserSession = (await browserSend(
             new StartBrowserSessionCommand({ browserIdentifier: browserId,
               name: `chat-${uuid().slice(0, 8)}`, clientToken: uuid(),
               sessionTimeoutSeconds: config.browserSessionSeconds || 300,
               viewPort: { width: 1000, height: 700 } }))).sessionId;
           content = await browserAction(browserSession, input);
+        } else {
+          if (!codeSession) throw Object.assign(
+            Error("Create the output in the code workspace first"),
+            { code: "ARTIFACT_FILE_UNAVAILABLE" });
+          const saved = await saveInterpreterArtifact(codeSession, scope, input);
+          content = [{ text: `Saved ${saved.name} in Files (id ${saved.id}, ${saved.sizeBytes} bytes).` }];
         }
       } catch (error) {
         console.error("Managed tool failed", name, error.name,
           error.$metadata?.httpStatusCode || "");
         isError = true;
-        content = [{ text: `${isSearch ? "Web Search" : "Browser"} could not complete that action.` }];
+        const saveMessages = {
+          INVALID_ARTIFACT: "Invalid output path, name, MIME type, or idempotency key.",
+          ARTIFACT_CONFLICT: "That idempotency key belongs to a different or removed output.",
+          ARTIFACT_FILE_UNAVAILABLE: "Create a regular file under outputs/ first (100 MB maximum).",
+          QUOTA_EXCEEDED: "The storage limit was reached; the output was not admitted.",
+          ARTIFACT_OUTCOME_UNKNOWN: "The save outcome is unknown. Check Files before another attempt with the same idempotency key.",
+          UPLOAD_MISSING: "The upload did not complete. Retry with the same idempotency key.",
+          UPLOAD_SIZE_MISMATCH: "The uploaded size changed. Retry with the same idempotency key.",
+        };
+        content = [{ text: isSave
+          ? saveMessages[error.code] || "Output save could not complete; check Files before retrying."
+          : `${isSearch ? "Web Search" : "Browser"} could not complete that action.` }];
       }
     } else {
       const pythonEnv = envNames.length ? `import os, base64
@@ -2000,7 +2145,7 @@ function rejectChat(response, code) {
 
 async function chat(input, identity, response, workloadToken) {
   const { agentId, sessionId, requestId, message, modelId, thinkingLevel,
-    fileIds = [] } = input;
+    fileIds = [], saveOutputs = false } = input;
   const projectId = projectIdOf(input);
   const branchId = input.branchId ?? "main";
   const forking = Object.hasOwn(input, "forkEventId");
@@ -2019,6 +2164,7 @@ async function chat(input, identity, response, workloadToken) {
     !Array.isArray(fileIds) || fileIds.length > 4 ||
     fileIds.some((id) => !idPattern.test(id || "")) ||
     new Set(fileIds).size !== fileIds.length ||
+    typeof saveOutputs !== "boolean" ||
     typeof message !== "string" || !message.trim() || message.length > 20000 ||
     (modelId !== undefined && (typeof modelId !== "string" || modelId.length > 512)) ||
     (thinkingLevel !== undefined && typeof thinkingLevel !== "string"))
@@ -2093,6 +2239,8 @@ async function chat(input, identity, response, workloadToken) {
   }
   if (fileIds.length && !config.codeInterpreter)
     return rejectChat(response, "TOOL_UNAVAILABLE");
+  if (saveOutputs && !config.codeInterpreter)
+    return rejectChat(response, "TOOL_UNAVAILABLE");
   const files = [];
   for (const id of fileIds) {
     const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
@@ -2116,7 +2264,7 @@ async function chat(input, identity, response, workloadToken) {
     throw error;
   }
   const turnConfig = { ...config, modelId: turnModelId,
-    thinkingLevel: turnThinkingLevel, skills };
+    thinkingLevel: turnThinkingLevel, skills, allowSaveOutputs: saveOutputs };
   const actorId = `${identity.sub}/${projectId}`;
   const mainMemorySessionId = conversationRow.Item?.mainMemorySessionId?.S ||
     `a_${agentId}_${sessionId}`;
@@ -2295,7 +2443,7 @@ async function chat(input, identity, response, workloadToken) {
   try {
     const result = await runModel(turnConfig, model, messages, emit, workloadToken,
       { sub: identity.sub, projectId, agentId, sessionId,
-        connectionIds: config.connectionIds || [], skills, files }, meter);
+        requestId, connectionIds: config.connectionIds || [], skills, files }, meter);
     const costMicroUsd = meteredCost;
     const occurredAt = new Date().toISOString();
     const receipt = { version: 1, requestId, projectId, branchId,

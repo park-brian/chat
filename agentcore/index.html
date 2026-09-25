@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-6AxIWHTKuH+diJ8vK0TB0NQ0Uzk/9vt4uA4JclxXMjLHICdwtDozNaDeblflyq5I' https://cdn.jsdelivr.net; style-src 'sha384-k3Bol5qo0ayY53LrOdUQ3kwREPpnJofQ/Ey2SEsbnkdaSWHTsTQttwITUtGcP5F1'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-IaWRbrZqR0h0hwFXRxXiNyKqWURRQNKj+g8std91h+04HJNYqgKUOM8qYaXB1sbC' https://cdn.jsdelivr.net; style-src 'sha384-S8ghR21qNALtl9wjJIIIEEh4ACv4Q+gsyFBZjmI17dHyibCwJ4hGnitpGYC/w4fZ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -321,6 +321,8 @@
         font-size: 12px; }
       .path-bar select { border: 1px solid #dce6dd; border-radius: 8px;
         padding: 6px 9px; background: #fff; color: #203829; }
+      .save-output-toggle { margin-left: auto; display: inline-flex;
+        align-items: center; gap: .4rem; cursor: pointer; }
       .message-action { margin-left: 10px; padding: 0; border: 0;
         background: none; color: #64816f; font-size: 11px; }
       .message-action:hover { color: #115d4b; text-decoration: underline; }
@@ -967,6 +969,7 @@
           config = deployment(),
           activeId = conversationId(),
           fileIds = agent?.codeInterpreter ? selectedFiles() : [],
+          allowSaveOutputs = agent?.codeInterpreter && saveOutputs(),
           fork = forkFrom(),
           sendingBranchId = fork ? crypto.randomUUID() : branchId(),
           priorMessages = messages();
@@ -1001,6 +1004,7 @@
                 { expectedHeadEventId: headEventId() }),
               modelId: model.id,
               ...(fileIds.length && { fileIds }),
+              ...(allowSaveOutputs && { saveOutputs: true }),
               ...(thinkingLevel && { thinkingLevel }),
             } }),
           });
@@ -1045,6 +1049,7 @@
                 setBranchId(event.branchId || sendingBranchId);
                 setHeadEventId(event.eventId);
                 setSelectedFiles([]);
+                setSaveOutputs(false);
                 setForkFrom(null);
                 if (fork) setBranches((items) => [...items, {
                   id: sendingBranchId, name: `Alternative ${items.length}`,
@@ -1164,6 +1169,7 @@
       const [messages, setMessages] = createSignal([]);
       const [draft, setDraft] = createSignal("");
       const [selectedFiles, setSelectedFiles] = createSignal([]);
+      const [saveOutputs, setSaveOutputs] = createSignal(false);
       const [sending, setSending] = createSignal(false);
       const [loadingConversation, setLoadingConversation] = createSignal(false);
       let conversationRequest = 0;
@@ -1178,6 +1184,7 @@
         setOlderCursor(null);
         setUncertainConversationId(null);
         setMessages([]);
+        setSaveOutputs(false);
         setError("");
         setLoadingConversation(false);
         showRoute(projectId());
@@ -2568,6 +2575,11 @@
                     <${Show} when=${() => selectedFiles().length}>
                       <button class="message-action" onClick=${() => setSelectedFiles([])}>
                         Clear</button><//>
+                    <label class="save-output-toggle">
+                      <input type="checkbox" checked=${saveOutputs}
+                        onChange=${(event) => setSaveOutputs(event.currentTarget.checked)} />
+                      Save outputs
+                    </label>
                   </div><//>
                 <textarea
                   aria-label="Message"

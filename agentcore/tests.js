@@ -558,9 +558,20 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     await editor.waitFor({ state: "hidden", timeout: 12000 }).catch(async () => {
       throw new Error(`Agent edit stayed open: ${(await editor.locator('[role="alert"]').allTextContents()).join(" | ")}`);
     });
+    const saveToggle = page.getByRole("checkbox", { name: "Save outputs" });
+    await saveToggle.check();
+    if (screenshot)
+      await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-code-composer", document.querySelector(".composer"));
+      });
     const message = page.locator('textarea[aria-label="Message"]');
     await message.fill(firstMessage);
+    const savedTurn = page.waitForRequest((request) =>
+      request.postDataJSON()?.command === "chat.send");
     await page.getByRole("button", { name: "Send ↑" }).click();
+    if ((await savedTurn).postDataJSON().input.saveOutputs !== true)
+      throw new Error("Composer did not send the per-turn output permission");
     await page.locator(".message-text").getByText(`Echo: ${firstMessage}`).waitFor()
       .catch(async (error) => {
         throw new Error(`Edited agent chat failed: ${(await page.locator('[role="alert"]').allTextContents()).join(" | ")}; ${error.message}`);
@@ -569,6 +580,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       .waitFor({ state: "hidden", timeout: 12000 }).catch(async () => {
         throw new Error(`First chat did not complete: ${(await page.locator('[role="alert"]').allTextContents()).join(" | ")}; ${uiErrors.join(" | ")}`);
       });
+    if (await saveToggle.isChecked())
+      throw new Error("Saved-output permission carried into the next turn");
     await chooseConversation("New chat");
     await message.fill(secondMessage);
     await page.getByRole("button", { name: "Send ↑" }).click();
@@ -1021,14 +1034,14 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           const text = await response.text();
           return { status: response.status, text, body: JSON.parse(text) };
         };
-        const chat = async (agentId, message, fileIds = []) => {
+        const chat = async (agentId, message, fileIds = [], saveOutputs = false) => {
           const sessionId = crypto.randomUUID();
           const response = await fetch(url, { method: "POST", headers: {
             authorization: `Bearer ${token}`, "content-type": "application/json",
             "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
           }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
             projectId: "main", agentId, sessionId,
-            requestId: crypto.randomUUID(), message, fileIds,
+            requestId: crypto.randomUUID(), message, fileIds, saveOutputs,
           } }) });
           return { status: response.status, text: await response.text() };
         };
@@ -1069,14 +1082,50 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           { method: "POST", body: form });
         const complete = await call("objects.completeUpload",
           { projectId: "main", id: upload.body.data.id });
-        if (!staged.ok || complete.status !== 200)
-          throw Error("Selected-file upload did not complete");
+        if (!staged.ok || complete.status !== 200 || !complete.body.ok)
+          throw Error("Selected-file upload did not complete: " +
+            JSON.stringify({ staged: staged.status,
+              complete: complete.body.error?.code || complete.body.data?.item?.status }));
+        const fileInventory = await call("objects.list", { projectId: "main" });
+        if (!fileInventory.body.data?.items?.some((item) =>
+          item.id === upload.body.data.id && item.status === "ACTIVE"))
+          throw Error("Completed selected file was not active in inventory: " +
+            JSON.stringify({ complete: complete.body.data?.item,
+              listError: fileInventory.body.error?.code,
+              listStatus: fileInventory.status,
+              items: fileInventory.body.data?.items?.map((item) =>
+                ({ id: item.id, status: item.status, kind: item.kind })),
+              cursor: Boolean(fileInventory.body.data?.nextCursor) }));
         const selected = await chat(agentId,
           'run-code: import json, requests; f=json.load(open("selected-files.json"))[0]; r=requests.get(f["url"],timeout=10); print(f["name"],r.status_code,r.text)',
           [upload.body.data.id]);
         if (!selected.text.includes("smoke.txt 200 " + fileBody) ||
           selected.text.includes("X-Amz-Signature="))
-          throw Error("Interpreter could not use the selected version-pinned file");
+          throw Error("Interpreter could not use the selected version-pinned file: " +
+            selected.text.slice(-900).replace(/https?:\/\/[^\s"]+/g, "[url]"));
+        const saved = await chat(agentId, "save-artifact-smoke", [], true);
+        if (saved.status !== 200 ||
+          !saved.text.includes('"name":"save_artifact","isError":false') ||
+          !saved.text.includes('"type":"message.done"') ||
+          saved.text.includes("X-Amz-Signature="))
+          throw Error("Interpreter output was not saved by the managed tool: " +
+            saved.text.slice(-700));
+        const artifacts = await call("objects.list", { projectId: "main" });
+        const artifact = artifacts.body.data?.items?.find((item) =>
+          item.kind === "artifact" && item.name === "report.txt");
+        if (!artifact || artifact.sizeBytes !==
+          new TextEncoder().encode("Saved by AgentCore smoke test").length)
+          throw Error("Saved output was missing from the quota-counted inventory");
+        const download = await call("objects.get", {
+          projectId: "main", id: artifact.id });
+        const actual = await fetch(download.body.data.url).then((response) =>
+          response.text());
+        if (actual !== "Saved by AgentCore smoke test")
+          throw Error("Saved output bytes could not be retrieved");
+        const removedArtifact = await call("objects.delete", {
+          projectId: "main", id: artifact.id });
+        if (removedArtifact.status !== 200)
+          throw Error("Saved output could not be deleted");
         const wrongFile = await chat(agentId, "run-code: print('no')",
           [crypto.randomUUID()]);
         if (!wrongFile.text.includes("FILE_UNAVAILABLE"))
@@ -1111,7 +1160,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         if (deleted.status !== 200 || revoked.status !== 200 ||
           !revoked.text.includes("CONNECTION_REVOKED"))
           throw Error("Deleted grant remained usable");
-        const streams = [selected.text, py.text, js.text, leaked.text, shell.text];
+        const streams = [selected.text, saved.text, py.text, js.text,
+          leaked.text, shell.text];
         if (realKey) {
           const realConnection = await call("connections.put", {
             projectId: "main", name: "Live GitHub verification",

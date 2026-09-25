@@ -4,6 +4,10 @@ export async function* scriptedStream(messages) {
   const prompt = messages.at(-1)?.content?.find((part) => part.text)?.text || "";
   const toolResult = messages.at(-1)?.content?.find((part) => part.toolResult)?.toolResult;
   const previousTool = messages.at(-2)?.content?.find((part) => part.toolUse)?.toolUse?.name;
+  const artifactSmoke = messages.some((item) => item.role === "user" &&
+    item.content?.some((part) => part.text === "save-artifact-smoke"));
+  const artifactStep = artifactSmoke && (!toolResult ? "write" :
+    previousTool === "execute_code" ? "save" : null);
   const reply = toolResult
     ? ["web_search", "browser"].includes(previousTool)
       ? `${previousTool === "web_search" ? "Search results" : "Browser screenshot"} reviewed.`
@@ -17,13 +21,19 @@ export async function* scriptedStream(messages) {
   const command = prompt.startsWith("run-command:") && !toolResult ? prompt.slice(12).trim() : null;
   const search = prompt.startsWith("run-search:") && !toolResult ? prompt.slice(11).trim() : null;
   const browser = prompt.startsWith("run-browser:") && !toolResult ? prompt.slice(12).trim() : null;
-  const tool = code || javascript || command || search || browser;
+  const tool = code || javascript || command || search || browser || artifactStep;
   const failAfterUsage = prompt === "scripted-error";
   yield { contentBlockStart: { contentBlockIndex: 0, start: tool
-    ? { toolUse: { toolUseId: "scripted-tool-1", name: search ? "web_search" :
+    ? { toolUse: { toolUseId: "scripted-tool-1", name: artifactStep === "save"
+      ? "save_artifact" : search ? "web_search" :
       browser ? "browser" : command ? "execute_command" : "execute_code" } } : {} } };
   yield { contentBlockDelta: { contentBlockIndex: 0, delta: tool
-    ? { toolUse: { input: JSON.stringify(search ? { query: search } :
+    ? { toolUse: { input: JSON.stringify(artifactStep === "save"
+      ? { path: "outputs/report.txt", name: "report.txt",
+        contentType: "text/plain", idempotencyKey: "smoke-report" }
+      : artifactStep === "write" ? { language: "python",
+        code: "from pathlib import Path; Path('outputs').mkdir(exist_ok=True); Path('outputs/report.txt').write_text('Saved by AgentCore smoke test')" }
+      : search ? { query: search } :
       browser ? { action: "navigate", url: browser } : command ? { command } :
       { language: javascript ? "javascript" : "python", code: javascript || code }) } }
     : { text: reply } } };
