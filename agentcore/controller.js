@@ -6,6 +6,10 @@ import { isIP } from "node:net";
 import { SignatureV4 } from "@smithy/signature-v4";
 import { Hash } from "@smithy/hash-node";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
+import { S3Client, CopyObjectCommand, DeleteObjectCommand,
+  GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { BedrockRuntimeClient, ConverseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
 import { scriptedStream } from "./scripted-model.js";
 import { modelCost, periodKey } from "./accounting.js";
@@ -24,7 +28,8 @@ import {
   TransactWriteItemsCommand, UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb";
 import {
-  BedrockAgentCoreClient, CreateEventCommand, ListEventsCommand,
+  BedrockAgentCoreClient, CreateEventCommand, DeleteEventCommand,
+  GetEventCommand, ListEventsCommand,
   GetResourceApiKeyCommand,
   StartCodeInterpreterSessionCommand, InvokeCodeInterpreterCommand,
   StopCodeInterpreterSessionCommand,
@@ -38,6 +43,7 @@ const idp = new CognitoIdentityProviderClient({});
 const db = new DynamoDBClient({});
 const memory = new BedrockAgentCoreClient({});
 const bedrock = new BedrockRuntimeClient({});
+const s3 = new S3Client({});
 // V2 may restore workers from one snapshot, including random state. Mix fresh
 // clock time with uncached entropy so separate sessions cannot reuse a key.
 const uuid = () => {
@@ -86,16 +92,24 @@ function caller(authorization) {
 }
 
 async function defaults() {
+  const existing = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+    Key: key("ACCOUNT#CONTROL", "DEFAULTS"), ConsistentRead: true }));
+  if (existing.Item?.baselineBudgetMicroUsd && existing.Item?.baselineStorageBytes)
+    return unpack(existing.Item);
+  const initialBudget = Number(existing.Item?.budgetMicroUsd?.N ?? process.env.BUDGET);
+  const initialStorage = Number(existing.Item?.storageBytes?.N ?? process.env.STORAGE);
   const row = await db.send(
     new UpdateItemCommand({
       TableName: process.env.TABLE,
       Key: key("ACCOUNT#CONTROL", "DEFAULTS"),
       UpdateExpression:
-        "SET budgetMicroUsd = if_not_exists(budgetMicroUsd, :budget), storageBytes = if_not_exists(storageBytes, :storage), #period = if_not_exists(#period, :period), revision = if_not_exists(revision, :zero)",
+        "SET budgetMicroUsd = if_not_exists(budgetMicroUsd, :budget), storageBytes = if_not_exists(storageBytes, :storage), baselineBudgetMicroUsd = if_not_exists(baselineBudgetMicroUsd, :baselineBudget), baselineStorageBytes = if_not_exists(baselineStorageBytes, :baselineStorage), #period = if_not_exists(#period, :period), revision = if_not_exists(revision, :zero)",
       ExpressionAttributeNames: { "#period": "period" },
       ExpressionAttributeValues: {
         ":budget": N(process.env.BUDGET),
         ":storage": N(process.env.STORAGE),
+        ":baselineBudget": N(initialBudget),
+        ":baselineStorage": N(initialStorage),
         ":period": S("daily"),
         ":zero": N(0),
       },
@@ -103,6 +117,121 @@ async function defaults() {
     }),
   );
   return unpack(row.Attributes);
+}
+
+const projectPattern = /^[a-z0-9][a-z0-9-]{0,39}$/;
+const projectIdOf = (input) => input.projectId ?? "main";
+const projectKey = (sub, projectId) => `PROJECT#${sub}/${projectId}`;
+const projectMetaKey = (sub, projectId) => key(`USER#${sub}`, `PROJECT#${projectId}`);
+const invalid = () => ({ status: 400, data: { ok: false,
+  error: { code: "VALIDATION_FAILED" } } });
+const missing = () => ({ status: 404, data: { ok: false,
+  error: { code: "NOT_FOUND" } } });
+const mainProject = { id: "main", name: "Main project", hidden: false };
+const projectPublic = ({ id, name, hidden, revision, createdAt }) =>
+  ({ id, name, hidden, ...(revision !== undefined && { revision }),
+    ...(createdAt && { createdAt }) });
+const objectKey = (sub, id) => key(`USER#${sub}`, `OBJECT#${id}`);
+const objectPublic = ({ id, projectId, name, kind, contentType, sizeBytes,
+  createdAt, status }) => ({ id, projectId, name, kind, contentType, sizeBytes,
+    createdAt, status });
+const uploadKey = (sub, id) => `pending/${sub}/${id}`;
+const savedKey = (sub, projectId, id) => `users/${sub}/${projectId}/${id}`;
+
+async function storageState(identity) {
+  const [limits, row] = await Promise.all([defaults(), db.send(new GetItemCommand({
+    TableName: process.env.TABLE, Key: key(`USER#${identity.sub}`, "CONTROL"),
+    ConsistentRead: true }))]);
+  return { limitBytes: effectiveLimits(row.Item, limits).storageBytes,
+    usedBytes: Number(row.Item?.storageUsedBytes?.N || 0) };
+}
+
+async function selectedSkills(identity, projectId, ids) {
+  if (!ids?.length) return [];
+  const rows = await Promise.all(ids.map((id) => db.send(new GetItemCommand({
+    TableName: process.env.TABLE, Key: objectKey(identity.sub, id),
+    ConsistentRead: true }))));
+  if (rows.some((row) => row.Item?.projectId?.S !== projectId ||
+    row.Item?.kind?.S !== "skill" || row.Item?.status?.S !== "ACTIVE" ||
+    Number(row.Item?.sizeBytes?.N || 0) > 50000))
+    throw Error("Selected skill was removed");
+  return Promise.all(rows.map(async (row) => {
+    const item = unpack(row.Item);
+    const object = await s3.send(new GetObjectCommand({ Bucket: process.env.BUCKET,
+      Key: item.key, ...(item.versionId && { VersionId: item.versionId }) }));
+    const text = await object.Body.transformToString("utf-8");
+    if (text.length > 50000 || text.includes("\0")) throw Error("Invalid skill text");
+    return { id: item.id, name: item.name, text };
+  }));
+}
+
+async function activateObject(identity, item, sizeBytes, versionId) {
+  const keyName = savedKey(identity.sub, item.projectId, item.id);
+  try {
+    await db.send(new TransactWriteItemsCommand({ ClientRequestToken: uuid(),
+      TransactItems: [
+      { Update: { TableName: process.env.TABLE, Key: objectKey(identity.sub, item.id),
+        UpdateExpression: "SET #status = :active, #key = :key, sizeBytes = :size, versionId = :version REMOVE stageKey, expiresAt",
+        ConditionExpression: "#status = :pending",
+        ExpressionAttributeNames: { "#status": "status", "#key": "key" },
+        ExpressionAttributeValues: { ":active": S("ACTIVE"), ":pending": S("PENDING"),
+          ":key": S(keyName), ":size": N(sizeBytes), ":version": S(versionId || "") } } },
+      { Update: { TableName: process.env.TABLE,
+        Key: key(`USER#${identity.sub}`, "CONTROL"),
+        UpdateExpression: "ADD storageUsedBytes :size",
+        ExpressionAttributeValues: { ":size": N(sizeBytes) } } },
+    ] }));
+    return { ...item, key: keyName, status: "ACTIVE", sizeBytes,
+      versionId: versionId || "" };
+  } catch (error) {
+    const latest = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: objectKey(identity.sub, item.id), ConsistentRead: true }));
+    if (latest.Item?.status?.S === "ACTIVE") return unpack(latest.Item);
+    throw error;
+  }
+}
+
+async function repairPendingObject(identity, item) {
+  if (item.status !== "PENDING") return item;
+  try {
+    const head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET,
+      Key: savedKey(identity.sub, item.projectId, item.id) }));
+    if (!Number.isSafeInteger(head.ContentLength) ||
+      head.ContentLength > item.declaredBytes) return item;
+    return activateObject(identity, item, head.ContentLength, head.VersionId);
+  } catch (error) {
+    if (error.$metadata?.httpStatusCode === 404) return item;
+    throw error;
+  }
+}
+
+async function project(identity, projectId) {
+  if (!projectPattern.test(projectId || "")) return null;
+  if (projectId === "main") return mainProject;
+  const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+    Key: projectMetaKey(identity.sub, projectId), ConsistentRead: true }));
+  return row.Item ? unpack(row.Item) : null;
+}
+
+async function listProjects(identity) {
+  const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
+    KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+    ExpressionAttributeValues: { ":pk": S(`USER#${identity.sub}`), ":prefix": S("PROJECT#") },
+    Limit: 100, ConsistentRead: true }));
+  return [mainProject, ...(page.Items || []).map(unpack).map(projectPublic)];
+}
+
+function effectiveLimits(row, limits) {
+  const choose = (legacy, override, baseline) => {
+    if (row?.limitsVersion?.N === "2")
+      return row[override]?.N === undefined ? limits[legacy] : Number(row[override].N);
+    const old = row?.[legacy]?.N;
+    return old === undefined || Number(old) === limits[baseline]
+      ? limits[legacy] : Number(old);
+  };
+  return { budgetMicroUsd: choose("budgetMicroUsd", "budgetOverrideMicroUsd",
+      "baselineBudgetMicroUsd"),
+    storageBytes: choose("storageBytes", "storageOverrideBytes", "baselineStorageBytes") };
 }
 
 async function approvedModel(modelId) {
@@ -122,12 +251,12 @@ const modelCatalog = () => [
       (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER)) })),
 ];
 
-async function listAgents(identity) {
+async function listAgents(identity, projectId = "main") {
   const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
     KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
-    ExpressionAttributeValues: { ":pk": S(`PROJECT#${identity.sub}/main`), ":prefix": S("AGENT#") },
+    ExpressionAttributeValues: { ":pk": S(projectKey(identity.sub, projectId)), ":prefix": S("AGENT#") },
     Limit: 100 }));
-  return (page.Items || []).map(unpack);
+  return (page.Items || []).map(unpack).map(({ pk, sk, ...agent }) => agent);
 }
 
 const uuidPattern = /^[0-9a-f-]{36}$/i;
@@ -160,14 +289,14 @@ async function changeCredentials(identity, edit) {
   throw Error("Connection changed concurrently; please retry");
 }
 
-async function listConversations(identity, cursor) {
+async function listConversations(identity, projectId, cursor) {
   let start;
   if (cursor) {
     try {
       if (typeof cursor !== "string" || cursor.length > 2000) throw Error();
       start = JSON.parse(Buffer.from(cursor, "base64url").toString());
-      if (start.gsi1pk?.S !== `CONVERSATIONS#${identity.sub}/main` ||
-        start.pk?.S !== `PROJECT#${identity.sub}/main` ||
+      if (start.gsi1pk?.S !== `CONVERSATIONS#${identity.sub}/${projectId}` ||
+        start.pk?.S !== projectKey(identity.sub, projectId) ||
         !/^CONVERSATION#[0-9a-f-]{36}$/i.test(start.sk?.S || "")) throw Error();
     } catch {
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
@@ -176,37 +305,86 @@ async function listConversations(identity, cursor) {
   const page = await db.send(new QueryCommand({
     TableName: process.env.TABLE, IndexName: "UsageByTime",
     KeyConditionExpression: "gsi1pk = :pk",
-    ExpressionAttributeValues: { ":pk": S(`CONVERSATIONS#${identity.sub}/main`) },
+    ExpressionAttributeValues: { ":pk": S(`CONVERSATIONS#${identity.sub}/${projectId}`) },
     ExclusiveStartKey: start, Limit: 30, ScanIndexForward: false,
   }));
   return { status: 200, data: { ok: true, data: {
     items: (page.Items || []).map(unpack).filter((row) => row.expiresAt > Date.now() / 1000)
-      .map(({ id, agentId, title, createdAt, lastActivityAt }) =>
-        ({ id, agentId, title, createdAt, lastActivityAt })),
+      .map(conversationPublic),
     nextCursor: page.LastEvaluatedKey
       ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null,
   } } };
 }
+
+const branchPattern = /^(main|[0-9a-f-]{36})$/i;
+const conversationPublic = ({ id, agentId, title, createdAt, lastActivityAt,
+  activeBranchId }) => ({ id, agentId, title, createdAt, lastActivityAt,
+    activeBranchId: activeBranchId || "main" });
+const eventPattern = /^[0-9]+#[a-f0-9]+$/i;
+const branchKey = (sub, projectId, conversationId, branchId) =>
+  key(projectKey(sub, projectId), `BRANCH#${conversationId}#${branchId}`);
+
+async function branchCatalog(identity, projectId, conversationId, conversation) {
+  const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
+    KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+    ExpressionAttributeValues: { ":pk": S(projectKey(identity.sub, projectId)),
+      ":prefix": S(`BRANCH#${conversationId}#`) }, ConsistentRead: true, Limit: 100 }));
+  return [{ id: "main", name: "Main", headEventId: conversation.mainHeadEventId || null },
+    ...(page.Items || []).map(unpack).map(({ id, name, rootEventId,
+      headEventId, createdAt, memorySessionId, memoryRoot }) =>
+      ({ id, name, rootEventId: rootEventId || null, headEventId,
+        createdAt, memorySessionId, memoryRoot }))];
+}
+
+async function branchEvents(actorId, sessionId, branchId, cursor, maxResults = 100) {
+  const events = [];
+  let nextToken = cursor;
+  do {
+    const page = await memory.send(new ListEventsCommand({
+      memoryId: process.env.MEMORY, actorId, sessionId,
+      ...(branchId !== "main" && { filter: { branch: {
+        name: branchId, includeParentBranches: true } } }),
+      includePayloads: true, maxResults: Math.min(100, maxResults), nextToken,
+    }));
+    events.push(...(branchId === "main"
+      ? (page.events || []).filter((event) =>
+        !event.branch || event.branch.name === "main")
+      : page.events || []));
+    nextToken = page.nextToken;
+  } while (nextToken && events.length < maxResults);
+  return { events: events.slice(0, maxResults), nextToken };
+}
+
+const eventMessages = (events) => events.toReversed().flatMap((event) => {
+  const calls = (event.payload || []).find((payload) =>
+    Array.isArray(payload.json?.content?.toolCalls))?.json.content.toolCalls || [];
+  return (event.payload || []).flatMap((payload) => {
+    const entry = payload.conversational;
+    return entry?.content?.text && ["USER", "ASSISTANT"].includes(entry.role)
+      ? [{ eventId: event.eventId, role: entry.role.toLowerCase(),
+        text: entry.content.text, status: "complete",
+        ...(entry.role === "ASSISTANT" && { tools: calls }) }]
+      : [];
+  });
+});
 
 async function getSession(identity) {
   const [user, limits] = await Promise.all([
     idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL, Username: identity.sub })),
     defaults(),
   ]);
-  const row = await db.send(new UpdateItemCommand({
+  const row = await db.send(new GetItemCommand({
     TableName: process.env.TABLE, Key: key(`USER#${identity.sub}`, "CONTROL"),
-    UpdateExpression:
-      "SET budgetMicroUsd = if_not_exists(budgetMicroUsd, :budget), storageBytes = if_not_exists(storageBytes, :storage)",
-    ExpressionAttributeValues: { ":budget": N(limits.budgetMicroUsd), ":storage": N(limits.storageBytes) },
-    ReturnValues: "ALL_NEW",
+    ConsistentRead: true,
   }));
+  const effective = effectiveLimits(row.Item, limits);
   return {
     user: {
       sub: identity.sub,
       email: user.UserAttributes?.find((attribute) => attribute.Name === "email")?.Value || "",
       role: identity.role,
-      budgetMicroUsd: Number(row.Attributes.budgetMicroUsd.N),
-      storageBytes: Number(row.Attributes.storageBytes.N),
+      ...effective,
+      storageUsedBytes: Number(row.Item?.storageUsedBytes?.N || 0),
     },
     defaults: limits, defaultProjectId: "main",
   };
@@ -219,14 +397,191 @@ async function invoke(body, identity) {
       data: { ok: false, error: { code: "VALIDATION_FAILED" } },
     };
   }
+  if (body.command === "projects.list")
+    return { status: 200, data: { ok: true, data: { items: await listProjects(identity) } } };
+  if (["projects.create", "projects.rename", "projects.setHidden"].includes(body.command)) {
+    if (identity.role === "Auditors")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    const { id, name, hidden, revision } = body.input;
+    if (!projectPattern.test(id || "") || id === "main") return invalid();
+    if (body.command === "projects.create") {
+      if (typeof name !== "string" || !name.trim() || name.length > 80) return invalid();
+      if ((await listProjects(identity)).length >= 100)
+        return { status: 409, data: { ok: false, error: { code: "PROJECT_LIMIT" } } };
+      const item = { ...projectMetaKey(identity.sub, id), id: S(id), name: S(name.trim()),
+        hidden: { BOOL: false }, revision: N(0), createdAt: S(new Date().toISOString()) };
+      try {
+        await db.send(new PutItemCommand({ TableName: process.env.TABLE, Item: item,
+          ConditionExpression: "attribute_not_exists(pk)" }));
+      } catch (error) {
+        if (error.name === "ConditionalCheckFailedException")
+          return { status: 409, data: { ok: false, error: { code: "PROJECT_EXISTS" } } };
+        throw error;
+      }
+      return { status: 200, data: { ok: true, data: projectPublic(unpack(item)) } };
+    }
+    if (!Number.isSafeInteger(revision) || revision < 0 ||
+      (body.command === "projects.rename" &&
+        (typeof name !== "string" || !name.trim() || name.length > 80)) ||
+      (body.command === "projects.setHidden" && typeof hidden !== "boolean"))
+      return invalid();
+    try {
+      const row = await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
+        Key: projectMetaKey(identity.sub, id),
+        UpdateExpression: body.command === "projects.rename"
+          ? "SET #name = :value, revision = revision + :one"
+          : "SET #hidden = :value, revision = revision + :one",
+        ConditionExpression: "attribute_exists(pk) AND revision = :revision",
+        ExpressionAttributeNames: body.command === "projects.rename"
+          ? { "#name": "name" } : { "#hidden": "hidden" },
+        ExpressionAttributeValues: { ":value": body.command === "projects.rename"
+          ? S(name.trim()) : { BOOL: hidden }, ":one": N(1), ":revision": N(revision) },
+        ReturnValues: "ALL_NEW" }));
+      return { status: 200, data: { ok: true,
+        data: projectPublic(unpack(row.Attributes)) } };
+    } catch (error) {
+      if (error.name === "ConditionalCheckFailedException")
+        return { status: 409, data: { ok: false, error: { code: "REVISION_CONFLICT" } } };
+      throw error;
+    }
+  }
+  if (["objects.beginUpload", "objects.completeUpload", "objects.list",
+    "objects.get", "objects.delete"].includes(body.command)) {
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId)) return invalid();
+    if (!await project(identity, projectId)) return missing();
+    if (["objects.beginUpload", "objects.completeUpload", "objects.delete"]
+      .includes(body.command) && identity.role === "Auditors")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    if (body.command === "objects.beginUpload") {
+      const { name, contentType = "application/octet-stream", sizeBytes,
+        kind = "file" } = body.input;
+      if (typeof name !== "string" || !name.trim() || name.length > 180 ||
+        /[\r\n\0]/.test(name) || !["file", "skill", "artifact"].includes(kind) ||
+        typeof contentType !== "string" || !/^[\w.+-]+\/[\w.+-]+$/.test(contentType) ||
+        !Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > 5000000000)
+        return invalid();
+      const storage = await storageState(identity);
+      if (storage.usedBytes + sizeBytes > storage.limitBytes)
+        return { status: 409, data: { ok: false, error: { code: "QUOTA_EXCEEDED" } } };
+      const id = uuid(), stageKey = uploadKey(identity.sub, id);
+      const item = { ...objectKey(identity.sub, id), id: S(id), projectId: S(projectId),
+        name: S(name.trim()), kind: S(kind), contentType: S(contentType),
+        declaredBytes: N(sizeBytes), stageKey: S(stageKey), status: S("PENDING"),
+        createdAt: S(new Date().toISOString()),
+        expiresAt: N(Math.floor(Date.now() / 1000) + 86400) };
+      await db.send(new PutItemCommand({ TableName: process.env.TABLE, Item: item,
+        ConditionExpression: "attribute_not_exists(pk)" }));
+      const upload = await createPresignedPost(s3, { Bucket: process.env.BUCKET,
+        Key: stageKey, Expires: 300,
+        Fields: { "Content-Type": contentType },
+        Conditions: [{ "Content-Type": contentType },
+          ["content-length-range", 1, Math.min(5000016384, sizeBytes + 16384)]] });
+      return { status: 200, data: { ok: true, data: {
+        id, upload, expiresInSeconds: 300 } } };
+    }
+    if (body.command === "objects.list") {
+      let start;
+      if (body.input.cursor) {
+        try {
+          if (typeof body.input.cursor !== "string" || body.input.cursor.length > 2000)
+            throw Error();
+          start = JSON.parse(Buffer.from(body.input.cursor, "base64url").toString());
+          if (start.pk?.S !== `USER#${identity.sub}` ||
+            !/^OBJECT#[0-9a-f-]{36}$/i.test(start.sk?.S || "")) throw Error();
+        } catch { return invalid(); }
+      }
+      const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
+          KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+          ExpressionAttributeValues: { ":pk": S(`USER#${identity.sub}`),
+            ":prefix": S("OBJECT#") }, ExclusiveStartKey: start,
+          ConsistentRead: true, Limit: 50 }));
+      const rows = await Promise.all((page.Items || []).map((item) =>
+        repairPendingObject(identity, unpack(item))));
+      const storage = await storageState(identity);
+      return { status: 200, data: { ok: true, data: {
+        items: rows.filter((item) =>
+          item.projectId === projectId && item.status === "ACTIVE").map(objectPublic),
+        ...storage, nextCursor: page.LastEvaluatedKey
+          ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null,
+      } } };
+    }
+    const id = body.input.id;
+    if (!uuidPattern.test(id || "")) return invalid();
+    const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: objectKey(identity.sub, id), ConsistentRead: true }));
+    if (!row.Item || row.Item.projectId?.S !== projectId) return missing();
+    let item = unpack(row.Item);
+    if (body.command === "objects.completeUpload") {
+      if (item.status === "ACTIVE")
+        return { status: 200, data: { ok: true, data: { item: objectPublic(item) } } };
+      if (item.status !== "PENDING" || item.expiresAt <= Date.now() / 1000)
+        return missing();
+      let head;
+      try {
+        head = await s3.send(new HeadObjectCommand({ Bucket: process.env.BUCKET,
+          Key: item.stageKey }));
+      } catch (error) {
+        if (error.$metadata?.httpStatusCode === 404)
+          return { status: 409, data: { ok: false, error: { code: "UPLOAD_MISSING" } } };
+        throw error;
+      }
+      const size = head.ContentLength;
+      if (!Number.isSafeInteger(size) || size < 1 || size > item.declaredBytes)
+        return { status: 409, data: { ok: false, error: { code: "UPLOAD_SIZE_MISMATCH" } } };
+      const storage = await storageState(identity);
+      if (storage.usedBytes + size > storage.limitBytes)
+        return { status: 409, data: { ok: false, error: { code: "QUOTA_EXCEEDED" } } };
+      const destination = savedKey(identity.sub, projectId, id);
+      const copy = await s3.send(new CopyObjectCommand({ Bucket: process.env.BUCKET,
+        Key: destination, CopySource: `${process.env.BUCKET}/${item.stageKey}`,
+        MetadataDirective: "REPLACE", ContentType: item.contentType }));
+      const saved = await activateObject(identity, item, size, copy.VersionId);
+      await s3.send(new DeleteObjectCommand({ Bucket: process.env.BUCKET,
+        Key: item.stageKey, ...(head.VersionId && { VersionId: head.VersionId }) }))
+        .catch(() => console.error("Could not remove completed staging object"));
+      return { status: 200, data: { ok: true, data: { item: objectPublic(saved) } } };
+    }
+    if (item.status === "PENDING") item = await repairPendingObject(identity, item);
+    if (item.status !== "ACTIVE") return missing();
+    if (body.command === "objects.get") {
+      const url = await getSignedUrl(s3, new GetObjectCommand({
+        Bucket: process.env.BUCKET, Key: item.key,
+        ...(item.versionId && { VersionId: item.versionId }) }), { expiresIn: 300 });
+      return { status: 200, data: { ok: true, data: { url, expiresInSeconds: 300 } } };
+    }
+    await s3.send(new DeleteObjectCommand({ Bucket: process.env.BUCKET,
+      Key: item.key, ...(item.versionId && { VersionId: item.versionId }) }));
+    try {
+      await db.send(new TransactWriteItemsCommand({ ClientRequestToken: uuid(),
+        TransactItems: [
+        { Update: { TableName: process.env.TABLE, Key: objectKey(identity.sub, id),
+          UpdateExpression: "SET #status = :deleted, expiresAt = :expiry",
+          ConditionExpression: "#status = :active",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: { ":deleted": S("DELETED"), ":active": S("ACTIVE"),
+            ":expiry": N(Math.floor(Date.now() / 1000) + 30 * 86400) } } },
+        { Update: { TableName: process.env.TABLE, Key: key(`USER#${identity.sub}`, "CONTROL"),
+          UpdateExpression: "ADD storageUsedBytes :size",
+          ExpressionAttributeValues: { ":size": N(-item.sizeBytes) } } },
+      ] }));
+    } catch (error) {
+      const latest = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+        Key: objectKey(identity.sub, id), ConsistentRead: true }));
+      if (latest.Item?.status?.S !== "DELETED") throw error;
+    }
+    return { status: 200, data: { ok: true, data: { deleted: true } } };
+  }
   if (body.command === "agents.list") {
-    if (body.input.projectId !== "main")
-      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    return { status: 200, data: { ok: true, data: { items: await listAgents(identity) } } };
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId)) return invalid();
+    if (!await project(identity, projectId)) return missing();
+    return { status: 200, data: { ok: true, data: { items: await listAgents(identity, projectId) } } };
   }
   if (body.command === "connections.list") {
-    if (body.input.projectId !== "main")
-      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId)) return invalid();
+    if (!await project(identity, projectId)) return missing();
     const state = await credentials(identity);
     return { status: 200, data: { ok: true, data: {
       items: Object.values(state.items).map(publicConnection) } } };
@@ -234,8 +589,9 @@ async function invoke(body, identity) {
   if (["connections.put", "connections.rotate", "connections.delete"].includes(body.command)) {
     if (identity.role === "Auditors")
       return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
-    if (body.input.projectId !== "main")
-      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId)) return invalid();
+    if (!await project(identity, projectId)) return missing();
     if (body.command === "connections.put") {
       const { name, kind, apiKey, jiraUrl = "", jiraEmail = "" } = body.input;
       let url;
@@ -288,68 +644,72 @@ async function invoke(body, identity) {
       [body.command === "connections.rotate" ? "rotated" : "deleted"]: true } } };
   }
   if (body.command === "workspace.get") {
-    if (Object.keys(body.input).length)
-      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    const [session, agents, conversations] = await Promise.all([
-      getSession(identity), listAgents(identity), listConversations(identity),
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId) || Object.keys(body.input).some((name) => name !== "projectId"))
+      return invalid();
+    if (!await project(identity, projectId)) return missing();
+    const [session, projects, agents, conversations] = await Promise.all([
+      getSession(identity), listProjects(identity), listAgents(identity, projectId),
+      listConversations(identity, projectId),
     ]);
     return { status: 200, data: { ok: true,
-      data: { session, agents, models: modelCatalog(),
+      data: { session, projects, agents, models: modelCatalog(),
         conversations: conversations.data.data } } };
   }
   if (body.command === "conversations.list") {
-    if (body.input.projectId !== "main")
-      return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    return listConversations(identity, body.input.cursor);
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId)) return invalid();
+    if (!await project(identity, projectId)) return missing();
+    return listConversations(identity, projectId, body.input.cursor);
   }
   if (body.command === "conversations.get") {
-    const { projectId, agentId, conversationId, cursor } = body.input;
+    const { agentId, conversationId, cursor } = body.input;
+    const projectId = projectIdOf(body.input);
+    const branchId = body.input.branchId ?? "main";
     const uuid = /^[0-9a-f-]{36}$/i;
-    if (projectId !== "main" || !uuid.test(agentId || "") ||
+    if (!projectPattern.test(projectId) || !branchPattern.test(branchId) || !uuid.test(agentId || "") ||
       !uuid.test(conversationId || "") ||
       (cursor !== undefined && (typeof cursor !== "string" || cursor.length > 4000)))
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    if (!await project(identity, projectId)) return missing();
     const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
-      Key: key(`PROJECT#${identity.sub}/main`, `CONVERSATION#${conversationId}`),
+      Key: key(projectKey(identity.sub, projectId), `CONVERSATION#${conversationId}`),
       ConsistentRead: true }));
     if (!row.Item || row.Item.agentId?.S !== agentId ||
       Number(row.Item.expiresAt?.N || 0) <= Date.now() / 1000)
       return { status: 404, data: { ok: false, error: { code: "NOT_FOUND" } } };
-    const page = await memory.send(new ListEventsCommand({
-      memoryId: process.env.MEMORY, actorId: `${identity.sub}/main`,
-      sessionId: `a_${agentId}_${conversationId}`,
-      includePayloads: true, maxResults: 100, nextToken: cursor,
-    }));
+    const conversation = unpack(row.Item);
+    const branches = await branchCatalog(identity, projectId, conversationId, conversation);
+    if (!branches.some((branch) => branch.id === branchId)) return missing();
+    const selected = branches.find((branch) => branch.id === branchId);
+    const page = await branchEvents(`${identity.sub}/${projectId}`,
+      selected.memorySessionId || `a_${agentId}_${conversationId}`,
+      selected.memoryRoot ? "main" : selected.id, cursor);
     return { status: 200, data: { ok: true, data: {
-      conversation: unpack(row.Item),
-      messages: (page.events || []).toReversed().flatMap((event) => {
-        const calls = (event.payload || []).find((payload) =>
-          Array.isArray(payload.json?.content?.toolCalls))?.json.content.toolCalls || [];
-        return (event.payload || []).flatMap((payload) => {
-          const entry = payload.conversational;
-          return entry?.content?.text && ["USER", "ASSISTANT"].includes(entry.role)
-            ? [{ role: entry.role.toLowerCase(), text: entry.content.text, status: "complete",
-              ...(entry.role === "ASSISTANT" && { tools: calls }) }]
-            : [];
-        });
-      }),
+      conversation: conversationPublic(conversation), branchId,
+      branches: branches.map(({ memorySessionId, memoryRoot, ...branch }) => branch),
+      messages: eventMessages(page.events),
       nextCursor: page.nextToken || null,
     } } };
   }
   if (body.command === "agents.put") {
     if (identity.role === "Auditors")
       return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
-    const { projectId, id: existingId, revision, name, modelId,
+    const { id: existingId, revision, name, modelId,
       systemPrompt = "", codeInterpreter = false, webSearch = false, browser = false,
-      connectionIds = [], thinkingLevel,
+      connectionIds = [], skillIds = [], thinkingLevel,
       webSearchMaxResults = 5, browserSessionSeconds = 300 } = body.input;
-    if (projectId !== "main" || typeof name !== "string" || !name.trim() || name.length > 80 ||
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId) || typeof name !== "string" || !name.trim() || name.length > 80 ||
       typeof modelId !== "string" || !modelId || modelId.length > 512 ||
       typeof systemPrompt !== "string" || systemPrompt.length > 12000 ||
       [codeInterpreter, webSearch, browser].some((value) => typeof value !== "boolean") ||
       !Array.isArray(connectionIds) || connectionIds.length > 4 ||
       connectionIds.some((id) => !uuidPattern.test(id || "")) ||
       new Set(connectionIds).size !== connectionIds.length ||
+      !Array.isArray(skillIds) || skillIds.length > 4 ||
+      skillIds.some((id) => !uuidPattern.test(id || "")) ||
+      new Set(skillIds).size !== skillIds.length ||
       (connectionIds.length && !codeInterpreter) ||
       (existingId !== undefined && (!uuidPattern.test(existingId || "") ||
         !Number.isSafeInteger(revision) || revision < 0)) ||
@@ -357,6 +717,7 @@ async function invoke(body, identity) {
       !Number.isSafeInteger(browserSessionSeconds) || browserSessionSeconds < 60 ||
       browserSessionSeconds > 900)
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
+    if (!await project(identity, projectId)) return missing();
     const model = await approvedModel(modelId);
     if (!model)
       return { status: 400, data: { ok: false, error: { code: "MODEL_UNAVAILABLE" } } };
@@ -374,12 +735,22 @@ async function invoke(body, identity) {
         new Set(selected.map((item) => item.kind)).size !== selected.length)
         return { status: 400, data: { ok: false, error: { code: "CONNECTION_UNAVAILABLE" } } };
     }
+    if (skillIds.length) {
+      const selected = await Promise.all(skillIds.map((id) => db.send(new GetItemCommand({
+        TableName: process.env.TABLE, Key: objectKey(identity.sub, id),
+        ConsistentRead: true }))));
+      if (selected.some((row) => row.Item?.projectId?.S !== projectId ||
+        row.Item?.kind?.S !== "skill" || row.Item?.status?.S !== "ACTIVE" ||
+        Number(row.Item?.sizeBytes?.N || 0) > 50000))
+        return { status: 400, data: { ok: false,
+          error: { code: "SKILL_UNAVAILABLE" } } };
+    }
     const id = existingId || uuid();
     let createdAt = new Date().toISOString();
     let legacyRevision = false;
     if (existingId) {
       const current = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
-        Key: key(`PROJECT#${identity.sub}/main`, `AGENT#${id}`), ConsistentRead: true }));
+        Key: key(projectKey(identity.sub, projectId), `AGENT#${id}`), ConsistentRead: true }));
       if (!current.Item)
         return { status: 404, data: { ok: false, error: { code: "NOT_FOUND" } } };
       if (Number(current.Item.revision?.N || 0) !== revision)
@@ -388,17 +759,18 @@ async function invoke(body, identity) {
       legacyRevision = !current.Item.revision;
     }
     const agent = { id, name: name.trim(), modelId, systemPrompt,
-      codeInterpreter, webSearch, browser, connectionIds,
+      codeInterpreter, webSearch, browser, connectionIds, skillIds,
       ...(selectedThinkingLevel && { thinkingLevel: selectedThinkingLevel }),
       webSearchMaxResults, browserSessionSeconds, createdAt,
       revision: existingId ? revision + 1 : 0 };
     try {
       await db.send(new PutItemCommand({ TableName: process.env.TABLE,
-        Item: { pk: S(`PROJECT#${identity.sub}/main`), sk: S(`AGENT#${id}`),
+        Item: { pk: S(projectKey(identity.sub, projectId)), sk: S(`AGENT#${id}`),
           id: S(id), name: S(agent.name), modelId: S(modelId),
           systemPrompt: S(systemPrompt), codeInterpreter: { BOOL: codeInterpreter },
           webSearch: { BOOL: webSearch }, browser: { BOOL: browser },
           connectionIds: { L: connectionIds.map(S) },
+          skillIds: { L: skillIds.map(S) },
           ...(selectedThinkingLevel && { thinkingLevel: S(selectedThinkingLevel) }),
           createdAt: S(createdAt),
           webSearchMaxResults: N(webSearchMaxResults),
@@ -439,9 +811,11 @@ async function invoke(body, identity) {
         Number(row.Item?.estimatedModelCalls?.N || 0) ? "estimated" : "model-only" } } };
   }
   if (body.command === "usage.list") {
-    const { range = "30d", sort = "desc", scope = "self", cursor } = body.input;
+    const { range = "30d", sort = "desc", scope = "self", cursor,
+      projectId: usageProjectId } = body.input;
     const target = body.input.userSub || identity.sub;
-    if (!["30d", "90d"].includes(range) || !["asc", "desc"].includes(sort) ||
+    if ((usageProjectId !== undefined && !projectPattern.test(usageProjectId)) ||
+      !["30d", "90d"].includes(range) || !["asc", "desc"].includes(sort) ||
       !["self", "all"].includes(scope) || (scope === "all" && identity.role !== "Administrators"))
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
     if (target !== identity.sub && identity.role !== "Administrators")
@@ -471,11 +845,16 @@ async function invoke(body, identity) {
         ":pk": S(scope === "all" ? "USAGE" : `USER#${target}`),
         ":from": S(`${scope === "all" ? "" : "USAGE#"}${since}`),
         ":to": S(`${scope === "all" ? "" : "USAGE#"}${new Date().toISOString()}~`),
+        ...(usageProjectId && { ":project": S(usageProjectId) }),
       },
       ExclusiveStartKey: start, Limit: 50, ScanIndexForward: sort === "asc",
+      ...(usageProjectId && { FilterExpression: usageProjectId === "main"
+        ? "projectId = :project OR attribute_not_exists(projectId)"
+        : "projectId = :project" }),
       ...(scope === "self" && { ConsistentRead: true }) }));
     return { status: 200, data: { ok: true, data: { range, sort, scope,
-      items: (page.Items || []).map(unpack),
+      items: (page.Items || []).map(unpack).map((item) => ({
+        ...item, projectId: item.projectId || "main" })),
       nextCursor: page.LastEvaluatedKey
         ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null } } };
   }
@@ -495,8 +874,16 @@ async function invoke(body, identity) {
         Key: key(`USER#${sub}`, "CONTROL") }));
       return { sub, email: user.Attributes?.find((attribute) => attribute.Name === "email")?.Value,
         enabled: user.Enabled, status: user.UserStatus,
-        budgetMicroUsd: Number(row.Item?.budgetMicroUsd?.N || limits.budgetMicroUsd),
-        storageBytes: Number(row.Item?.storageBytes?.N || limits.storageBytes) };
+        ...effectiveLimits(row.Item, limits),
+        budgetInherited: row.Item?.limitsVersion?.N === "2"
+          ? row.Item.budgetOverrideMicroUsd?.N === undefined
+          : row.Item?.budgetMicroUsd?.N === undefined ||
+            Number(row.Item.budgetMicroUsd.N) === limits.baselineBudgetMicroUsd,
+        storageInherited: row.Item?.limitsVersion?.N === "2"
+          ? row.Item.storageOverrideBytes?.N === undefined
+          : row.Item?.storageBytes?.N === undefined ||
+            Number(row.Item.storageBytes.N) === limits.baselineStorageBytes,
+        storageUsedBytes: Number(row.Item?.storageUsedBytes?.N || 0) };
     }));
     return { status: 200, data: { ok: true, data: {
       items, cursor: page.PaginationToken || null, defaults: limits } } };
@@ -517,14 +904,19 @@ async function invoke(body, identity) {
   if (body.command === "users.setLimits") {
     const { sub, budgetMicroUsd, storageBytes } = body.input;
     if (!/^[0-9a-f-]{36}$/i.test(sub || "") ||
-      !Number.isSafeInteger(budgetMicroUsd) || budgetMicroUsd < 0 ||
-      !Number.isSafeInteger(storageBytes) || storageBytes < 0)
+      (budgetMicroUsd !== null && (!Number.isSafeInteger(budgetMicroUsd) || budgetMicroUsd < 0)) ||
+      (storageBytes !== null && (!Number.isSafeInteger(storageBytes) || storageBytes < 0)))
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
     await idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL, Username: sub }));
+    const limits = await defaults();
     await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
       Key: key(`USER#${sub}`, "CONTROL"),
-      UpdateExpression: "SET budgetMicroUsd = :budget, storageBytes = :storage",
-      ExpressionAttributeValues: { ":budget": N(budgetMicroUsd), ":storage": N(storageBytes) } }));
+      UpdateExpression: "SET limitsVersion = :version, budgetOverrideMicroUsd = :budgetOverride, storageOverrideBytes = :storageOverride, budgetMicroUsd = :budget, storageBytes = :storage",
+      ExpressionAttributeValues: { ":version": N(2),
+        ":budgetOverride": budgetMicroUsd === null ? { NULL: true } : N(budgetMicroUsd),
+        ":storageOverride": storageBytes === null ? { NULL: true } : N(storageBytes),
+        ":budget": N(budgetMicroUsd ?? limits.budgetMicroUsd),
+        ":storage": N(storageBytes ?? limits.storageBytes) } }));
     return { status: 200, data: { ok: true, data: { updated: true } } };
   }
   if (body.command === "defaults.get")
@@ -649,7 +1041,9 @@ async function initializeWorkspace(sessionId, scope) {
     return `${name}=${value}`;
   }).join("\n") + "\n";
   const written = await interpreterCall(sessionId, "writeFiles", {
-    content: [{ path: ".env", text: contents }],
+    content: [{ path: ".env", text: contents },
+      ...(scope.skills || []).map((skill) => ({ path: `skill-${skill.id}.md`,
+        text: skill.text }))],
   });
   if (written.isError) throw Error("Could not initialize code workspace");
   const cwd = await interpreterCall(sessionId, "executeCommand", { command: "pwd" });
@@ -802,8 +1196,10 @@ function toolSpecs(config) {
 function toolInstructions(config) {
   return [
     config.systemPrompt,
+    ...(config.skills || []).map((skill) =>
+      `Selected skill ${skill.name} (${skill.id}):\n${skill.text}`),
     "Use only the tools provided in this request. If a requested capability is unavailable, say so; do not invent tool results.",
-    config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
+    config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Selected skill files are in skill-<id>.md. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
     config.webSearch ? "Web Search returns current results. Base factual claims on the returned sources and cite their URLs." : "",
     config.browser ? "Browser actions return screenshots. Inspect each screenshot and avoid entering private credentials." : "",
   ].filter(Boolean).join("\n\n");
@@ -1012,6 +1408,7 @@ async function runModel(config, model, messages, emit, workloadToken, scope) {
 function rejectChat(response, code) {
   const messages = {
     CONNECTION_REVOKED: "A granted connection was removed. Edit this agent before sending again.",
+    SKILL_UNAVAILABLE: "A selected skill was removed. Edit this agent before sending again.",
     BUDGET_EXHAUSTED: "Your current budget is exhausted.",
     MODEL_UNAVAILABLE: "This agent's model is unavailable.",
     TOOL_UNAVAILABLE: "This model cannot use the agent's enabled tools.",
@@ -1019,6 +1416,7 @@ function rejectChat(response, code) {
     FORBIDDEN: "This account cannot send messages.",
     NOT_FOUND: "This agent was not found.",
     VALIDATION_FAILED: "The message request is invalid.",
+    BRANCH_CONFLICT: "This conversation path changed. Reopen it before sending again.",
   };
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
   response.end(`data: ${JSON.stringify({ type: "error", code,
@@ -1026,9 +1424,21 @@ function rejectChat(response, code) {
 }
 
 async function chat(input, identity, response, workloadToken) {
-  const { projectId, agentId, sessionId, requestId, message, modelId, thinkingLevel } = input;
+  const { agentId, sessionId, requestId, message, modelId, thinkingLevel } = input;
+  const projectId = projectIdOf(input);
+  const branchId = input.branchId ?? "main";
+  const forking = Object.hasOwn(input, "forkEventId");
+  const forkEventId = input.forkEventId;
+  const sourceBranchId = input.sourceBranchId ?? "main";
   const uuid = /^[0-9a-f-]{36}$/i;
-  if (projectId !== "main" || !uuid.test(agentId || "") ||
+  if (!projectPattern.test(projectId) || !branchPattern.test(branchId) ||
+    (forking ? !branchPattern.test(sourceBranchId) :
+      input.sourceBranchId !== undefined) ||
+    (forking && (branchId === "main" ||
+      (forkEventId !== null && !eventPattern.test(forkEventId || "")))) ||
+    (input.expectedHeadEventId !== undefined && input.expectedHeadEventId !== null &&
+      !eventPattern.test(input.expectedHeadEventId)) ||
+    !uuid.test(agentId || "") ||
     !uuid.test(sessionId || "") || !uuid.test(requestId || "") ||
     typeof message !== "string" || !message.trim() || message.length > 20000 ||
     (modelId !== undefined && (typeof modelId !== "string" || modelId.length > 512)) ||
@@ -1036,20 +1446,42 @@ async function chat(input, identity, response, workloadToken) {
     return rejectChat(response, "VALIDATION_FAILED");
   if (identity.role === "Auditors")
     return rejectChat(response, "FORBIDDEN");
-  const [row, defaultsRow, prior, user] = await Promise.all([
+  if (!await project(identity, projectId))
+    return rejectChat(response, "NOT_FOUND");
+  const [row, defaultsRow, prior, user, conversationRow, branchRow,
+    sourceBranchRow] = await Promise.all([
     db.send(new GetItemCommand({ TableName: process.env.TABLE,
-      Key: key(`PROJECT#${identity.sub}/main`, `AGENT#${agentId}`), ConsistentRead: true })),
+      Key: key(projectKey(identity.sub, projectId), `AGENT#${agentId}`), ConsistentRead: true })),
     defaults(),
     db.send(new GetItemCommand({ TableName: process.env.TABLE,
       Key: key(`USER#${identity.sub}`, `REQUEST#${requestId}`), ConsistentRead: true })),
     db.send(new GetItemCommand({ TableName: process.env.TABLE,
       Key: key(`USER#${identity.sub}`, "CONTROL"), ConsistentRead: true })),
+    db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: key(projectKey(identity.sub, projectId), `CONVERSATION#${sessionId}`),
+      ConsistentRead: true })),
+    branchId === "main" ? Promise.resolve({}) : db.send(new GetItemCommand({
+      TableName: process.env.TABLE,
+      Key: branchKey(identity.sub, projectId, sessionId, branchId),
+      ConsistentRead: true })),
+    !forking || sourceBranchId === "main" ? Promise.resolve({}) :
+      db.send(new GetItemCommand({ TableName: process.env.TABLE,
+        Key: branchKey(identity.sub, projectId, sessionId, sourceBranchId),
+        ConsistentRead: true })),
   ]);
   if (!row.Item)
     return rejectChat(response, "NOT_FOUND");
   const config = unpack(row.Item);
   if (prior.Item)
     return rejectChat(response, "REQUEST_ALREADY_COMPLETED");
+  if (conversationRow.Item && (conversationRow.Item.agentId?.S !== agentId ||
+    Number(conversationRow.Item.expiresAt?.N || 0) <= Date.now() / 1000))
+    return rejectChat(response, "NOT_FOUND");
+  if (forking ? branchRow.Item || !conversationRow.Item ||
+      (sourceBranchId !== "main" && !sourceBranchRow.Item) ||
+      (forkEventId === null && branchId === "main")
+    : branchId !== "main" && !branchRow.Item)
+    return rejectChat(response, "BRANCH_CONFLICT");
   const period = periodKey(defaultsRow.period);
   const turnModelId = modelId ?? config.modelId;
   const [model, spent] = await Promise.all([
@@ -1069,20 +1501,75 @@ async function chat(input, identity, response, workloadToken) {
     return rejectChat(response, "VALIDATION_FAILED");
   if (config.browser && !model.browserTool)
     return rejectChat(response, "TOOL_UNAVAILABLE");
-  const turnConfig = { ...config, modelId: turnModelId, thinkingLevel: turnThinkingLevel };
   if (config.connectionIds?.length) {
     const current = (await credentials(identity)).items;
     if (config.connectionIds.some((id) => !current[id]))
       return rejectChat(response, "CONNECTION_REVOKED");
   }
-  const limit = Number(user.Item?.budgetMicroUsd?.N ?? defaultsRow.budgetMicroUsd);
+  const limit = effectiveLimits(user.Item, defaultsRow).budgetMicroUsd;
   if (Number(spent.Item?.costMicroUsd?.N || 0) >= limit)
     return rejectChat(response, "BUDGET_EXHAUSTED");
-  const actorId = `${identity.sub}/main`;
-  const memorySessionId = `a_${agentId}_${sessionId}`;
-  const history = await memory.send(new ListEventsCommand({
-    memoryId: process.env.MEMORY, actorId, sessionId: memorySessionId,
-    includePayloads: true, maxResults: 20 }));
+  let skills;
+  try {
+    skills = await selectedSkills(identity, projectId, config.skillIds || []);
+  } catch (error) {
+    if (error.message === "Selected skill was removed")
+      return rejectChat(response, "SKILL_UNAVAILABLE");
+    throw error;
+  }
+  const turnConfig = { ...config, modelId: turnModelId,
+    thinkingLevel: turnThinkingLevel, skills };
+  const actorId = `${identity.sub}/${projectId}`;
+  const mainMemorySessionId = `a_${agentId}_${sessionId}`;
+  // Memory requires a rootEventId for native branches. Editing the first turn
+  // therefore starts one independent session; its later descendants can use
+  // native branches inside that session without copying any message bodies.
+  const sourceMemorySessionId = sourceBranchRow.Item?.memorySessionId?.S ||
+    mainMemorySessionId;
+  const memorySessionId = forking
+    ? forkEventId === null ? `a_${agentId}_b_${branchId}` :
+      sourceMemorySessionId
+    : branchRow.Item?.memorySessionId?.S || mainMemorySessionId;
+  const nativeBranchId = forking && forkEventId === null ||
+    !forking && branchRow.Item?.memoryRoot?.BOOL ? "main" : branchId;
+  let rootEvent;
+  if (forking && forkEventId) {
+    try {
+      rootEvent = (await memory.send(new GetEventCommand({
+        memoryId: process.env.MEMORY, actorId,
+        sessionId: sourceMemorySessionId,
+        eventId: forkEventId }))).event;
+    } catch (error) {
+      if (error.name === "ResourceNotFoundException")
+        return rejectChat(response, "BRANCH_CONFLICT");
+      throw error;
+    }
+  }
+  let history;
+  if (forking && rootEvent) {
+    const sourceBranch = sourceBranchId === "main"
+      ? rootEvent.branch?.name || "main"
+      : sourceBranchRow.Item?.memoryRoot?.BOOL ? "main" : sourceBranchId;
+    let cursor;
+    const events = [];
+    do {
+      const page = await branchEvents(actorId, sourceMemorySessionId,
+        sourceBranch, cursor);
+      events.push(...page.events);
+      cursor = page.nextToken;
+    } while (cursor && !events.some((event) => event.eventId === forkEventId));
+    const rootIndex = events.findIndex((event) => event.eventId === forkEventId);
+    if (rootIndex < 0) return rejectChat(response, "BRANCH_CONFLICT");
+    history = { events: events.slice(rootIndex, rootIndex + 20) };
+  } else if (forking) history = { events: [] };
+  else history = await branchEvents(actorId, memorySessionId,
+    nativeBranchId, undefined, 20);
+  const observedHead = branchId === "main"
+    ? conversationRow.Item?.mainHeadEventId?.S || history.events[0]?.eventId || null
+    : branchRow.Item?.headEventId?.S || null;
+  if (!forking && input.expectedHeadEventId !== undefined &&
+    input.expectedHeadEventId !== observedHead)
+    return rejectChat(response, "BRANCH_CONFLICT");
   // ListEvents returns newest first. Only recent context goes to the model;
   // AgentCore Memory retains the full session independently of that window.
   const messages = (history.events || []).toReversed().flatMap((event) =>
@@ -1099,25 +1586,29 @@ async function chat(input, identity, response, workloadToken) {
   try {
     const result = await runModel(turnConfig, model, messages, emit, workloadToken,
       { sub: identity.sub, projectId, agentId, sessionId,
-        connectionIds: config.connectionIds || [] });
+        connectionIds: config.connectionIds || [], skills });
     const costMicroUsd = modelCost(result.usage, model);
     const occurredAt = new Date().toISOString();
-    const receipt = { version: 1, requestId, agentId, conversationId: sessionId,
+    const receipt = { version: 1, requestId, projectId, branchId,
+      agentId, conversationId: sessionId,
       modelId: turnModelId, occurredAt, usage: result.usage, costMicroUsd,
       rates: { inputRate: model.inputRate || 0, outputRate: model.outputRate || 0,
         cacheReadRate: model.cacheReadRate || 0, cacheWriteRate: model.cacheWriteRate || 0 },
       pricingQuality: model.pricingQuality || "unknown",
       toolCalls: result.toolCalls.map(({ name, occurredAt, latencyMs, isError }) =>
         ({ name, occurredAt, latencyMs, isError })) };
-    await memory.send(new CreateEventCommand({
+    const savedEvent = await memory.send(new CreateEventCommand({
       memoryId: process.env.MEMORY, actorId, sessionId: memorySessionId,
       eventTimestamp: new Date(), clientToken: requestId, extractionMode: "SKIP",
+      ...(nativeBranchId !== "main" && { branch: { name: nativeBranchId,
+        ...(forking && { rootEventId: forkEventId }) } }),
       payload: [
         { conversational: { role: "USER", content: { text: message } } },
         { conversational: { role: "ASSISTANT", content: { text: result.text } } },
         { json: { content: receipt } },
       ] })).catch((error) => { error.stage = "memory"; throw error; });
-    await db.send(new TransactWriteItemsCommand({ ClientRequestToken: requestId, TransactItems: [
+    try {
+      await db.send(new TransactWriteItemsCommand({ ClientRequestToken: requestId, TransactItems: [
       { Put: { TableName: process.env.TABLE,
         Item: { pk: S(`USER#${identity.sub}`), sk: S(`REQUEST#${requestId}`),
           expiresAt: N(Math.floor(Date.now() / 1000) + 30 * 86400) },
@@ -1126,7 +1617,8 @@ async function chat(input, identity, response, workloadToken) {
         Item: { pk: S(`USER#${identity.sub}`), sk: S(`USAGE#${occurredAt}#${requestId}`),
           gsi1pk: S("USAGE"), gsi1sk: S(`${occurredAt}#${identity.sub}#${requestId}`),
           occurredAt: S(occurredAt), userSub: S(identity.sub), requestId: S(requestId),
-          agentId: S(agentId), modelId: S(turnModelId), costMicroUsd: N(costMicroUsd),
+          projectId: S(projectId), branchId: S(branchId), agentId: S(agentId),
+          modelId: S(turnModelId), costMicroUsd: N(costMicroUsd),
           inputTokens: N(result.usage.inputTokens), outputTokens: N(result.usage.outputTokens),
           cacheReadInputTokens: N(result.usage.cacheReadInputTokens || 0),
           cacheWriteInputTokens: N(result.usage.cacheWriteInputTokens || 0),
@@ -1143,26 +1635,61 @@ async function chat(input, identity, response, workloadToken) {
         ExpressionAttributeValues: { ":cost": N(costMicroUsd), ":tools": N(result.toolCalls.length),
           ":one": N(1) } } },
       { Update: { TableName: process.env.TABLE,
-        Key: key(`PROJECT#${identity.sub}/main`, `CONVERSATION#${sessionId}`),
-        UpdateExpression: "SET id = :id, agentId = :agent, title = if_not_exists(title, :title), createdAt = if_not_exists(createdAt, :time), lastActivityAt = :time, gsi1pk = :index, gsi1sk = :sort, expiresAt = :expiry",
+        Key: key(projectKey(identity.sub, projectId), `CONVERSATION#${sessionId}`),
+        UpdateExpression: "SET id = :id, agentId = :agent, title = if_not_exists(title, :title), createdAt = if_not_exists(createdAt, :time), lastActivityAt = :time, gsi1pk = :index, gsi1sk = :sort, expiresAt = :expiry, activeBranchId = :branch" +
+          (branchId === "main" ? ", mainHeadEventId = :head" : ""),
+        ConditionExpression: branchId === "main"
+          ? `(attribute_not_exists(agentId) OR agentId = :agent) AND ${conversationRow.Item?.mainHeadEventId
+            ? "mainHeadEventId = :previous" : "attribute_not_exists(mainHeadEventId)"}`
+          : "agentId = :agent",
         ExpressionAttributeValues: {
           ":id": S(sessionId), ":agent": S(agentId),
+          ":branch": S(branchId),
+          ...(branchId === "main" && { ":head": S(savedEvent.event.eventId),
+            ...(conversationRow.Item?.mainHeadEventId && { ":previous": S(observedHead) }) }),
           ":title": S(message.trim().replace(/\s+/g, " ").slice(0, 80)),
-          ":time": S(occurredAt), ":index": S(`CONVERSATIONS#${identity.sub}/main`),
+          ":time": S(occurredAt), ":index": S(`CONVERSATIONS#${identity.sub}/${projectId}`),
           ":sort": S(`${occurredAt}#${sessionId}`),
           ":expiry": N(Math.floor(Date.now() / 1000) + 30 * 86400),
-        } } },
+      } } },
+      ...(branchId === "main" ? [] : forking ? [{ Put: { TableName: process.env.TABLE,
+        Item: { ...branchKey(identity.sub, projectId, sessionId, branchId),
+          id: S(branchId), name: S(`Alternative ${new Date().toISOString().slice(11, 19)}`),
+          rootEventId: forkEventId ? S(forkEventId) : { NULL: true },
+          ...(memorySessionId !== mainMemorySessionId && {
+            memorySessionId: S(memorySessionId) }),
+          ...(forkEventId === null && { memoryRoot: { BOOL: true } }),
+          headEventId: S(savedEvent.event.eventId), createdAt: S(occurredAt) },
+        ConditionExpression: "attribute_not_exists(pk)" } }] : [{ Update: {
+        TableName: process.env.TABLE,
+        Key: branchKey(identity.sub, projectId, sessionId, branchId),
+        UpdateExpression: "SET headEventId = :head",
+        ConditionExpression: "headEventId = :previous",
+        ExpressionAttributeValues: { ":head": S(savedEvent.event.eventId),
+          ":previous": S(observedHead) } } }]),
       ...result.toolCalls.map((tool, index) => ({ Put: { TableName: process.env.TABLE,
         Item: { pk: S(`USER#${identity.sub}`),
           sk: S(`USAGE#${tool.occurredAt}#${requestId}#TOOL#${index}`),
           gsi1pk: S("USAGE"), gsi1sk: S(`${tool.occurredAt}#${identity.sub}#${requestId}#TOOL#${index}`),
           occurredAt: S(tool.occurredAt), userSub: S(identity.sub), requestId: S(requestId),
-          agentId: S(agentId), name: S(tool.name), costMicroUsd: N(0),
+          projectId: S(projectId), branchId: S(branchId), agentId: S(agentId),
+          name: S(tool.name), costMicroUsd: N(0),
           latencyMs: N(tool.latencyMs), isError: { BOOL: tool.isError },
           quality: S("unpriced") },
         ConditionExpression: "attribute_not_exists(pk)" } })),
-    ] })).catch((error) => { error.stage = "ledger"; throw error; });
+      ] }));
+    } catch (error) {
+      error.stage = "ledger";
+      if (error.name === "TransactionCanceledException") {
+        await memory.send(new DeleteEventCommand({ memoryId: process.env.MEMORY,
+          actorId, sessionId: memorySessionId, eventId: savedEvent.event.eventId }))
+          .catch(() => console.error("Could not remove uncommitted Memory event"));
+        error.message = "Branch head changed";
+      }
+      throw error;
+    }
     emit({ type: "message.done", requestId, conversationId: sessionId,
+      branchId, eventId: savedEvent.event.eventId,
       usage: result.usage, costMicroUsd,
       unpricedToolCalls: result.toolCalls.length, latencyMs: Date.now() - started });
   } catch (error) {
@@ -1177,6 +1704,8 @@ async function chat(input, identity, response, workloadToken) {
           ? "The model could not form a valid tool call."
           : error.message === "Invalid tool request"
             ? "The model requested an unavailable tool."
+            : error.message === "Branch head changed"
+              ? "This conversation path changed. Reopen it before sending again."
             : "Agent turn failed";
     emit({ type: "error", message,
       ...(process.env.SCRIPTED_MODEL === "true" && {
@@ -1239,10 +1768,13 @@ createServer(async (request, response) => {
     // AgentCore masks non-2xx Runtime responses as generic 424 errors.
     // Application failures use a stable JSON envelope over HTTP 200.
     respond(response, 200, result.data);
-  } catch {
-    respond(response, 500, {
+  } catch (error) {
+    console.error("Control failed", error.name, error.$metadata?.httpStatusCode || "");
+    respond(response, 200, {
       ok: false,
-      error: { code: "INTERNAL", message: "Operation failed" },
+      error: { code: "INTERNAL", message: "Operation failed",
+        ...(process.env.SCRIPTED_MODEL === "true" && {
+          diagnostic: error.name, detail: error.message?.slice(0, 300) }) },
     });
   }
 }).listen(Number(process.env.PORT || 8080), "0.0.0.0");

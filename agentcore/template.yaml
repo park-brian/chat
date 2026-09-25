@@ -164,6 +164,17 @@ Resources:
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
       VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUnfinishedUploads
+            Prefix: pending/
+            Status: Enabled
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
+          - Id: RemoveOldUserObjectVersions
+            Prefix: users/
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
       CorsConfiguration:
         CorsRules:
           - AllowedMethods: [GET, PUT, POST, HEAD]
@@ -285,7 +296,7 @@ Resources:
                 Action: [dynamodb:Query]
                 Resource: !Sub '${Data.Arn}/index/UsageByTime'
               - Effect: Allow
-                Action: [bedrock-agentcore:CreateEvent, bedrock-agentcore:ListEvents]
+                Action: [bedrock-agentcore:CreateEvent, bedrock-agentcore:GetEvent, bedrock-agentcore:ListEvents, bedrock-agentcore:DeleteEvent]
                 Resource: !Ref Memory
               - !If
                 - HasGemini
@@ -335,6 +346,11 @@ Resources:
                 Action: [s3:GetObject]
                 Resource: !Sub '${SharedObjects.Arn}/controller/*'
               - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:DeleteObject, s3:DeleteObjectVersion]
+                Resource:
+                  - !Sub '${SharedObjects.Arn}/pending/*'
+                  - !Sub '${SharedObjects.Arn}/users/*'
+              - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:DescribeLogGroups, logs:DescribeLogStreams, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
 
@@ -368,6 +384,7 @@ Resources:
         ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
         BUDGET: !Ref DefaultDailyBudgetMicroUsd
         STORAGE: !Ref DefaultStorageBytes
+        BUCKET: !Ref SharedObjects
         MEMORY: !GetAtt Memory.MemoryId
         SCRIPTED_MODEL: !Ref EnableScriptedModel
         GEMINI_PROVIDER: !If [HasGemini, !Sub '${ResourcePrefix}-gemini', '']
