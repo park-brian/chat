@@ -186,6 +186,13 @@ Production `agentcore-chat-prod` was updated via a reviewed change set to
 `controller/2355030ebfd386cd2270.zip`; only `ControllerRole` policies and
 the `Controller` artifact changed, both without replacement. The NoEcho
 Gemini parameter and all other stack parameters used `UsePreviousValue`.
+Commit `0afa9c7` reached GitHub Pages with the new **Save outputs** control;
+published-origin Cognito login passed on desktop and mobile, and a real
+Gemini 3.8 Flash text turn completed in 3.6 seconds. The disposable dev
+stack was deleted after testing. Its tagged retained bucket contained only
+the two known controller ZIP versions; both exact versions and then the empty
+bucket were removed. Production resources and user data were not used for
+this cleanup.
 
 Run `npm test` for fast protocol/buildless checks. `npm run test:roadmap --
 <disposable-stack> --profile eaap --region us-east-1` uses real Cognito,
