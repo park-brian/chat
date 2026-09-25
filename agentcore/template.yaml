@@ -30,6 +30,10 @@ Parameters:
     Type: Number
     Default: 5000000000
     MinValue: 0
+  BootstrapAdministratorEmail:
+    Type: String
+    Default: ''
+    Description: Optional designated administrator whose Cognito subject is protected from role/status changes.
   ControllerCodeKey:
     Type: String
     Default: ''
@@ -188,7 +192,7 @@ Resources:
     Type: AWS::BedrockAgentCore::Memory
     Properties:
       Name: !Sub '${ResourcePrefix}_memory'
-      EventExpiryDuration: 30
+      EventExpiryDuration: 365
       Description: Shared short-term conversational memory; actor is Cognito sub/project.
       Tags:
         app: agentcore-chat
@@ -290,7 +294,7 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query, dynamodb:TransactWriteItems, dynamodb:UpdateItem]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:TransactWriteItems, dynamodb:UpdateItem]
                 Resource: !GetAtt Data.Arn
               - Effect: Allow
                 Action: [dynamodb:Query]
@@ -340,7 +344,7 @@ Resources:
                   - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
                   - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:application-inference-profile/*'
               - Effect: Allow
-                Action: [cognito-idp:AdminGetUser, cognito-idp:AdminCreateUser, cognito-idp:AdminAddUserToGroup, cognito-idp:ListUsers]
+                Action: [cognito-idp:AdminGetUser, cognito-idp:AdminCreateUser, cognito-idp:AdminAddUserToGroup, cognito-idp:AdminRemoveUserFromGroup, cognito-idp:AdminListGroupsForUser, cognito-idp:AdminEnableUser, cognito-idp:AdminDisableUser, cognito-idp:ListUsers]
                 Resource: !GetAtt UserPool.Arn
               - Effect: Allow
                 Action: [s3:GetObject]
@@ -380,6 +384,7 @@ Resources:
       EnvironmentVariables:
         TABLE: !Ref Data
         POOL: !Ref UserPool
+        BOOTSTRAP_ADMIN_EMAIL: !Ref BootstrapAdministratorEmail
         CLIENT: !Ref Client
         ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
         BUDGET: !Ref DefaultDailyBudgetMicroUsd

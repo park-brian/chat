@@ -7,7 +7,7 @@ import { SignatureV4 } from "@smithy/signature-v4";
 import { Hash } from "@smithy/hash-node";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { S3Client, CopyObjectCommand, DeleteObjectCommand,
-  GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+  GetObjectCommand, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { BedrockRuntimeClient, ConverseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
@@ -21,10 +21,14 @@ import {
   AdminGetUserCommand,
   AdminCreateUserCommand,
   AdminAddUserToGroupCommand,
+  AdminRemoveUserFromGroupCommand,
+  AdminListGroupsForUserCommand,
+  AdminEnableUserCommand,
+  AdminDisableUserCommand,
   ListUsersCommand,
 } from "@aws-sdk/client-cognito-identity-provider";
 import {
-  DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand,
+  DynamoDBClient, DeleteItemCommand, GetItemCommand, PutItemCommand, QueryCommand,
   TransactWriteItemsCommand, UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb";
 import {
@@ -89,6 +93,44 @@ function caller(authorization) {
   )
     return null;
   return { sub: claims.sub, role: groups[0] };
+}
+
+async function currentIdentity(identity) {
+  try {
+    const [user, groups] = await Promise.all([
+    idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL,
+      Username: identity.sub })),
+    idp.send(new AdminListGroupsForUserCommand({ UserPoolId: process.env.POOL,
+      Username: identity.sub, Limit: 10 })),
+    ]);
+    const names = (groups.Groups || []).map((group) => group.GroupName);
+    return user.Enabled && names.length === 1 && names[0] === identity.role;
+  } catch (error) {
+    if (error.name === "UserNotFoundException") return false;
+    throw error;
+  }
+}
+
+async function protectedAdministrator(sub) {
+  const existing = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+    Key: key("ACCOUNT#CONTROL", "OWNER"), ConsistentRead: true }));
+  if (existing.Item?.ownerSub?.S) return existing.Item.ownerSub.S;
+  const configured = process.env.BOOTSTRAP_ADMIN_EMAIL?.trim().toLowerCase();
+  let owner = sub;
+  if (configured) {
+    const users = await idp.send(new ListUsersCommand({ UserPoolId: process.env.POOL,
+      Filter: `email = "${configured.replaceAll('"', "")}"`, Limit: 10 }));
+    owner = users.Users?.find((user) => user.Attributes?.some((attribute) =>
+      attribute.Name === "email" && attribute.Value?.toLowerCase() === configured))
+      ?.Attributes?.find((attribute) => attribute.Name === "sub")?.Value;
+    if (!owner) return null;
+  }
+  const row = await db.send(new UpdateItemCommand({
+    TableName: process.env.TABLE, Key: key("ACCOUNT#CONTROL", "OWNER"),
+    UpdateExpression: "SET ownerSub = if_not_exists(ownerSub, :sub)",
+    ExpressionAttributeValues: { ":sub": S(owner) }, ReturnValues: "ALL_NEW",
+  }));
+  return row.Attributes.ownerSub.S;
 }
 
 async function defaults() {
@@ -231,7 +273,9 @@ function effectiveLimits(row, limits) {
   };
   return { budgetMicroUsd: choose("budgetMicroUsd", "budgetOverrideMicroUsd",
       "baselineBudgetMicroUsd"),
-    storageBytes: choose("storageBytes", "storageOverrideBytes", "baselineStorageBytes") };
+    storageBytes: choose("storageBytes", "storageOverrideBytes", "baselineStorageBytes"),
+    period: row?.periodOverride?.S || limits.period,
+    budgetEpoch: Number(row?.budgetEpoch?.N || 0) };
 }
 
 async function approvedModel(modelId) {
@@ -251,12 +295,13 @@ const modelCatalog = () => [
       (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER)) })),
 ];
 
-async function listAgents(identity, projectId = "main") {
+async function listAgents(identity, projectId = "main", includeArchived = true) {
   const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
     KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
     ExpressionAttributeValues: { ":pk": S(projectKey(identity.sub, projectId)), ":prefix": S("AGENT#") },
     Limit: 100 }));
-  return (page.Items || []).map(unpack).map(({ pk, sk, ...agent }) => agent);
+  return (page.Items || []).map(unpack).map(({ pk, sk, ...agent }) => agent)
+    .filter((agent) => includeArchived || !agent.archived);
 }
 
 const uuidPattern = /^[0-9a-f-]{36}$/i;
@@ -309,8 +354,8 @@ async function listConversations(identity, projectId, cursor) {
     ExclusiveStartKey: start, Limit: 30, ScanIndexForward: false,
   }));
   return { status: 200, data: { ok: true, data: {
-    items: (page.Items || []).map(unpack).filter((row) => row.expiresAt > Date.now() / 1000)
-      .map(conversationPublic),
+    items: (page.Items || []).map(unpack).filter((item) =>
+      item.status !== "DELETING").map(conversationPublic),
     nextCursor: page.LastEvaluatedKey
       ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null,
   } } };
@@ -323,6 +368,41 @@ const conversationPublic = ({ id, agentId, title, createdAt, lastActivityAt,
 const eventPattern = /^[0-9]+#[a-f0-9]+$/i;
 const branchKey = (sub, projectId, conversationId, branchId) =>
   key(projectKey(sub, projectId), `BRANCH#${conversationId}#${branchId}`);
+const archiveKey = (sub, projectId, conversationId, eventId) =>
+  key(projectKey(sub, projectId), `ARCHIVE#${conversationId}#${eventId}`);
+const archiveObjectKey = (sub, projectId, conversationId, requestId) =>
+  `users/${sub}/${projectId}/chats/${conversationId}/${requestId}.json`;
+
+async function archivePath(identity, projectId, conversationId, headEventId, limit = 50) {
+  const records = [];
+  let cursor = headEventId;
+  while (cursor && records.length < limit) {
+    const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: archiveKey(identity.sub, projectId, conversationId, cursor),
+      ConsistentRead: true }));
+    if (!row.Item) return { events: await archiveEvents(records), nextCursor: null,
+      incomplete: true };
+    const record = unpack(row.Item);
+    records.push(record);
+    cursor = record.parentEventId || null;
+  }
+  return { events: await archiveEvents(records), nextCursor: cursor,
+    incomplete: false };
+}
+
+async function archiveEvents(records) {
+  return Promise.all(records.map(async (record) => {
+    const result = await s3.send(new GetObjectCommand({
+      Bucket: process.env.BUCKET, Key: record.objectKey,
+      ...(record.versionId && { VersionId: record.versionId }) }));
+    const data = JSON.parse(await result.Body.transformToString());
+    return { eventId: record.eventId, payload: [
+      { conversational: { role: "USER", content: { text: data.message } } },
+      { conversational: { role: "ASSISTANT", content: { text: data.answer } } },
+      { json: { content: data.receipt } },
+    ] };
+  }));
+}
 
 async function branchCatalog(identity, projectId, conversationId, conversation) {
   const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
@@ -576,7 +656,35 @@ async function invoke(body, identity) {
     const projectId = projectIdOf(body.input);
     if (!projectPattern.test(projectId)) return invalid();
     if (!await project(identity, projectId)) return missing();
-    return { status: 200, data: { ok: true, data: { items: await listAgents(identity, projectId) } } };
+    if (body.input.includeArchived !== undefined &&
+      typeof body.input.includeArchived !== "boolean") return invalid();
+    return { status: 200, data: { ok: true, data: { items: await listAgents(
+      identity, projectId, body.input.includeArchived ?? true) } } };
+  }
+  if (body.command === "agents.setArchived") {
+    if (identity.role === "Auditors") return { status: 403, data: {
+      ok: false, error: { code: "FORBIDDEN" } } };
+    const { id, revision, archived } = body.input;
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId) || !uuidPattern.test(id || "") ||
+      !Number.isSafeInteger(revision) || revision < 0 ||
+      typeof archived !== "boolean") return invalid();
+    if (!await project(identity, projectId)) return missing();
+    try {
+      const updated = await db.send(new UpdateItemCommand({
+        TableName: process.env.TABLE,
+        Key: key(projectKey(identity.sub, projectId), `AGENT#${id}`),
+        UpdateExpression: "SET archived = :archived, revision = :next",
+        ConditionExpression: "attribute_exists(pk) AND revision = :revision",
+        ExpressionAttributeValues: { ":archived": { BOOL: archived },
+          ":next": N(revision + 1), ":revision": N(revision) },
+        ReturnValues: "ALL_NEW" }));
+      return { status: 200, data: { ok: true, data: unpack(updated.Attributes) } };
+    } catch (error) {
+      if (error.name === "ConditionalCheckFailedException")
+        return { status: 409, data: { ok: false, error: { code: "REVISION_CONFLICT" } } };
+      throw error;
+    }
   }
   if (body.command === "connections.list") {
     const projectId = projectIdOf(body.input);
@@ -585,6 +693,51 @@ async function invoke(body, identity) {
     const state = await credentials(identity);
     return { status: 200, data: { ok: true, data: {
       items: Object.values(state.items).map(publicConnection) } } };
+  }
+  if (body.command === "connections.test") {
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId) || !uuidPattern.test(body.input.id || ""))
+      return invalid();
+    if (!await project(identity, projectId)) return missing();
+    if (identity.role === "Auditors")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    const connection = (await credentials(identity)).items[body.input.id];
+    if (!connection) return missing();
+    const jira = connection.kind === "jira";
+    const host = jira ? new URL(connection.jiraUrl) : null;
+    // Never turn a user-supplied Jira URL into an authenticated SSRF probe.
+    if (jira && (host.protocol !== "https:" || host.port ||
+      !/^[a-z0-9-]+\.atlassian\.net$/i.test(host.hostname)))
+      return { status: 400, data: { ok: false,
+        error: { code: "CONNECTION_TEST_UNAVAILABLE" } } };
+    const url = jira ? new URL("/rest/api/3/myself", host).href :
+      "https://api.github.com/user";
+    let checked;
+    try {
+      const result = await fetch(url, { method: "GET", redirect: "manual",
+        signal: AbortSignal.timeout(8000), headers: {
+          Accept: "application/json",
+          Authorization: jira ? "Basic " + Buffer.from(
+            connection.jiraEmail + ":" + connection.apiKey).toString("base64") :
+            "Bearer " + connection.apiKey,
+          ...(!jira && { "User-Agent": "agentcore-chat-connection-check" }),
+        } });
+      const connected = result.status === 200;
+      let account = null;
+      if (connected) {
+        const length = Number(result.headers.get("content-length") || 0);
+        if (length > 16384) throw Error("Connection response too large");
+        const raw = await result.text();
+        if (raw.length > 16384) throw Error("Connection response too large");
+        const data = JSON.parse(raw);
+        const label = jira ? data.displayName : data.login;
+        if (typeof label === "string") account = label.slice(0, 120);
+      } else await result.body?.cancel();
+      checked = { connected, account, httpStatus: result.status };
+    } catch {
+      checked = { connected: false, account: null, httpStatus: null };
+    }
+    return { status: 200, data: { ok: true, data: checked } };
   }
   if (["connections.put", "connections.rotate", "connections.delete"].includes(body.command)) {
     if (identity.role === "Auditors")
@@ -676,21 +829,140 @@ async function invoke(body, identity) {
       Key: key(projectKey(identity.sub, projectId), `CONVERSATION#${conversationId}`),
       ConsistentRead: true }));
     if (!row.Item || row.Item.agentId?.S !== agentId ||
-      Number(row.Item.expiresAt?.N || 0) <= Date.now() / 1000)
+      row.Item.status?.S === "DELETING")
       return { status: 404, data: { ok: false, error: { code: "NOT_FOUND" } } };
     const conversation = unpack(row.Item);
     const branches = await branchCatalog(identity, projectId, conversationId, conversation);
     if (!branches.some((branch) => branch.id === branchId)) return missing();
     const selected = branches.find((branch) => branch.id === branchId);
-    const page = await branchEvents(`${identity.sub}/${projectId}`,
-      selected.memorySessionId || `a_${agentId}_${conversationId}`,
-      selected.memoryRoot ? "main" : selected.id, cursor);
+    if (conversation.durable && cursor && !eventPattern.test(cursor)) return invalid();
+    const page = conversation.durable
+      ? await archivePath(identity, projectId, conversationId,
+        cursor || selected.headEventId, 50)
+      : await branchEvents(`${identity.sub}/${projectId}`,
+        selected.memorySessionId || conversation.mainMemorySessionId ||
+          `a_${agentId}_${conversationId}`,
+        selected.memoryRoot ? "main" : selected.id, cursor);
     return { status: 200, data: { ok: true, data: {
       conversation: conversationPublic(conversation), branchId,
       branches: branches.map(({ memorySessionId, memoryRoot, ...branch }) => branch),
       messages: eventMessages(page.events),
-      nextCursor: page.nextToken || null,
+      historyExpired: !conversation.durable && !page.events.length,
+      archiveIncomplete: Boolean(page.incomplete),
+      nextCursor: page.nextCursor || page.nextToken || null,
     } } };
+  }
+  if (body.command === "conversations.delete") {
+    if (identity.role === "Auditors")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    const { conversationId, agentId } = body.input;
+    const projectId = projectIdOf(body.input);
+    if (!projectPattern.test(projectId) || !uuidPattern.test(conversationId || "") ||
+      (agentId !== undefined && !uuidPattern.test(agentId))) return invalid();
+    if (!await project(identity, projectId)) return missing();
+    const conversationKey = key(projectKey(identity.sub, projectId),
+      `CONVERSATION#${conversationId}`);
+    const read = () => db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: conversationKey, ConsistentRead: true }));
+    const row = await read();
+    if (!row.Item) return { status: 200, data: { ok: true,
+      data: { deleted: true } } };
+    if (agentId && row.Item.agentId?.S !== agentId) return missing();
+    if (row.Item.status?.S !== "DELETING") {
+      try {
+        await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
+          Key: conversationKey,
+          UpdateExpression: "SET #status = :deleting REMOVE gsi1pk, gsi1sk",
+          ConditionExpression: "attribute_exists(pk) AND (attribute_not_exists(#status) OR #status = :active)",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: { ":deleting": S("DELETING"),
+            ":active": S("ACTIVE") } }));
+      } catch (error) {
+        if (error.name !== "ConditionalCheckFailedException") throw error;
+        const current = await read();
+        if (!current.Item) return { status: 200, data: { ok: true,
+          data: { deleted: true } } };
+        if (current.Item.status?.S !== "DELETING") throw error;
+      }
+    }
+    const archives = await db.send(new QueryCommand({ TableName: process.env.TABLE,
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+      ExpressionAttributeValues: { ":pk": S(projectKey(identity.sub, projectId)),
+        ":prefix": S(`ARCHIVE#${conversationId}#`) },
+      ConsistentRead: true, Limit: 100 }));
+    for (const item of archives.Items || []) {
+      if (!item.versionId?.S) throw Error("Archive version is missing");
+      await s3.send(new DeleteObjectCommand({ Bucket: process.env.BUCKET,
+        Key: item.objectKey.S, VersionId: item.versionId.S }));
+      try {
+        await db.send(new TransactWriteItemsCommand({ ClientRequestToken: uuid(),
+          TransactItems: [
+            { Delete: { TableName: process.env.TABLE,
+              Key: { pk: item.pk, sk: item.sk },
+              ConditionExpression: "versionId = :version",
+              ExpressionAttributeValues: { ":version": item.versionId } } },
+            { Update: { TableName: process.env.TABLE,
+              Key: key(`USER#${identity.sub}`, "CONTROL"),
+              UpdateExpression: "ADD storageUsedBytes :bytes",
+              ExpressionAttributeValues: { ":bytes": N(-Number(item.sizeBytes.N)) } } },
+          ] }));
+      } catch (error) {
+        if (error.name !== "TransactionCanceledException") throw error;
+        const latest = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+          Key: { pk: item.pk, sk: item.sk }, ConsistentRead: true }));
+        if (latest.Item) throw error;
+      }
+    }
+    if (archives.LastEvaluatedKey || archives.Items?.length === 100)
+      return { status: 200, data: { ok: true, data: { deleting: true } } };
+    const sessions = new Set([row.Item.mainMemorySessionId?.S ||
+      `a_${row.Item.agentId.S}_${conversationId}`,
+      ...(row.Item.memorySessions?.SS || [])]);
+    const branches = await db.send(new QueryCommand({ TableName: process.env.TABLE,
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+      ExpressionAttributeValues: { ":pk": S(projectKey(identity.sub, projectId)),
+        ":prefix": S(`BRANCH#${conversationId}#`) },
+      ConsistentRead: true, Limit: 100 }));
+    for (const branch of branches.Items || [])
+      if (branch.memorySessionId?.S) sessions.add(branch.memorySessionId.S);
+    let removed = 0;
+    for (const sessionId of sessions) {
+      let page;
+      try {
+        page = await memory.send(new ListEventsCommand({ memoryId: process.env.MEMORY,
+          actorId: `${identity.sub}/${projectId}`, sessionId,
+          maxResults: 100, includePayloads: false }));
+      } catch (error) {
+        if (error.name === "ResourceNotFoundException") continue;
+        throw error;
+      }
+      for (const event of page.events || []) {
+        await memory.send(new DeleteEventCommand({ memoryId: process.env.MEMORY,
+          actorId: `${identity.sub}/${projectId}`, sessionId,
+          eventId: event.eventId })).catch((error) => {
+          if (error.name !== "ResourceNotFoundException") throw error;
+        });
+        if (++removed === 100)
+          return { status: 200, data: { ok: true,
+            data: { deleting: true } } };
+      }
+      if (page.nextToken)
+        return { status: 200, data: { ok: true,
+          data: { deleting: true } } };
+    }
+    for (const branch of branches.Items || [])
+      await db.send(new DeleteItemCommand({ TableName: process.env.TABLE,
+        Key: { pk: branch.pk, sk: branch.sk } }));
+    if (branches.LastEvaluatedKey || branches.Items?.length === 100)
+      return { status: 200, data: { ok: true, data: { deleting: true } } };
+    await db.send(new DeleteItemCommand({ TableName: process.env.TABLE,
+      Key: conversationKey, ConditionExpression: "#status = :deleting",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: { ":deleting": S("DELETING") } }))
+      .catch((error) => {
+        if (error.name !== "ConditionalCheckFailedException") throw error;
+      });
+    return { status: 200, data: { ok: true, data: { deleted: true } } };
   }
   if (body.command === "agents.put") {
     if (identity.role === "Auditors")
@@ -753,6 +1025,8 @@ async function invoke(body, identity) {
         Key: key(projectKey(identity.sub, projectId), `AGENT#${id}`), ConsistentRead: true }));
       if (!current.Item)
         return { status: 404, data: { ok: false, error: { code: "NOT_FOUND" } } };
+      if (current.Item.archived?.BOOL)
+        return { status: 409, data: { ok: false, error: { code: "AGENT_ARCHIVED" } } };
       if (Number(current.Item.revision?.N || 0) !== revision)
         return { status: 409, data: { ok: false, error: { code: "REVISION_CONFLICT" } } };
       createdAt = current.Item.createdAt.S;
@@ -789,22 +1063,175 @@ async function invoke(body, identity) {
     return { status: 200, data: { ok: true, data: agent } };
   }
   if (body.command === "usage.get") {
+    if (body.input.requestId)
+      return invoke({ v: 1, command: "usage.request", input: body.input }, identity);
     // Compose two independent, authorized reads inside one Runtime invocation.
-    const [summary, detail] = await Promise.all([
-      invoke({ v: 1, command: "usage.summary", input: {} }, identity),
+    const [summary, detail, daily] = await Promise.all([
+      invoke({ v: 1, command: "usage.summary", input: {
+        userSub: body.input.userSub } }, identity),
       invoke({ v: 1, command: "usage.list", input: body.input }, identity),
+      body.input.includeDaily ? invoke({ v: 1, command: "usage.daily", input: {
+        range: body.input.range, scope: body.input.scope,
+        userSub: body.input.userSub } }, identity) : null,
     ]);
     if (summary.status !== 200) return summary;
     if (detail.status !== 200) return detail;
+    if (daily && daily.status !== 200) return daily;
     return { status: 200, data: { ok: true,
-      data: { ...summary.data.data, ...detail.data.data } } };
+      data: { ...summary.data.data, ...detail.data.data,
+        ...(daily && { daily: daily.data.data }) } } };
+  }
+  if (body.command === "usage.daily") {
+    const { range = "30d", scope = "self", cursor } = body.input;
+    const target = body.input.userSub || identity.sub;
+    if (!["30d", "90d"].includes(range) || !["self", "all"].includes(scope) ||
+      !/^[0-9a-f-]{36}$/i.test(target)) return invalid();
+    if ((scope === "all" || target !== identity.sub) &&
+      identity.role !== "Administrators")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    const since = new Date(Date.now() - (range === "90d" ? 89 : 29) * 86400000)
+      .toISOString().slice(0, 10);
+    let start;
+    if (cursor) {
+      try {
+        if (typeof cursor !== "string" || cursor.length > 4000) throw Error();
+        const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString());
+        if (decoded.range !== range || decoded.scope !== scope ||
+          decoded.target !== target || decoded.since !== since) throw Error();
+        start = decoded.key;
+        if (!start?.sk?.S?.startsWith("DAY#") ||
+          (scope === "self" && start.pk?.S !== `USER#${target}`) ||
+          (scope === "all" && start.gsi1pk?.S !== "USAGE_DAYS")) throw Error();
+      } catch { return invalid(); }
+    }
+    const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
+      ...(scope === "all" && { IndexName: "UsageByTime" }),
+      KeyConditionExpression: scope === "all"
+        ? "gsi1pk = :pk AND gsi1sk BETWEEN :from AND :to"
+        : "pk = :pk AND sk BETWEEN :from AND :to",
+      ExpressionAttributeValues: {
+        ":pk": S(scope === "all" ? "USAGE_DAYS" : `USER#${target}`),
+        ":from": S(scope === "all" ? since : `DAY#${since}`),
+        ":to": S(scope === "all" ? "￿" : "DAY#9999-12-31"),
+      },
+      ExclusiveStartKey: start, Limit: 100,
+      ...(scope === "self" && { ConsistentRead: true }) }));
+    return { status: 200, data: { ok: true, data: {
+      items: (page.Items || []).map(unpack),
+      nextCursor: page.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify({ key: page.LastEvaluatedKey,
+          range, scope, target, since })).toString("base64url") : null } } };
+  }
+  if (body.command === "usage.request") {
+    const target = body.input.userSub || identity.sub;
+    const requestId = body.input.requestId;
+    if (!/^[0-9a-f-]{36}$/i.test(target) ||
+      !/^[0-9a-f-]{36}$/i.test(requestId || "")) return invalid();
+    if (target !== identity.sub && identity.role !== "Administrators")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: key(`USER#${target}`, `REQUEST#${requestId}`),
+      ConsistentRead: true }));
+    if (!row.Item) return missing();
+    const { pendingCommitJson, meterKeys, ...request } = unpack(row.Item);
+    const steps = await Promise.all((meterKeys || []).map(async (sk) => {
+      const item = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+        Key: key(`USER#${target}`, sk), ConsistentRead: true }));
+      return item.Item ? unpack(item.Item) : null;
+    }));
+    return { status: 200, data: { ok: true, data: {
+      request, steps: steps.filter(Boolean) } } };
+  }
+  if (body.command === "usage.reconcile") {
+    const target = body.input.userSub || identity.sub;
+    const requestId = body.input.requestId;
+    if (!/^[0-9a-f-]{36}$/i.test(target) ||
+      !/^[0-9a-f-]{36}$/i.test(requestId || "")) return invalid();
+    if (target !== identity.sub && identity.role !== "Administrators")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    const requestKey = key(`USER#${target}`, `REQUEST#${requestId}`);
+    const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: requestKey, ConsistentRead: true }));
+    if (!row.Item) return missing();
+    const state = unpack(row.Item);
+    if (state.status === "completed")
+      return { status: 200, data: { ok: true, data: {
+        status: "completed", costMicroUsd: state.costMicroUsd } } };
+    if (state.pendingCommitJson && state.eventId &&
+      ["memory_written", "navigation_failed"].includes(state.status)) {
+      const items = JSON.parse(state.pendingCommitJson);
+      if (!Array.isArray(items) || items.length > 6 || items.some((item) => {
+        const operation = item.Put || item.Update;
+        const itemKey = operation?.Key || operation?.Item;
+        return operation?.TableName !== process.env.TABLE ||
+          !(itemKey?.pk?.S === `USER#${target}` ||
+            itemKey?.pk?.S?.startsWith(`PROJECT#${target}/`));
+      })) throw Error("Invalid prepared completion");
+      const archived = items.find((item) =>
+        item.Put?.Item?.sk?.S?.startsWith("ARCHIVE#"))?.Put.Item;
+      if (archived) {
+        try {
+          const head = await s3.send(new HeadObjectCommand({
+            Bucket: process.env.BUCKET, Key: archived.objectKey.S,
+            ...(archived.versionId?.S && { VersionId: archived.versionId.S }) }));
+          if (head.ContentLength !== Number(archived.sizeBytes.N))
+            return { status: 409, data: { ok: false,
+              error: { code: "ARCHIVE_MISMATCH" } } };
+        } catch (error) {
+          if (error.$metadata?.httpStatusCode === 404)
+            return { status: 409, data: { ok: false,
+              error: { code: "ARCHIVE_MISSING" } } };
+          throw error;
+        }
+      }
+      try {
+        await db.send(new TransactWriteItemsCommand({
+          ClientRequestToken: requestId, TransactItems: items }));
+      } catch (error) {
+        if (error.name !== "TransactionCanceledException") throw error;
+        const latest = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+          Key: requestKey, ConsistentRead: true }));
+        if (latest.Item?.status?.S !== "completed")
+          return { status: 409, data: { ok: false,
+            error: { code: "RECONCILE_CONFLICT" } } };
+      }
+      return { status: 200, data: { ok: true, data: {
+        status: "completed", costMicroUsd: state.costMicroUsd } } };
+    }
+    if (state.status === "running" &&
+      Date.parse(state.acceptedAt) < Date.now() - 3600000) {
+      await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
+        Key: requestKey,
+        UpdateExpression: "SET #status = :unknown, failureStage = :stage",
+        ConditionExpression: "#status = :running AND acceptedAt < :cutoff",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: { ":unknown": S("outcome_unknown"),
+          ":stage": S("stale_request"), ":running": S("running"),
+          ":cutoff": S(new Date(Date.now() - 3600000).toISOString()) } }))
+        .catch((error) => {
+          if (error.name !== "ConditionalCheckFailedException") throw error;
+        });
+      return { status: 200, data: { ok: true, data: {
+        status: "outcome_unknown", costMicroUsd: state.costMicroUsd } } };
+    }
+    return { status: 200, data: { ok: true, data: {
+      status: state.status, costMicroUsd: state.costMicroUsd,
+      quality: "unresolved" } } };
   }
   if (body.command === "usage.summary") {
-    const limits = await defaults();
-    const period = periodKey(limits.period);
+    const target = body.input.userSub || identity.sub;
+    if (!/^[0-9a-f-]{36}$/i.test(target)) return invalid();
+    if (target !== identity.sub && identity.role !== "Administrators")
+      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
+    const [limits, user] = await Promise.all([defaults(),
+      db.send(new GetItemCommand({ TableName: process.env.TABLE,
+        Key: key(`USER#${target}`, "CONTROL"), ConsistentRead: true }))]);
+    const effective = effectiveLimits(user.Item, limits);
+    const period = periodKey(effective.period, new Date(), effective.budgetEpoch);
     const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
-      Key: key(`USER#${identity.sub}`, period), ConsistentRead: true }));
-    return { status: 200, data: { ok: true, data: { period,
+      Key: key(`USER#${target}`, period), ConsistentRead: true }));
+    return { status: 200, data: { ok: true, data: { period, userSub: target,
+      budgetMicroUsd: effective.budgetMicroUsd,
       costMicroUsd: Number(row.Item?.costMicroUsd?.N || 0),
       unpricedToolCalls: Number(row.Item?.unpricedToolCalls?.N || 0),
       quality: Number(row.Item?.unpricedToolCalls?.N || 0) ? "partial" :
@@ -812,22 +1239,54 @@ async function invoke(body, identity) {
   }
   if (body.command === "usage.list") {
     const { range = "30d", sort = "desc", scope = "self", cursor,
-      projectId: usageProjectId } = body.input;
+      projectId: usageProjectId, agentId, requestId, tool, kind, quality,
+      status, from, to } = body.input;
     const target = body.input.userSub || identity.sub;
     if ((usageProjectId !== undefined && !projectPattern.test(usageProjectId)) ||
       !["30d", "90d"].includes(range) || !["asc", "desc"].includes(sort) ||
-      !["self", "all"].includes(scope) || (scope === "all" && identity.role !== "Administrators"))
+      !["self", "all"].includes(scope) || (scope === "all" && identity.role !== "Administrators") ||
+      (agentId !== undefined && !uuidPattern.test(agentId)) ||
+      (requestId !== undefined && !uuidPattern.test(requestId)) ||
+      (tool !== undefined && (!/^[a-z_]{1,80}$/.test(tool))) ||
+      (kind !== undefined && !["model", "tool"].includes(kind)) ||
+      (quality !== undefined && !["estimated", "unpriced", "unknown"].includes(quality)) ||
+      (status !== undefined && !["running", "completed", "memory_failed",
+        "navigation_failed", "outcome_unknown"].includes(status)) ||
+      ((from === undefined) !== (to === undefined)) ||
+      (from !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(from) ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(to))))
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
     if (target !== identity.sub && identity.role !== "Administrators")
       return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
     if (!/^[0-9a-f-]{36}$/i.test(target))
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
-    const since = new Date(Date.now() - (range === "90d" ? 90 : 30) * 86400000).toISOString();
+    const filterKey = createHash("sha256").update(JSON.stringify({
+      range, sort, scope, target, usageProjectId, agentId, requestId,
+      tool, kind, quality, status, from, to })).digest("hex").slice(0, 20);
+    if (from && (!Number.isFinite(Date.parse(from + "T00:00:00.000Z")) ||
+      !Number.isFinite(Date.parse(to + "T23:59:59.999Z")))) return invalid();
+    let since = from ? new Date(from + "T00:00:00.000Z").toISOString() :
+      new Date(Date.now() - (range === "90d" ? 90 : 30) * 86400000).toISOString();
+    let until = to ? new Date(to + "T23:59:59.999Z").toISOString() :
+      new Date().toISOString();
+    if (!Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until)) ||
+      Date.parse(until) < Date.parse(since) ||
+      Date.parse(until) - Date.parse(since) > 91 * 86400000 ||
+      Date.parse(until) > Date.now() + 86400000) return invalid();
     let start;
     if (cursor) {
       try {
-        if (typeof cursor !== "string" || cursor.length > 2000) throw Error();
-        start = JSON.parse(Buffer.from(cursor, "base64url").toString());
+        if (typeof cursor !== "string" || cursor.length > 4000) throw Error();
+        const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString());
+        if (decoded.filterKey !== filterKey ||
+          typeof decoded.since !== "string" || typeof decoded.until !== "string" ||
+          !Number.isFinite(Date.parse(decoded.since)) ||
+          !Number.isFinite(Date.parse(decoded.until)) ||
+          Date.parse(decoded.until) < Date.parse(decoded.since) ||
+          Date.parse(decoded.until) - Date.parse(decoded.since) > 91 * 86400000)
+          throw Error();
+        ({ since, until } = decoded);
+        start = decoded.key;
         if (!/^USER#[0-9a-f-]{36}$/i.test(start.pk?.S || "") ||
           (scope === "self" && start.pk.S !== `USER#${target}`) ||
           !start.sk?.S?.startsWith("USAGE#") ||
@@ -836,44 +1295,88 @@ async function invoke(body, identity) {
         return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
       }
     }
+    const filters = [];
+    const values = {
+      ":pk": S(scope === "all" ? "USAGE" : `USER#${target}`),
+      ":from": S(`${scope === "all" ? "" : "USAGE#"}${since}`),
+      ":to": S(`${scope === "all" ? "" : "USAGE#"}${until}~`),
+    };
+    const names = {};
+    if (usageProjectId) {
+      values[":project"] = S(usageProjectId);
+      filters.push(usageProjectId === "main"
+        ? "(projectId = :project OR attribute_not_exists(projectId))"
+        : "projectId = :project");
+    }
+    for (const [field, value] of Object.entries({
+      agentId, requestId, kind, quality })) if (value !== undefined) {
+      names[`#${field}`] = field;
+      values[`:${field}`] = S(value);
+      filters.push(`#${field} = :${field}`);
+    }
+    if (tool !== undefined) {
+      names["#name"] = "name";
+      values[":tool"] = S(tool);
+      filters.push("#name = :tool");
+    }
+    if (scope === "all" && body.input.userSub) {
+      values[":user"] = S(target);
+      filters.push("userSub = :user");
+    }
     const page = await db.send(new QueryCommand({ TableName: process.env.TABLE,
       ...(scope === "all" && { IndexName: "UsageByTime" }),
       KeyConditionExpression: scope === "all"
         ? "gsi1pk = :pk AND gsi1sk BETWEEN :from AND :to"
         : "pk = :pk AND sk BETWEEN :from AND :to",
-      ExpressionAttributeValues: {
-        ":pk": S(scope === "all" ? "USAGE" : `USER#${target}`),
-        ":from": S(`${scope === "all" ? "" : "USAGE#"}${since}`),
-        ":to": S(`${scope === "all" ? "" : "USAGE#"}${new Date().toISOString()}~`),
-        ...(usageProjectId && { ":project": S(usageProjectId) }),
-      },
+      ExpressionAttributeValues: values,
       ExclusiveStartKey: start, Limit: 50, ScanIndexForward: sort === "asc",
-      ...(usageProjectId && { FilterExpression: usageProjectId === "main"
-        ? "projectId = :project OR attribute_not_exists(projectId)"
-        : "projectId = :project" }),
+      ...(filters.length && { FilterExpression: filters.join(" AND "),
+        ...(Object.keys(names).length && { ExpressionAttributeNames: names }) }),
       ...(scope === "self" && { ConsistentRead: true }) }));
+    let items = (page.Items || []).map(unpack).map((item) => ({
+      ...item, projectId: item.projectId || "main" }));
+    if (status !== undefined) {
+      const states = await Promise.all(items.map((item) => db.send(
+        new GetItemCommand({ TableName: process.env.TABLE,
+          Key: key(`USER#${item.userSub}`, `REQUEST#${item.requestId}`),
+          ConsistentRead: true }))));
+      items = items.map((item, index) => ({
+        ...item, requestStatus: states[index].Item?.status?.S || "unknown" }))
+        .filter((item) => item.requestStatus === status);
+    }
     return { status: 200, data: { ok: true, data: { range, sort, scope,
-      items: (page.Items || []).map(unpack).map((item) => ({
-        ...item, projectId: item.projectId || "main" })),
+      items,
       nextCursor: page.LastEvaluatedKey
-        ? Buffer.from(JSON.stringify(page.LastEvaluatedKey)).toString("base64url") : null } } };
+        ? Buffer.from(JSON.stringify({ key: page.LastEvaluatedKey,
+          filterKey, since, until })).toString("base64url") : null } } };
   }
   if (body.command === "models.list") {
     return { status: 200, data: { ok: true, data: { items: modelCatalog() } } };
   }
   const admin = identity.role === "Administrators";
-  if (["users.list", "users.invite", "users.setLimits", "defaults.get", "defaults.set"].includes(body.command) && !admin)
+  if (["users.list", "users.invite", "users.setLimits", "users.setRole",
+    "users.setEnabled", "users.startNewBudgetPeriod", "defaults.get",
+    "defaults.set"].includes(body.command) && !admin)
     return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
   if (body.command === "users.list") {
+    if (body.input.cursor !== undefined && (typeof body.input.cursor !== "string" ||
+      body.input.cursor.length > 4096)) return invalid();
     const page = await idp.send(new ListUsersCommand({ UserPoolId: process.env.POOL,
       Limit: 20, PaginationToken: body.input.cursor || undefined }));
-    const limits = await defaults();
+    const [limits, ownerSub] = await Promise.all([
+      defaults(), protectedAdministrator(identity.sub) ]);
     const items = await Promise.all(page.Users.map(async (user) => {
       const sub = user.Attributes?.find((attribute) => attribute.Name === "sub")?.Value;
-      const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
-        Key: key(`USER#${sub}`, "CONTROL") }));
+      const [row, groups] = await Promise.all([
+        db.send(new GetItemCommand({ TableName: process.env.TABLE,
+          Key: key(`USER#${sub}`, "CONTROL") })),
+        idp.send(new AdminListGroupsForUserCommand({ UserPoolId: process.env.POOL,
+          Username: sub, Limit: 10 })),
+      ]);
       return { sub, email: user.Attributes?.find((attribute) => attribute.Name === "email")?.Value,
         enabled: user.Enabled, status: user.UserStatus,
+        role: (groups.Groups || []).map((group) => group.GroupName)[0] || null,
+        protected: sub === ownerSub,
         ...effectiveLimits(row.Item, limits),
         budgetInherited: row.Item?.limitsVersion?.N === "2"
           ? row.Item.budgetOverrideMicroUsd?.N === undefined
@@ -883,6 +1386,7 @@ async function invoke(body, identity) {
           ? row.Item.storageOverrideBytes?.N === undefined
           : row.Item?.storageBytes?.N === undefined ||
             Number(row.Item.storageBytes.N) === limits.baselineStorageBytes,
+        periodInherited: !row.Item?.periodOverride?.S,
         storageUsedBytes: Number(row.Item?.storageUsedBytes?.N || 0) };
     }));
     return { status: 200, data: { ok: true, data: {
@@ -902,22 +1406,71 @@ async function invoke(body, identity) {
     return { status: 200, data: { ok: true, data: { invited: true } } };
   }
   if (body.command === "users.setLimits") {
-    const { sub, budgetMicroUsd, storageBytes } = body.input;
+    const { sub, budgetMicroUsd, storageBytes, period = null } = body.input;
     if (!/^[0-9a-f-]{36}$/i.test(sub || "") ||
       (budgetMicroUsd !== null && (!Number.isSafeInteger(budgetMicroUsd) || budgetMicroUsd < 0)) ||
-      (storageBytes !== null && (!Number.isSafeInteger(storageBytes) || storageBytes < 0)))
+      (storageBytes !== null && (!Number.isSafeInteger(storageBytes) || storageBytes < 0)) ||
+      (period !== null && !["daily", "weekly", "monthly"].includes(period)))
       return { status: 400, data: { ok: false, error: { code: "VALIDATION_FAILED" } } };
     await idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL, Username: sub }));
     const limits = await defaults();
     await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
       Key: key(`USER#${sub}`, "CONTROL"),
-      UpdateExpression: "SET limitsVersion = :version, budgetOverrideMicroUsd = :budgetOverride, storageOverrideBytes = :storageOverride, budgetMicroUsd = :budget, storageBytes = :storage",
+      UpdateExpression: "SET limitsVersion = :version, budgetOverrideMicroUsd = :budgetOverride, storageOverrideBytes = :storageOverride, budgetMicroUsd = :budget, storageBytes = :storage, periodOverride = :period",
       ExpressionAttributeValues: { ":version": N(2),
         ":budgetOverride": budgetMicroUsd === null ? { NULL: true } : N(budgetMicroUsd),
         ":storageOverride": storageBytes === null ? { NULL: true } : N(storageBytes),
         ":budget": N(budgetMicroUsd ?? limits.budgetMicroUsd),
-        ":storage": N(storageBytes ?? limits.storageBytes) } }));
+        ":storage": N(storageBytes ?? limits.storageBytes),
+        ":period": period === null ? { NULL: true } : S(period) } }));
     return { status: 200, data: { ok: true, data: { updated: true } } };
+  }
+  if (body.command === "users.startNewBudgetPeriod") {
+    const { sub } = body.input;
+    if (!/^[0-9a-f-]{36}$/i.test(sub || "")) return invalid();
+    await idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL, Username: sub }));
+    const row = await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
+      Key: key(`USER#${sub}`, "CONTROL"),
+      UpdateExpression: "ADD budgetEpoch :one",
+      ExpressionAttributeValues: { ":one": N(1) }, ReturnValues: "ALL_NEW" }));
+    return { status: 200, data: { ok: true,
+      data: { budgetEpoch: Number(row.Attributes.budgetEpoch.N) } } };
+  }
+  if (["users.setRole", "users.setEnabled"].includes(body.command)) {
+    const { sub } = body.input;
+    if (!/^[0-9a-f-]{36}$/i.test(sub || "")) return invalid();
+    if (sub === await protectedAdministrator(identity.sub))
+      return { status: 403, data: { ok: false, error: { code: "PROTECTED_ADMIN" } } };
+    await idp.send(new AdminGetUserCommand({ UserPoolId: process.env.POOL, Username: sub }));
+    if (body.command === "users.setEnabled") {
+      if (typeof body.input.enabled !== "boolean") return invalid();
+      await idp.send(new (body.input.enabled
+        ? AdminEnableUserCommand : AdminDisableUserCommand)({
+        UserPoolId: process.env.POOL, Username: sub }));
+      return { status: 200, data: { ok: true,
+        data: { enabled: body.input.enabled } } };
+    }
+    const role = body.input.role;
+    if (!["Administrators", "Members", "Auditors"].includes(role)) return invalid();
+    const groups = await idp.send(new AdminListGroupsForUserCommand({
+      UserPoolId: process.env.POOL, Username: sub, Limit: 10 }));
+    const old = (groups.Groups || []).map((group) => group.GroupName);
+    if (old.length !== 1 || !["Administrators", "Members", "Auditors"].includes(old[0]))
+      return { status: 409, data: { ok: false, error: { code: "ROLE_CONFLICT" } } };
+    if (old[0] !== role) {
+      await idp.send(new AdminAddUserToGroupCommand({
+        UserPoolId: process.env.POOL, Username: sub, GroupName: role }));
+      try {
+        await idp.send(new AdminRemoveUserFromGroupCommand({
+          UserPoolId: process.env.POOL, Username: sub, GroupName: old[0] }));
+      } catch (error) {
+        await idp.send(new AdminRemoveUserFromGroupCommand({
+          UserPoolId: process.env.POOL, Username: sub, GroupName: role }))
+          .catch(() => console.error("Role update needs administrator repair"));
+        throw error;
+      }
+    }
+    return { status: 200, data: { ok: true, data: { role } } };
   }
   if (body.command === "defaults.get")
     return { status: 200, data: { ok: true, data: await defaults() } };
@@ -941,7 +1494,7 @@ async function invoke(body, identity) {
   return { status: 200, data: { ok: true, data: await getSession(identity) } };
 }
 
-async function runGemini(config, model, level, messages, emit, workloadToken, tools) {
+async function runGemini(config, model, level, messages, emit, workloadToken, tools, meter) {
   if (!workloadToken) throw Error("Missing runtime workload token");
   const { apiKey } = await memory.send(new GetResourceApiKeyCommand({
     resourceCredentialProviderName: process.env.GEMINI_PROVIDER,
@@ -963,6 +1516,7 @@ async function runGemini(config, model, level, messages, emit, workloadToken, to
     );
     if (!reply.ok) throw Error(`Gemini HTTP ${reply.status}`);
     const step = await readGeminiStream(reply.body, emit);
+    await meter.model(turn, step.usage);
     for (const name of Object.keys(usage)) usage[name] += step.usage[name];
     text += step.visibleText;
     const calls = geminiStepCalls(step);
@@ -1024,6 +1578,13 @@ async function initializeWorkspace(sessionId, scope) {
       secretsForSession.JIRA_EMAIL = item.jiraEmail;
     }
   }
+  const fileManifest = await Promise.all((scope.files || []).map(async (item) => ({
+    id: item.id, name: item.name, sizeBytes: item.sizeBytes,
+    url: await getSignedUrl(s3, new GetObjectCommand({
+      Bucket: process.env.BUCKET, Key: item.key,
+      ...(item.versionId && { VersionId: item.versionId }),
+    }), { expiresIn: 900 }),
+  })));
   const variables = {
     AGENTCORE_USER_ID: scope.sub,
     AGENTCORE_PROJECT_ID: scope.projectId,
@@ -1042,6 +1603,8 @@ async function initializeWorkspace(sessionId, scope) {
   }).join("\n") + "\n";
   const written = await interpreterCall(sessionId, "writeFiles", {
     content: [{ path: ".env", text: contents },
+      ...(fileManifest.length ? [{ path: "selected-files.json",
+        text: JSON.stringify(fileManifest) }] : []),
       ...(scope.skills || []).map((skill) => ({ path: `skill-${skill.id}.md`,
         text: skill.text }))],
   });
@@ -1051,7 +1614,8 @@ async function initializeWorkspace(sessionId, scope) {
   if (cwd.isError || !/^\/[A-Za-z0-9._/-]+$/.test(path))
     throw Error("Could not locate code workspace");
   return { path: `${path}/.env`, names: Object.keys(secretsForSession),
-    values: Object.values(secretsForSession) };
+    values: [...Object.values(secretsForSession), ...fileManifest.map((item) => item.url),
+      JSON.stringify(fileManifest)] };
 }
 
 const gatewaySigner = new SignatureV4({
@@ -1199,13 +1763,13 @@ function toolInstructions(config) {
     ...(config.skills || []).map((skill) =>
       `Selected skill ${skill.name} (${skill.id}):\n${skill.text}`),
     "Use only the tools provided in this request. If a requested capability is unavailable, say so; do not invent tool results.",
-    config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Selected skill files are in skill-<id>.md. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
+    config.codeInterpreter ? "Use the code workspace to inspect, run and revise work. Selected skill files are in skill-<id>.md. When this turn has selected user files, selected-files.json lists their names and short-lived read-only download URLs; fetch only what you need and never print URLs. Prefer installed Python requests/boto3 and native HTTPS APIs before installing packages. Granted GitHub/Jira connections, if any, appear as GITHUB_TOKEN or JIRA_API_TOKEN/JIRA_URL/JIRA_EMAIL environment variables. Do not print session secrets; code with granted credentials can read and transmit them." : "",
     config.webSearch ? "Web Search returns current results. Base factual claims on the returned sources and cite their URLs." : "",
     config.browser ? "Browser actions return screenshots. Inspect each screenshot and avoid entering private credentials." : "",
   ].filter(Boolean).join("\n\n");
 }
 
-function toolSession(config, emit, scope) {
+function toolSession(config, emit, scope, meter) {
   const specs = toolSpecs(config);
   const toolCalls = [];
   const sources = new Map();
@@ -1291,8 +1855,10 @@ for _name in ${JSON.stringify(envNames)}:
       result.output || "(no output)");
       content = [{ text: safeOutput }];
     }
-    toolCalls.push({ name, latencyMs: Date.now() - started,
-      occurredAt: new Date().toISOString(), isError });
+    const tool = { name, latencyMs: Date.now() - started,
+      occurredAt: new Date().toISOString(), isError };
+    await meter.tool(toolCalls.length, tool);
+    toolCalls.push(tool);
     emit({ type: "tool.done", name, isError });
     return { content, isError };
   };
@@ -1309,13 +1875,13 @@ for _name in ${JSON.stringify(envNames)}:
   return { specs, toolCalls, execute, citations, close };
 }
 
-async function runModel(config, model, messages, emit, workloadToken, scope) {
+async function runModel(config, model, messages, emit, workloadToken, scope, meter) {
   const level = model.thinkingLevels.includes(config.thinkingLevel)
     ? config.thinkingLevel : model.defaultThinkingLevel;
-  const tools = toolSession(config, emit, scope);
+  const tools = toolSession(config, emit, scope, meter);
   if (model.transport === "gemini") {
     try {
-      return await runGemini(config, model, level, messages, emit, workloadToken, tools);
+      return await runGemini(config, model, level, messages, emit, workloadToken, tools, meter);
     } finally {
       await tools.close();
     }
@@ -1343,6 +1909,8 @@ async function runModel(config, model, messages, emit, workloadToken, scope) {
       const content = [];
       let stopReason;
       let metered = false;
+      const stepUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0,
+        cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
       for await (const event of stream) {
         if (event.contentBlockStart?.start?.toolUse) {
           const { contentBlockIndex, start } = event.contentBlockStart;
@@ -1377,10 +1945,13 @@ async function runModel(config, model, messages, emit, workloadToken, scope) {
         if (event.messageStop) stopReason = event.messageStop.stopReason;
         if (event.metadata?.usage) {
           metered = true;
-          for (const name of Object.keys(usage)) usage[name] += event.metadata.usage[name] || 0;
+          for (const name of Object.keys(usage))
+            stepUsage[name] += event.metadata.usage[name] || 0;
         }
       }
       if (!metered) throw Error("Model did not report token usage");
+      await meter.model(turn, stepUsage);
+      for (const name of Object.keys(usage)) usage[name] += stepUsage[name];
       if (stopReason === "end_turn") {
         const citations = tools.citations();
         if (citations) emit({ type: "message.delta", text: citations });
@@ -1409,12 +1980,16 @@ function rejectChat(response, code) {
   const messages = {
     CONNECTION_REVOKED: "A granted connection was removed. Edit this agent before sending again.",
     SKILL_UNAVAILABLE: "A selected skill was removed. Edit this agent before sending again.",
+    STORAGE_EXHAUSTED: "Your storage limit is reached. Delete files or ask an administrator to raise it before starting another persistent turn.",
+    HISTORY_INCOMPLETE: "This conversation's saved history is incomplete. Do not continue it until it is repaired.",
     BUDGET_EXHAUSTED: "Your current budget is exhausted.",
     MODEL_UNAVAILABLE: "This agent's model is unavailable.",
     TOOL_UNAVAILABLE: "This model cannot use the agent's enabled tools.",
-    REQUEST_ALREADY_COMPLETED: "This request was already completed.",
+    AGENT_ARCHIVED: "This agent is archived. Restore it to send another message.",
+    REQUEST_ALREADY_COMPLETED: "This request was already accepted. Reopen the conversation or inspect usage before retrying.",
     FORBIDDEN: "This account cannot send messages.",
     NOT_FOUND: "This agent was not found.",
+    FILE_UNAVAILABLE: "A selected file was removed or is outside this project. Choose files again.",
     VALIDATION_FAILED: "The message request is invalid.",
     BRANCH_CONFLICT: "This conversation path changed. Reopen it before sending again.",
   };
@@ -1424,13 +1999,14 @@ function rejectChat(response, code) {
 }
 
 async function chat(input, identity, response, workloadToken) {
-  const { agentId, sessionId, requestId, message, modelId, thinkingLevel } = input;
+  const { agentId, sessionId, requestId, message, modelId, thinkingLevel,
+    fileIds = [] } = input;
   const projectId = projectIdOf(input);
   const branchId = input.branchId ?? "main";
   const forking = Object.hasOwn(input, "forkEventId");
   const forkEventId = input.forkEventId;
   const sourceBranchId = input.sourceBranchId ?? "main";
-  const uuid = /^[0-9a-f-]{36}$/i;
+  const idPattern = /^[0-9a-f-]{36}$/i;
   if (!projectPattern.test(projectId) || !branchPattern.test(branchId) ||
     (forking ? !branchPattern.test(sourceBranchId) :
       input.sourceBranchId !== undefined) ||
@@ -1438,8 +2014,11 @@ async function chat(input, identity, response, workloadToken) {
       (forkEventId !== null && !eventPattern.test(forkEventId || "")))) ||
     (input.expectedHeadEventId !== undefined && input.expectedHeadEventId !== null &&
       !eventPattern.test(input.expectedHeadEventId)) ||
-    !uuid.test(agentId || "") ||
-    !uuid.test(sessionId || "") || !uuid.test(requestId || "") ||
+    !idPattern.test(agentId || "") ||
+    !idPattern.test(sessionId || "") || !idPattern.test(requestId || "") ||
+    !Array.isArray(fileIds) || fileIds.length > 4 ||
+    fileIds.some((id) => !idPattern.test(id || "")) ||
+    new Set(fileIds).size !== fileIds.length ||
     typeof message !== "string" || !message.trim() || message.length > 20000 ||
     (modelId !== undefined && (typeof modelId !== "string" || modelId.length > 512)) ||
     (thinkingLevel !== undefined && typeof thinkingLevel !== "string"))
@@ -1472,17 +2051,23 @@ async function chat(input, identity, response, workloadToken) {
   if (!row.Item)
     return rejectChat(response, "NOT_FOUND");
   const config = unpack(row.Item);
+  if (config.archived) return rejectChat(response, "AGENT_ARCHIVED");
   if (prior.Item)
     return rejectChat(response, "REQUEST_ALREADY_COMPLETED");
+  const durable = !conversationRow.Item || conversationRow.Item.durable?.BOOL === true;
   if (conversationRow.Item && (conversationRow.Item.agentId?.S !== agentId ||
-    Number(conversationRow.Item.expiresAt?.N || 0) <= Date.now() / 1000))
+    conversationRow.Item.status?.S === "DELETING" ||
+    (!durable && Number(conversationRow.Item.expiresAt?.N || 0) <= Date.now() / 1000)))
     return rejectChat(response, "NOT_FOUND");
   if (forking ? branchRow.Item || !conversationRow.Item ||
       (sourceBranchId !== "main" && !sourceBranchRow.Item) ||
       (forkEventId === null && branchId === "main")
     : branchId !== "main" && !branchRow.Item)
     return rejectChat(response, "BRANCH_CONFLICT");
-  const period = periodKey(defaultsRow.period);
+  const currentLimits = effectiveLimits(user.Item, defaultsRow);
+  if (durable && Number(user.Item?.storageUsedBytes?.N || 0) >= currentLimits.storageBytes)
+    return rejectChat(response, "STORAGE_EXHAUSTED");
+  const period = periodKey(currentLimits.period, new Date(), currentLimits.budgetEpoch);
   const turnModelId = modelId ?? config.modelId;
   const [model, spent] = await Promise.all([
     approvedModel(turnModelId),
@@ -1506,7 +2091,20 @@ async function chat(input, identity, response, workloadToken) {
     if (config.connectionIds.some((id) => !current[id]))
       return rejectChat(response, "CONNECTION_REVOKED");
   }
-  const limit = effectiveLimits(user.Item, defaultsRow).budgetMicroUsd;
+  if (fileIds.length && !config.codeInterpreter)
+    return rejectChat(response, "TOOL_UNAVAILABLE");
+  const files = [];
+  for (const id of fileIds) {
+    const row = await db.send(new GetItemCommand({ TableName: process.env.TABLE,
+      Key: objectKey(identity.sub, id), ConsistentRead: true }));
+    const item = row.Item && unpack(row.Item);
+    if (!item || item.status !== "ACTIVE" || item.projectId !== projectId ||
+      !["file", "artifact"].includes(item.kind))
+      return rejectChat(response, "FILE_UNAVAILABLE");
+    files.push({ id, name: item.name, sizeBytes: item.sizeBytes,
+      key: item.key, versionId: item.versionId });
+  }
+  const limit = currentLimits.budgetMicroUsd;
   if (Number(spent.Item?.costMicroUsd?.N || 0) >= limit)
     return rejectChat(response, "BUDGET_EXHAUSTED");
   let skills;
@@ -1520,17 +2118,18 @@ async function chat(input, identity, response, workloadToken) {
   const turnConfig = { ...config, modelId: turnModelId,
     thinkingLevel: turnThinkingLevel, skills };
   const actorId = `${identity.sub}/${projectId}`;
-  const mainMemorySessionId = `a_${agentId}_${sessionId}`;
+  const mainMemorySessionId = conversationRow.Item?.mainMemorySessionId?.S ||
+    `a_${agentId}_${sessionId}`;
   // Memory requires a rootEventId for native branches. Editing the first turn
   // therefore starts one independent session; its later descendants can use
   // native branches inside that session without copying any message bodies.
   const sourceMemorySessionId = sourceBranchRow.Item?.memorySessionId?.S ||
     mainMemorySessionId;
-  const memorySessionId = forking
+  let memorySessionId = forking
     ? forkEventId === null ? `a_${agentId}_b_${branchId}` :
       sourceMemorySessionId
     : branchRow.Item?.memorySessionId?.S || mainMemorySessionId;
-  const nativeBranchId = forking && forkEventId === null ||
+  let nativeBranchId = forking && forkEventId === null ||
     !forking && branchRow.Item?.memoryRoot?.BOOL ? "main" : branchId;
   let rootEvent;
   if (forking && forkEventId) {
@@ -1540,13 +2139,23 @@ async function chat(input, identity, response, workloadToken) {
         sessionId: sourceMemorySessionId,
         eventId: forkEventId }))).event;
     } catch (error) {
-      if (error.name === "ResourceNotFoundException")
+      if (error.name === "ResourceNotFoundException" && durable) {
+        memorySessionId = `a_${agentId}_r_${uuid()}`;
+        nativeBranchId = "main";
+      } else if (error.name === "ResourceNotFoundException")
         return rejectChat(response, "BRANCH_CONFLICT");
-      throw error;
+      else throw error;
     }
   }
   let history;
-  if (forking && rootEvent) {
+  if (durable) {
+    const head = forking ? forkEventId :
+      branchId === "main" ? conversationRow.Item?.mainHeadEventId?.S :
+        branchRow.Item?.headEventId?.S;
+    history = head ? await archivePath(identity, projectId, sessionId, head, 20) :
+      { events: [], incomplete: false };
+    if (history.incomplete) return rejectChat(response, "HISTORY_INCOMPLETE");
+  } else if (forking && rootEvent) {
     const sourceBranch = sourceBranchId === "main"
       ? rootEvent.branch?.name || "main"
       : sourceBranchRow.Item?.memoryRoot?.BOOL ? "main" : sourceBranchId;
@@ -1580,14 +2189,114 @@ async function chat(input, identity, response, workloadToken) {
         : [];
     }));
   messages.push({ role: "user", content: [{ text: message }] });
+  const acceptedAt = new Date().toISOString();
+  const requestKey = key(`USER#${identity.sub}`, `REQUEST#${requestId}`);
+  try {
+    await db.send(new PutItemCommand({ TableName: process.env.TABLE,
+      Item: { ...requestKey, status: S("running"), acceptedAt: S(acceptedAt),
+        userSub: S(identity.sub), projectId: S(projectId), agentId: S(agentId),
+        conversationId: S(sessionId), branchId: S(branchId), modelId: S(turnModelId),
+        durable: { BOOL: durable },
+        period: S(period), costMicroUsd: N(0), modelSteps: N(0), toolSteps: N(0),
+        meterKeys: { L: [] },
+        },
+      ConditionExpression: "attribute_not_exists(pk)" }));
+  } catch (error) {
+    if (error.name === "ConditionalCheckFailedException")
+      return rejectChat(response, "REQUEST_ALREADY_COMPLETED");
+    throw error;
+  }
+  let meteredCost = 0;
+  const meter = {
+    model: async (step, usage) => {
+      const occurredAt = new Date().toISOString();
+      const cost = modelCost(usage, model);
+      const eventKey = `USAGE#${occurredAt}#${requestId}#MODEL#${step}`;
+      await db.send(new TransactWriteItemsCommand({ ClientRequestToken: uuid(),
+        TransactItems: [
+          { Put: { TableName: process.env.TABLE,
+            Item: { ...key(`USER#${identity.sub}`, eventKey),
+              gsi1pk: S("USAGE"), gsi1sk: S(`${occurredAt}#${identity.sub}#${requestId}#MODEL#${step}`),
+              occurredAt: S(occurredAt), userSub: S(identity.sub), requestId: S(requestId),
+              projectId: S(projectId), branchId: S(branchId), agentId: S(agentId),
+              modelId: S(turnModelId), step: N(step), kind: S("model"),
+              costMicroUsd: N(cost), inputTokens: N(usage.inputTokens),
+              outputTokens: N(usage.outputTokens),
+              cacheReadInputTokens: N(usage.cacheReadInputTokens || 0),
+              cacheWriteInputTokens: N(usage.cacheWriteInputTokens || 0),
+              inputRate: N(model.inputRate || 0), outputRate: N(model.outputRate || 0),
+              cacheReadRate: N(model.cacheReadRate || 0),
+              cacheWriteRate: N(model.cacheWriteRate || 0),
+              pricingSource: S(model.pricingSource || ""),
+              pricingQuality: S(model.pricingQuality || "unknown"),
+              quality: S("estimated") },
+            ConditionExpression: "attribute_not_exists(pk)" } },
+          { Update: { TableName: process.env.TABLE,
+            Key: key(`USER#${identity.sub}`, period),
+            UpdateExpression: "ADD costMicroUsd :cost, estimatedModelCalls :one",
+            ExpressionAttributeValues: { ":cost": N(cost), ":one": N(1) } } },
+          { Update: { TableName: process.env.TABLE,
+            Key: key(`USER#${identity.sub}`, `DAY#${occurredAt.slice(0, 10)}`),
+            UpdateExpression: "ADD costMicroUsd :cost, estimatedModelCalls :one SET gsi1pk = :index, gsi1sk = :sort, userSub = :user, #day = :day",
+            ExpressionAttributeNames: { "#day": "day" },
+            ExpressionAttributeValues: { ":cost": N(cost), ":one": N(1),
+              ":index": S("USAGE_DAYS"),
+              ":sort": S(`${occurredAt.slice(0, 10)}#${identity.sub}`),
+              ":user": S(identity.sub), ":day": S(occurredAt.slice(0, 10)) } } },
+          { Update: { TableName: process.env.TABLE, Key: requestKey,
+            UpdateExpression: "ADD costMicroUsd :cost, modelSteps :one SET lastMeteredAt = :time, meterKeys = list_append(if_not_exists(meterKeys, :empty), :keys)",
+            ConditionExpression: "#status = :running",
+            ExpressionAttributeNames: { "#status": "status" },
+            ExpressionAttributeValues: { ":cost": N(cost), ":one": N(1),
+              ":time": S(occurredAt), ":running": S("running"),
+              ":empty": { L: [] }, ":keys": { L: [S(eventKey)] } } } },
+        ] }));
+      meteredCost += cost;
+    },
+    tool: async (step, tool) => {
+      const occurredAt = tool.occurredAt;
+      await db.send(new TransactWriteItemsCommand({ ClientRequestToken: uuid(),
+        TransactItems: [
+          { Put: { TableName: process.env.TABLE,
+            Item: { ...key(`USER#${identity.sub}`,
+              `USAGE#${occurredAt}#${requestId}#TOOL#${step}`),
+              gsi1pk: S("USAGE"), gsi1sk: S(`${occurredAt}#${identity.sub}#${requestId}#TOOL#${step}`),
+              occurredAt: S(occurredAt), userSub: S(identity.sub), requestId: S(requestId),
+              projectId: S(projectId), branchId: S(branchId), agentId: S(agentId),
+              kind: S("tool"), name: S(tool.name), costMicroUsd: N(0),
+              latencyMs: N(tool.latencyMs), isError: { BOOL: tool.isError },
+              quality: S("unpriced") },
+            ConditionExpression: "attribute_not_exists(pk)" } },
+          { Update: { TableName: process.env.TABLE,
+            Key: key(`USER#${identity.sub}`, period),
+            UpdateExpression: "ADD unpricedToolCalls :one",
+            ExpressionAttributeValues: { ":one": N(1) } } },
+          { Update: { TableName: process.env.TABLE,
+            Key: key(`USER#${identity.sub}`, `DAY#${occurredAt.slice(0, 10)}`),
+            UpdateExpression: "ADD unpricedToolCalls :one SET gsi1pk = :index, gsi1sk = :sort, userSub = :user, #day = :day",
+            ExpressionAttributeNames: { "#day": "day" },
+            ExpressionAttributeValues: { ":one": N(1),
+              ":index": S("USAGE_DAYS"),
+              ":sort": S(`${occurredAt.slice(0, 10)}#${identity.sub}`),
+              ":user": S(identity.sub), ":day": S(occurredAt.slice(0, 10)) } } },
+          { Update: { TableName: process.env.TABLE, Key: requestKey,
+            UpdateExpression: "ADD toolSteps :one SET lastMeteredAt = :time, meterKeys = list_append(if_not_exists(meterKeys, :empty), :keys)",
+            ConditionExpression: "#status = :running",
+            ExpressionAttributeNames: { "#status": "status" },
+            ExpressionAttributeValues: { ":one": N(1), ":time": S(occurredAt),
+              ":running": S("running"), ":empty": { L: [] },
+              ":keys": { L: [S(`USAGE#${occurredAt}#${requestId}#TOOL#${step}`)] } } } },
+        ] }));
+    },
+  };
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
   const emit = (event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
   const started = Date.now();
   try {
     const result = await runModel(turnConfig, model, messages, emit, workloadToken,
       { sub: identity.sub, projectId, agentId, sessionId,
-        connectionIds: config.connectionIds || [], skills });
-    const costMicroUsd = modelCost(result.usage, model);
+        connectionIds: config.connectionIds || [], skills, files }, meter);
+    const costMicroUsd = meteredCost;
     const occurredAt = new Date().toISOString();
     const receipt = { version: 1, requestId, projectId, branchId,
       agentId, conversationId: sessionId,
@@ -1597,7 +2306,7 @@ async function chat(input, identity, response, workloadToken) {
       pricingQuality: model.pricingQuality || "unknown",
       toolCalls: result.toolCalls.map(({ name, occurredAt, latencyMs, isError }) =>
         ({ name, occurredAt, latencyMs, isError })) };
-    const savedEvent = await memory.send(new CreateEventCommand({
+    const saveMemory = () => memory.send(new CreateEventCommand({
       memoryId: process.env.MEMORY, actorId, sessionId: memorySessionId,
       eventTimestamp: new Date(), clientToken: requestId, extractionMode: "SKIP",
       ...(nativeBranchId !== "main" && { branch: { name: nativeBranchId,
@@ -1606,51 +2315,95 @@ async function chat(input, identity, response, workloadToken) {
         { conversational: { role: "USER", content: { text: message } } },
         { conversational: { role: "ASSISTANT", content: { text: result.text } } },
         { json: { content: receipt } },
-      ] })).catch((error) => { error.stage = "memory"; throw error; });
+      ] }));
+    let savedEvent;
     try {
-      await db.send(new TransactWriteItemsCommand({ ClientRequestToken: requestId, TransactItems: [
-      { Put: { TableName: process.env.TABLE,
-        Item: { pk: S(`USER#${identity.sub}`), sk: S(`REQUEST#${requestId}`),
-          expiresAt: N(Math.floor(Date.now() / 1000) + 30 * 86400) },
-        ConditionExpression: "attribute_not_exists(pk)" } },
-      { Put: { TableName: process.env.TABLE,
-        Item: { pk: S(`USER#${identity.sub}`), sk: S(`USAGE#${occurredAt}#${requestId}`),
-          gsi1pk: S("USAGE"), gsi1sk: S(`${occurredAt}#${identity.sub}#${requestId}`),
-          occurredAt: S(occurredAt), userSub: S(identity.sub), requestId: S(requestId),
-          projectId: S(projectId), branchId: S(branchId), agentId: S(agentId),
-          modelId: S(turnModelId), costMicroUsd: N(costMicroUsd),
-          inputTokens: N(result.usage.inputTokens), outputTokens: N(result.usage.outputTokens),
-          cacheReadInputTokens: N(result.usage.cacheReadInputTokens || 0),
-          cacheWriteInputTokens: N(result.usage.cacheWriteInputTokens || 0),
-          inputRate: N(model.inputRate || 0), outputRate: N(model.outputRate || 0),
-          cacheReadRate: N(model.cacheReadRate || 0), cacheWriteRate: N(model.cacheWriteRate || 0),
-          pricingSource: S(model.pricingSource || ""), pricingQuality: S(model.pricingQuality || "unknown"),
-          quality: S("estimated"),
-          toolCalls: N(result.toolCalls.length),
-          unpricedToolCalls: N(result.toolCalls.length),
-          latencyMs: N(Date.now() - started) },
-        ConditionExpression: "attribute_not_exists(pk)" } },
-      { Update: { TableName: process.env.TABLE, Key: key(`USER#${identity.sub}`, period),
-        UpdateExpression: "ADD costMicroUsd :cost, unpricedToolCalls :tools, estimatedModelCalls :one",
-        ExpressionAttributeValues: { ":cost": N(costMicroUsd), ":tools": N(result.toolCalls.length),
-          ":one": N(1) } } },
+      savedEvent = await saveMemory();
+    } catch (error) {
+      if (!durable || error.name !== "ResourceNotFoundException") {
+        error.stage = "memory";
+        throw error;
+      }
+      // An archive can outlive its Memory branch. Link this turn through its
+      // archived parent and begin a fresh ephemeral Memory session.
+      memorySessionId = `a_${agentId}_r_${uuid()}`;
+      nativeBranchId = "main";
+      savedEvent = await saveMemory()
+        .catch((retryError) => { retryError.stage = "memory"; throw retryError; });
+    }
+    await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
+      Key: requestKey,
+      UpdateExpression: "SET #status = :written, eventId = :event, memorySessionId = :session",
+      ConditionExpression: "#status = :running",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: { ":written": S("memory_written"),
+        ":running": S("running"), ":event": S(savedEvent.event.eventId),
+        ":session": S(memorySessionId) } }))
+      .catch((error) => { error.stage = "navigation"; throw error; });
+    let archive;
+    if (durable) {
+      const objectKey = archiveObjectKey(identity.sub, projectId, sessionId, requestId);
+      const data = Buffer.from(JSON.stringify({ message, answer: result.text, receipt }));
+      const saved = await s3.send(new PutObjectCommand({
+        Bucket: process.env.BUCKET, Key: objectKey, Body: data,
+        ContentType: "application/json", ServerSideEncryption: "AES256" }))
+        .catch((error) => { error.stage = "archive"; throw error; });
+      archive = { objectKey, versionId: saved.VersionId, sizeBytes: data.length };
+    }
+    try {
+      const completion = [
+      { Update: { TableName: process.env.TABLE, Key: requestKey,
+        UpdateExpression: "SET #status = :complete, completedAt = :time" +
+          (archive ? ", archiveObjectKey = :archiveKey, archiveBytes = :archiveBytes" : "") +
+          " REMOVE pendingCommitJson",
+        ConditionExpression: "#status IN (:written, :failed)",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: { ":complete": S("completed"),
+          ":written": S("memory_written"), ":failed": S("navigation_failed"),
+          ":time": S(occurredAt),
+          ...(archive && { ":archiveKey": S(archive.objectKey),
+            ":archiveBytes": N(archive.sizeBytes) }) } } },
+      ...(archive ? [
+        { Put: { TableName: process.env.TABLE,
+          Item: { ...archiveKey(identity.sub, projectId, sessionId,
+            savedEvent.event.eventId),
+            eventId: S(savedEvent.event.eventId), requestId: S(requestId),
+            branchId: S(branchId),
+            parentEventId: (forking ? forkEventId : observedHead)
+              ? S(forking ? forkEventId : observedHead) : { NULL: true },
+            objectKey: S(archive.objectKey),
+            memorySessionId: S(memorySessionId),
+            ...(archive.versionId && { versionId: S(archive.versionId) }),
+            sizeBytes: N(archive.sizeBytes), createdAt: S(occurredAt) },
+          ConditionExpression: "attribute_not_exists(pk)" } },
+        { Update: { TableName: process.env.TABLE,
+          Key: key(`USER#${identity.sub}`, "CONTROL"),
+          UpdateExpression: "ADD storageUsedBytes :bytes",
+          ExpressionAttributeValues: { ":bytes": N(archive.sizeBytes) } } },
+      ] : []),
       { Update: { TableName: process.env.TABLE,
         Key: key(projectKey(identity.sub, projectId), `CONVERSATION#${sessionId}`),
-        UpdateExpression: "SET id = :id, agentId = :agent, title = if_not_exists(title, :title), createdAt = if_not_exists(createdAt, :time), lastActivityAt = :time, gsi1pk = :index, gsi1sk = :sort, expiresAt = :expiry, activeBranchId = :branch" +
-          (branchId === "main" ? ", mainHeadEventId = :head" : ""),
-        ConditionExpression: branchId === "main"
+        UpdateExpression: "SET id = :id, agentId = :agent, title = if_not_exists(title, :title), createdAt = if_not_exists(createdAt, :time), lastActivityAt = :time, gsi1pk = :index, gsi1sk = :sort, activeBranchId = :branch, durable = :durable, #status = :active" +
+          (durable ? "" : ", expiresAt = :expiry") +
+          (branchId === "main"
+            ? ", mainHeadEventId = :head, mainMemorySessionId = :memorySession" : "") +
+          " ADD memorySessions :sessions",
+        ConditionExpression: "(attribute_not_exists(#status) OR #status = :active) AND " + (branchId === "main"
           ? `(attribute_not_exists(agentId) OR agentId = :agent) AND ${conversationRow.Item?.mainHeadEventId
             ? "mainHeadEventId = :previous" : "attribute_not_exists(mainHeadEventId)"}`
-          : "agentId = :agent",
+          : "agentId = :agent"),
+        ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
-          ":id": S(sessionId), ":agent": S(agentId),
-          ":branch": S(branchId),
+          ":id": S(sessionId), ":agent": S(agentId), ":active": S("ACTIVE"),
+          ":sessions": { SS: [memorySessionId] },
+          ":branch": S(branchId), ":durable": { BOOL: durable },
           ...(branchId === "main" && { ":head": S(savedEvent.event.eventId),
+            ":memorySession": S(memorySessionId),
             ...(conversationRow.Item?.mainHeadEventId && { ":previous": S(observedHead) }) }),
           ":title": S(message.trim().replace(/\s+/g, " ").slice(0, 80)),
           ":time": S(occurredAt), ":index": S(`CONVERSATIONS#${identity.sub}/${projectId}`),
           ":sort": S(`${occurredAt}#${sessionId}`),
-          ":expiry": N(Math.floor(Date.now() / 1000) + 30 * 86400),
+          ...(!durable && { ":expiry": N(Math.floor(Date.now() / 1000) + 30 * 86400) }),
       } } },
       ...(branchId === "main" ? [] : forking ? [{ Put: { TableName: process.env.TABLE,
         Item: { ...branchKey(identity.sub, projectId, sessionId, branchId),
@@ -1658,29 +2411,33 @@ async function chat(input, identity, response, workloadToken) {
           rootEventId: forkEventId ? S(forkEventId) : { NULL: true },
           ...(memorySessionId !== mainMemorySessionId && {
             memorySessionId: S(memorySessionId) }),
-          ...(forkEventId === null && { memoryRoot: { BOOL: true } }),
+          ...(nativeBranchId === "main" && { memoryRoot: { BOOL: true } }),
           headEventId: S(savedEvent.event.eventId), createdAt: S(occurredAt) },
         ConditionExpression: "attribute_not_exists(pk)" } }] : [{ Update: {
         TableName: process.env.TABLE,
         Key: branchKey(identity.sub, projectId, sessionId, branchId),
-        UpdateExpression: "SET headEventId = :head",
+        UpdateExpression: "SET headEventId = :head, memorySessionId = :session, memoryRoot = :root",
         ConditionExpression: "headEventId = :previous",
         ExpressionAttributeValues: { ":head": S(savedEvent.event.eventId),
-          ":previous": S(observedHead) } } }]),
-      ...result.toolCalls.map((tool, index) => ({ Put: { TableName: process.env.TABLE,
-        Item: { pk: S(`USER#${identity.sub}`),
-          sk: S(`USAGE#${tool.occurredAt}#${requestId}#TOOL#${index}`),
-          gsi1pk: S("USAGE"), gsi1sk: S(`${tool.occurredAt}#${identity.sub}#${requestId}#TOOL#${index}`),
-          occurredAt: S(tool.occurredAt), userSub: S(identity.sub), requestId: S(requestId),
-          projectId: S(projectId), branchId: S(branchId), agentId: S(agentId),
-          name: S(tool.name), costMicroUsd: N(0),
-          latencyMs: N(tool.latencyMs), isError: { BOOL: tool.isError },
-          quality: S("unpriced") },
-        ConditionExpression: "attribute_not_exists(pk)" } })),
-      ] }));
+          ":previous": S(observedHead), ":session": S(memorySessionId),
+          ":root": { BOOL: nativeBranchId === "main" } } } }]),
+      ];
+      await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
+        Key: requestKey,
+        UpdateExpression: "SET pendingCommitJson = :commit",
+        ConditionExpression: "#status = :written",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: { ":written": S("memory_written"),
+          ":commit": S(JSON.stringify(completion)) } }));
+      await db.send(new TransactWriteItemsCommand({
+        ClientRequestToken: requestId, TransactItems: completion }));
     } catch (error) {
-      error.stage = "ledger";
+      error.stage = "navigation";
       if (error.name === "TransactionCanceledException") {
+        if (archive) await s3.send(new DeleteObjectCommand({
+          Bucket: process.env.BUCKET, Key: archive.objectKey,
+          ...(archive.versionId && { VersionId: archive.versionId }) }))
+          .catch(() => console.error("Could not remove uncommitted turn archive"));
         await memory.send(new DeleteEventCommand({ memoryId: process.env.MEMORY,
           actorId, sessionId: memorySessionId, eventId: savedEvent.event.eventId }))
           .catch(() => console.error("Could not remove uncommitted Memory event"));
@@ -1693,6 +2450,17 @@ async function chat(input, identity, response, workloadToken) {
       usage: result.usage, costMicroUsd,
       unpricedToolCalls: result.toolCalls.length, latencyMs: Date.now() - started });
   } catch (error) {
+    await db.send(new UpdateItemCommand({ TableName: process.env.TABLE,
+      Key: requestKey,
+      UpdateExpression: "SET #status = :failed, failureStage = :stage, failedAt = :time",
+      ConditionExpression: "#status <> :complete",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: { ":failed": S(error.stage === "memory"
+        ? "memory_failed" : error.stage === "navigation"
+          ? "navigation_failed" : "outcome_unknown"),
+        ":stage": S(error.stage || "provider_or_tool"),
+        ":time": S(new Date().toISOString()), ":complete": S("completed") } }))
+      .catch(() => console.error("Could not mark failed request"));
     console.error("Chat failed", error.name, error.$metadata?.httpStatusCode || "",
       /^(Gemini |Inconsistent Gemini|Invalid Gemini|Incomplete Gemini|Agent turn limit)/
         .test(error.message || "") ? error.message : "");
@@ -1741,6 +2509,11 @@ createServer(async (request, response) => {
       error: { code: "UNAUTHENTICATED" },
     });
   try {
+    if (!await currentIdentity(identity))
+      return respond(response, 200, { ok: false,
+        error: { code: "SESSION_CHANGED", message: "Sign in again to refresh your access." } });
+    if (identity.role === "Administrators")
+      await protectedAdministrator(identity.sub);
     let raw = "";
     let bytes = 0;
     for await (const chunk of request) {

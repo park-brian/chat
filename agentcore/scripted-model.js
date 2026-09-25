@@ -18,6 +18,7 @@ export async function* scriptedStream(messages) {
   const search = prompt.startsWith("run-search:") && !toolResult ? prompt.slice(11).trim() : null;
   const browser = prompt.startsWith("run-browser:") && !toolResult ? prompt.slice(12).trim() : null;
   const tool = code || javascript || command || search || browser;
+  const failAfterUsage = prompt === "scripted-error";
   yield { contentBlockStart: { contentBlockIndex: 0, start: tool
     ? { toolUse: { toolUseId: "scripted-tool-1", name: search ? "web_search" :
       browser ? "browser" : command ? "execute_command" : "execute_code" } } : {} } };
@@ -27,6 +28,7 @@ export async function* scriptedStream(messages) {
       { language: javascript ? "javascript" : "python", code: javascript || code }) } }
     : { text: reply } } };
   yield { contentBlockStop: { contentBlockIndex: 0 } };
-  yield { messageStop: { stopReason: tool ? "tool_use" : "end_turn" } };
+  yield { messageStop: { stopReason: failAfterUsage ? "scripted_failure" :
+    tool ? "tool_use" : "end_turn" } };
   yield { metadata: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } };
 }

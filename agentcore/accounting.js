@@ -1,10 +1,11 @@
 // Pure budget periods and Bedrock Converse token pricing; no reset worker.
-export function periodKey(period, now = new Date()) {
+export function periodKey(period, now = new Date(), epoch = 0) {
   if (!["daily", "weekly", "monthly"].includes(period)) throw Error("Invalid budget period");
+  if (!Number.isSafeInteger(epoch) || epoch < 0) throw Error("Invalid budget epoch");
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   if (period === "monthly") start.setUTCDate(1);
   if (period === "weekly") start.setUTCDate(start.getUTCDate() - (start.getUTCDay() + 6) % 7);
-  return `PERIOD#${period}#${start.toISOString().slice(0, 10)}`;
+  return `PERIOD#${period}#${start.toISOString().slice(0, 10)}${epoch ? `#E${epoch}` : ""}`;
 }
 
 export function modelCost(usage, model) {

@@ -7,6 +7,9 @@ assert.equal(periodKey("weekly", sunday), "PERIOD#weekly#2026-09-21");
 assert.equal(periodKey("weekly", new Date("2026-09-28T00:00:00Z")), "PERIOD#weekly#2026-09-28");
 assert.equal(periodKey("monthly", sunday), "PERIOD#monthly#2026-09-01");
 assert.equal(periodKey("monthly", new Date("2026-10-01T00:00:00Z")), "PERIOD#monthly#2026-10-01");
+assert.equal(periodKey("daily", sunday, 1), "PERIOD#daily#2026-09-27#E1");
+assert.equal(periodKey("daily", sunday, 2), "PERIOD#daily#2026-09-27#E2");
+assert.throws(() => periodKey("daily", sunday, -1), /epoch/);
 assert.equal(modelCost({ inputTokens: 100, outputTokens: 20,
   cacheReadInputTokens: 40, cacheWriteInputTokens: 10 },
   { inputRate: 3000000, outputRate: 15000000,

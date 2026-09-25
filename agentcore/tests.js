@@ -156,7 +156,10 @@ export async function runTests(api) {
 
 // Node-only live story hook used by the shared root test.js runner. It makes a
 // disposable Cognito identity; the browser still drives the real hosted login.
-export async function createLiveFixture({ stackName, profile, region }) {
+export async function createLiveFixture({ stackName, profile, region,
+  role = "Administrators" }) {
+  if (!["Administrators", "Members", "Auditors"].includes(role))
+    throw Error("Invalid disposable fixture role");
   const [
     { fromIni },
     cloudformation,
@@ -265,6 +268,16 @@ export async function createLiveFixture({ stackName, profile, region }) {
           nextToken = page.LastEvaluatedKey;
         } while (nextToken);
       }
+      const owner = await db.send(new dynamodb.GetItemCommand({
+        TableName: outputs.DataTable,
+        Key: { pk: { S: "ACCOUNT#CONTROL" }, sk: { S: "OWNER" } },
+        ConsistentRead: true }));
+      if (owner.Item?.ownerSub?.S === sub)
+        await db.send(new dynamodb.DeleteItemCommand({
+          TableName: outputs.DataTable,
+          Key: { pk: { S: "ACCOUNT#CONTROL" }, sk: { S: "OWNER" } },
+          ConditionExpression: "ownerSub = :sub",
+          ExpressionAttributeValues: { ":sub": { S: sub } } }));
     }
     if (created)
       await idp.send(new cognito.AdminDeleteUserCommand({ UserPoolId: pool, Username: email }));
@@ -297,7 +310,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
       new cognito.AdminAddUserToGroupCommand({
         UserPoolId: pool,
         Username: email,
-        GroupName: "Administrators",
+        GroupName: role,
       }),
     );
   } catch (error) {
@@ -327,6 +340,8 @@ export async function createLiveFixture({ stackName, profile, region }) {
     controllerUrl,
     hasGemini: Boolean(outputs.GeminiCredentialArn),
     hasScriptedModel: parameters.EnableScriptedModel === "true",
+    createPeer: (peerRole = "Members") => createLiveFixture({
+      stackName, profile, region, role: peerRole }),
     trackChat: (agentId, sessionId, projectId = "main", rootlessBranchId) => {
       const key = `${projectId}/${sessionId}`;
       const memorySessionId = `a_${agentId}_${sessionId}`;
@@ -345,6 +360,16 @@ export async function createLiveFixture({ stackName, profile, region }) {
       memoryId: outputs.MemoryArn, actorId: `${sub}/main`,
       sessionId: `a_${agentId}_${sessionId}`, includePayloads: true,
     })),
+    deleteChatMemory: async (agentId, sessionId) => {
+      const scope = { memoryId: outputs.MemoryArn, actorId: `${sub}/main`,
+        sessionId: `a_${agentId}_${sessionId}` };
+      const events = await memory.send(new memoryApi.ListEventsCommand({
+        ...scope, maxResults: 100 }));
+      for (const event of events.events || [])
+        await memory.send(new memoryApi.DeleteEventCommand({
+          ...scope, eventId: event.eventId }));
+      return (events.events || []).length;
+    },
     readUsage: async () => db.send(new dynamodb.QueryCommand({
       TableName: outputs.DataTable,
       KeyConditionExpression: "pk = :pk AND begins_with(sk, :usage)",
@@ -355,9 +380,9 @@ export async function createLiveFixture({ stackName, profile, region }) {
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark", "runtime-foundation"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark", "runtime-foundation", "runtime-roadmap"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark", "runtime-foundation"].includes(story) && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark", "runtime-foundation", "runtime-roadmap"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
   const uiInvocations = [];
   const uiErrors = [];
@@ -370,7 +395,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (!request.url().includes("/runtimes/")) return;
     const body = request.postDataJSON();
     if (["runtime-ui", "runtime-composer", "runtime-connections", "runtime-web",
-      "runtime-foundation"].includes(story) && body?.command === "chat.send")
+      "runtime-foundation", "runtime-roadmap"].includes(story) && body?.command === "chat.send")
       fixture.trackChat(body.input.agentId, body.input.sessionId,
         body.input.projectId || "main",
         body.input.forkEventId === null ? body.input.branchId : null);
@@ -383,7 +408,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (body.includes('"type":"error"')) uiErrors.push(body.slice(0, 1000));
   });
   const tokenResponse =
-    ["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark", "runtime-foundation"].includes(story)
+    ["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark", "runtime-foundation", "runtime-roadmap"].includes(story)
       ? page.waitForResponse((response) =>
           response.url().includes("/oauth2/token"),
         )
@@ -571,9 +596,233 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       });
     return;
   }
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark", "runtime-foundation"].includes(story)) {
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark", "runtime-foundation", "runtime-roadmap"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
+    if (story === "runtime-roadmap") {
+      if (!fixture.hasScriptedModel)
+        throw new Error("runtime-roadmap requires scripted inference");
+      const setup = await page.evaluate(async ({ url, token }) => {
+        const headers = { authorization: "Bearer " + token,
+          "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": "roadmap-" + crypto.randomUUID() };
+        const call = async (command, input) => (await (await fetch(url, {
+          method: "POST", headers,
+          body: JSON.stringify({ v: 1, command, input }),
+        })).json());
+        const send = async (input) => {
+          const response = await fetch(url, { method: "POST", headers,
+            body: JSON.stringify({ v: 1, command: "chat.send",
+              input: { ...input, requestId: crypto.randomUUID() } }) });
+          const events = (await response.text()).split("\n\n")
+            .filter((line) => line.startsWith("data: "))
+            .map((line) => JSON.parse(line.slice(6)));
+          return { done: events.find((event) => event.type === "message.done"),
+            error: events.find((event) => event.type === "error") };
+        };
+        const agent = await call("agents.put", { name: "Durable smoke",
+          modelId: "test.echo" });
+        if (!agent.ok) return { agent };
+        const agentId = agent.data.id, sessionId = crypto.randomUUID();
+        const first = await send({ agentId, sessionId, message: "first archive",
+          expectedHeadEventId: null });
+        if (!first.done) return { agentId, sessionId, agent, first };
+        const second = await send({ agentId, sessionId, message: "history?",
+          expectedHeadEventId: first.done.eventId });
+        const usage = await call("usage.get", { range: "30d",
+          includeDaily: true });
+        const detail = await call("usage.request", {
+          requestId: first.done.requestId });
+        const reconciled = await call("usage.reconcile", {
+          requestId: first.done.requestId });
+        const filtered = await call("usage.list", { range: "30d",
+          requestId: first.done.requestId, quality: "estimated",
+          status: "completed" });
+        const people = await call("users.list", {});
+        const connection = await call("connections.put", {
+          projectId: "main", name: "Private smoke credential",
+          kind: "github", apiKey: "disposable-" + crypto.randomUUID() });
+        const session = await call("session.get", {});
+        const protectedRole = await call("users.setRole", {
+          sub: session.data.user.sub, role: "Members" });
+        return { agentId, sessionId, agent, first, second, usage, detail,
+          reconciled, filtered, people, connection, protectedRole, session };
+      }, { url: fixture.controllerUrl, token: accessToken });
+      if (setup.agentId && setup.sessionId)
+        fixture.trackChat(setup.agentId, setup.sessionId);
+      if (!setup.first?.done || !setup.second?.done ||
+        setup.session?.data?.user?.storageUsedBytes <= 0 ||
+        setup.usage?.data?.items?.filter((item) => item.kind === "model").length !== 2 ||
+        setup.usage?.data?.daily?.items?.length !== 1 ||
+        setup.detail?.data?.steps?.length !== 1 ||
+        setup.reconciled?.data?.status !== "completed" ||
+        setup.filtered?.data?.items?.length !== 1 ||
+        setup.people?.data?.items?.length !== 1 ||
+        !setup.connection?.data?.id ||
+        setup.protectedRole?.error?.code !== "PROTECTED_ADMIN")
+        throw new Error("Durable admission/metering failed: " +
+          JSON.stringify(setup).slice(0, 1800));
+      let peer, peerContext;
+      try {
+        peer = await fixture.createPeer("Members");
+        peerContext = await page.context().browser().newContext();
+        const peerPage = await peerContext.newPage();
+        await peerPage.goto(peer.entryUrl);
+        const peerTokenResponse = peerPage.waitForResponse((response) =>
+          response.url().includes("/oauth2/token"));
+        await peerPage.locator('input[type="password"]').waitFor();
+        await peerPage.locator('input[type="email"], input[name="username"]')
+          .first().fill(peer.email);
+        await peerPage.locator('input[type="password"]').first().fill(peer.password);
+        await peerPage.locator('button[type="submit"], input[type="submit"]')
+          .first().click();
+        await peerPage.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+        const peerToken = (await (await peerTokenResponse).json()).access_token;
+        const denied = await peerPage.evaluate(async ({ url, token, agentId,
+          sessionId, ownerSub, requestId, connectionId }) => {
+          const call = async (command, input) => (await (await fetch(url, {
+            method: "POST", headers: { authorization: "Bearer " + token,
+              "content-type": "application/json",
+              "x-amzn-bedrock-agentcore-runtime-session-id": "peer-" + crypto.randomUUID() },
+            body: JSON.stringify({ v: 1, command, input }),
+          })).json());
+          return {
+            conversation: await call("conversations.get", {
+              agentId, conversationId: sessionId }),
+            usage: await call("usage.request", { userSub: ownerSub, requestId }),
+            users: await call("users.list", {}),
+            agents: await call("agents.list", {}),
+            connection: await call("connections.test", {
+              projectId: "main", id: connectionId }),
+          };
+        }, { url: fixture.controllerUrl, token: peerToken,
+          agentId: setup.agentId, sessionId: setup.sessionId,
+          ownerSub: setup.session.data.user.sub,
+          requestId: setup.first.done.requestId,
+          connectionId: setup.connection.data.id });
+        if (denied.conversation?.error?.code !== "NOT_FOUND" ||
+          denied.usage?.error?.code !== "FORBIDDEN" ||
+          denied.users?.error?.code !== "FORBIDDEN" ||
+          denied.agents?.data?.items?.length ||
+          denied.connection?.error?.code !== "NOT_FOUND")
+          throw new Error("Cross-user denial failed: " + JSON.stringify(denied));
+      } finally {
+        await peerContext?.close();
+        await peer?.cleanup();
+      }
+      const removed = await fixture.deleteChatMemory(setup.agentId, setup.sessionId);
+      if (removed !== 2) throw new Error("Expected two disposable Memory events");
+      const afterLoss = await page.evaluate(async ({ url, token, agentId, sessionId,
+        headEventId, sub }) => {
+        const headers = { authorization: "Bearer " + token,
+          "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": "roadmap-" + crypto.randomUUID() };
+        const call = async (command, input) => (await (await fetch(url, {
+          method: "POST", headers,
+          body: JSON.stringify({ v: 1, command, input }),
+        })).json());
+        const reopened = await call("conversations.get", { agentId,
+          conversationId: sessionId });
+        const response = await fetch(url, { method: "POST", headers,
+          body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            agentId, sessionId, requestId: crypto.randomUUID(),
+            message: "history?", expectedHeadEventId: headEventId } }) });
+        const events = (await response.text()).split("\n\n")
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)));
+        const third = { done: events.find((event) => event.type === "message.done"),
+          error: events.find((event) => event.type === "error") };
+        const after = await call("conversations.get", { agentId,
+          conversationId: sessionId });
+        const archived = await call("agents.setArchived", { id: agentId,
+          revision: 0, archived: true });
+        const deniedResponse = await fetch(url, { method: "POST", headers,
+          body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            agentId, sessionId, requestId: crypto.randomUUID(), message: "blocked" } }) });
+        const denied = await deniedResponse.text();
+        const restored = await call("agents.setArchived", { id: agentId,
+          revision: 1, archived: false });
+        const failedRequestId = crypto.randomUUID();
+        const failedResponse = await fetch(url, { method: "POST", headers,
+          body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            agentId, sessionId: crypto.randomUUID(),
+            requestId: failedRequestId, message: "scripted-error" } }) });
+        const failed = await failedResponse.text();
+        const failedDetail = await call("usage.request", {
+          requestId: failedRequestId });
+        const limits = await call("users.setLimits", { sub,
+          budgetMicroUsd: null, storageBytes: 0, period: "weekly" });
+        const quotaResponse = await fetch(url, { method: "POST", headers,
+          body: JSON.stringify({ v: 1, command: "chat.send", input: {
+            agentId, sessionId: crypto.randomUUID(),
+            requestId: crypto.randomUUID(), message: "new" } }) });
+        const quota = await quotaResponse.text();
+        const reset = await call("users.startNewBudgetPeriod", { sub });
+        const summary = await call("usage.summary", {});
+        const inherit = await call("users.setLimits", { sub,
+          budgetMicroUsd: null, storageBytes: null, period: null });
+        let deleted;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          deleted = await call("conversations.delete", { agentId,
+            conversationId: sessionId });
+          if (deleted.data?.deleted) break;
+        }
+        const afterDelete = await call("session.get", {});
+        const missing = await call("conversations.get", { agentId,
+          conversationId: sessionId });
+        const duplicateDelete = await call("conversations.delete", { agentId,
+          conversationId: sessionId });
+        return { reopened, third, after, archived, denied, restored,
+          failed, failedDetail, limits, quota, reset, summary,
+          inherit, deleted, afterDelete, missing, duplicateDelete };
+      }, { url: fixture.controllerUrl, token: accessToken,
+        agentId: setup.agentId, sessionId: setup.sessionId,
+        headEventId: setup.second.done.eventId,
+        sub: setup.session.data.user.sub });
+      if (afterLoss.reopened?.data?.messages?.length !== 4 ||
+        !afterLoss.third?.done ||
+        afterLoss.after?.data?.messages?.length !== 6 ||
+        !afterLoss.archived?.ok || !afterLoss.restored?.ok ||
+        !afterLoss.denied?.includes("AGENT_ARCHIVED") ||
+        !afterLoss.failed?.includes('"type":"error"') ||
+        afterLoss.failedDetail?.data?.request?.status !== "outcome_unknown" ||
+        afterLoss.failedDetail?.data?.steps?.length !== 1 ||
+        !afterLoss.quota?.includes("STORAGE_EXHAUSTED") ||
+        !afterLoss.limits?.ok || !afterLoss.reset?.ok ||
+        !afterLoss.summary?.data?.period?.includes("#E1") ||
+        !afterLoss.inherit?.ok || !afterLoss.deleted?.data?.deleted ||
+        afterLoss.afterDelete?.data?.user?.storageUsedBytes !== 0 ||
+        afterLoss.missing?.error?.code !== "NOT_FOUND" ||
+        !afterLoss.duplicateDelete?.data?.deleted)
+        throw new Error("Durable reopen/reset/archive failed: " +
+          JSON.stringify(afterLoss).slice(0, 1800));
+      if (screenshot) {
+        await page.reload();
+        await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+        const openManage = async (name) => {
+          const target = page.getByRole("button", { name: new RegExp(name + "$") });
+          if (!await target.first().isVisible())
+            await page.getByRole("button", { name: "Open menu" }).click();
+          await target.last().click();
+          await page.getByRole("dialog").waitFor({ state: "visible" });
+        };
+        await openManage("Users");
+        await page.getByRole("dialog").getByText("Bootstrap administrator").waitFor();
+        await page.evaluate(async () => {
+          const { _screenshot } = await import("./tests.js");
+          await _screenshot("live-users", document.querySelector("dialog[open]"));
+        });
+        await page.getByRole("button", { name: "Close dialog" }).click();
+        await openManage("Usage");
+        await page.getByRole("dialog").getByRole("button",
+          { name: "Request detail" }).first().waitFor();
+        await page.evaluate(async () => {
+          const { _screenshot } = await import("./tests.js");
+          await _screenshot("live-usage", document.querySelector("dialog[open]"));
+        });
+      }
+      return;
+    }
     if (story === "runtime-foundation") {
       if (!fixture.hasScriptedModel)
         throw new Error("runtime-foundation requires scripted inference");
@@ -641,8 +890,9 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         const stale = await send({ ...base, message: "stale",
           branchId: alternativeId, expectedHeadEventId: first.done.eventId });
         const self = await call("session.get", {});
+        const archiveUsed = self.data.user.storageUsedBytes;
         const limits = await call("users.setLimits", { sub: self.data.user.sub,
-          budgetMicroUsd: null, storageBytes: 5 });
+          budgetMicroUsd: null, storageBytes: archiveUsed + 5 });
         const begin = await call("objects.beginUpload", { projectId: "alpha",
           name: "skill.md", contentType: "text/plain", sizeBytes: 5, kind: "skill" });
         if (!begin.ok) return { alpha, beta, agent, isolated, first, second,
@@ -663,6 +913,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         const skillAgent = await call("agents.put", { projectId: "alpha", id: agentId,
           revision: 0, name: "Foundation smoke", modelId: "test.echo",
           skillIds: [begin.data.id] });
+        await call("users.setLimits", { sub: self.data.user.sub,
+          budgetMicroUsd: null, storageBytes: null });
         const skilled = await send({ ...base, message: "skill-loaded",
           branchId: "main", expectedHeadEventId: second.done.eventId });
         const deleted = await call("objects.delete", {
@@ -686,7 +938,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         return { alpha, beta, agent, agentId, sessionId, isolated, first, second,
           alternate, nested, firstEdit, firstEditChild, firstEditReopened,
           reopened, main, denied, stale, limits, begin,
-          posted: posted.status, completed, listed, content, quota, skillAgent,
+          archiveUsed, posted: posted.status, completed, listed, content, quota, skillAgent,
           skilled, deleted, afterDelete, unskilledAgent,
           zeroLimit, zeroSession, zeroDenied,
           inheritLimit, inheritedSession, hidden, hiddenAgents, projects };
@@ -706,10 +958,11 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         result.denied?.error?.code !== "NOT_FOUND" ||
         result.stale?.error?.code !== "BRANCH_CONFLICT" ||
         !result.limits?.ok || result.posted !== 204 || !result.completed?.ok ||
-        result.listed?.data?.usedBytes !== 5 || result.content !== "hello" ||
+        result.listed?.data?.usedBytes !== result.archiveUsed + 5 ||
+        result.content !== "hello" ||
         result.quota?.error?.code !== "QUOTA_EXCEEDED" ||
         !result.skillAgent?.ok || !result.skilled?.done ||
-        !result.deleted?.ok || result.afterDelete?.data?.usedBytes !== 0 ||
+        !result.deleted?.ok || result.afterDelete?.data?.usedBytes <= result.archiveUsed ||
         !result.unskilledAgent?.ok ||
         !result.zeroLimit?.ok || result.zeroSession?.data?.user?.storageBytes !== 0 ||
         result.zeroDenied?.error?.code !== "QUOTA_EXCEEDED" ||
@@ -768,14 +1021,14 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           const text = await response.text();
           return { status: response.status, text, body: JSON.parse(text) };
         };
-        const chat = async (agentId, message) => {
+        const chat = async (agentId, message, fileIds = []) => {
           const sessionId = crypto.randomUUID();
           const response = await fetch(url, { method: "POST", headers: {
             authorization: `Bearer ${token}`, "content-type": "application/json",
             "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
           }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
             projectId: "main", agentId, sessionId,
-            requestId: crypto.randomUUID(), message,
+            requestId: crypto.randomUUID(), message, fileIds,
           } }) });
           return { status: response.status, text: await response.text() };
         };
@@ -789,6 +1042,10 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         if (listed.status !== 200 || listed.text.includes(rawKey) ||
           !listed.body.data.items.some((item) => item.id === id))
           throw Error("Connection list was missing or leaked its key");
+        const checked = await call("connections.test", { projectId: "main", id });
+        if (checked.status !== 200 || checked.text.includes(rawKey) ||
+          checked.body.data.connected)
+          throw Error("Read-only check accepted a fake token or exposed it");
         const denied = await call("agents.put", { projectId: "main",
           name: "Unauthorized grant", modelId: "test.echo", codeInterpreter: true,
           connectionIds: [crypto.randomUUID()] });
@@ -799,6 +1056,31 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           connectionIds: [id] });
         if (agent.status !== 200) throw Error("Connected agent creation failed");
         const agentId = agent.body.data.id;
+        const fileBody = "selected-file-" + crypto.randomUUID();
+        const upload = await call("objects.beginUpload", {
+          projectId: "main", name: "smoke.txt", kind: "file",
+          contentType: "text/plain", sizeBytes: fileBody.length });
+        if (upload.status !== 200) throw Error("Selected-file upload could not begin");
+        const form = new FormData();
+        for (const [name, value] of Object.entries(upload.body.data.upload.fields))
+          form.append(name, value);
+        form.append("file", new Blob([fileBody], { type: "text/plain" }), "smoke.txt");
+        const staged = await fetch(upload.body.data.upload.url,
+          { method: "POST", body: form });
+        const complete = await call("objects.completeUpload",
+          { projectId: "main", id: upload.body.data.id });
+        if (!staged.ok || complete.status !== 200)
+          throw Error("Selected-file upload did not complete");
+        const selected = await chat(agentId,
+          'run-code: import json, requests; f=json.load(open("selected-files.json"))[0]; r=requests.get(f["url"],timeout=10); print(f["name"],r.status_code,r.text)',
+          [upload.body.data.id]);
+        if (!selected.text.includes("smoke.txt 200 " + fileBody) ||
+          selected.text.includes("X-Amz-Signature="))
+          throw Error("Interpreter could not use the selected version-pinned file");
+        const wrongFile = await chat(agentId, "run-code: print('no')",
+          [crypto.randomUUID()]);
+        if (!wrongFile.text.includes("FILE_UNAVAILABLE"))
+          throw Error("Unowned file selection was accepted");
         const py = await chat(agentId,
           'run-code: import os, hashlib; print(hashlib.sha256(os.environ["GITHUB_TOKEN"].encode()).hexdigest())');
         if (py.status !== 200 || !py.text.includes(await digest(rawKey)) ||
@@ -829,7 +1111,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         if (deleted.status !== 200 || revoked.status !== 200 ||
           !revoked.text.includes("CONNECTION_REVOKED"))
           throw Error("Deleted grant remained usable");
-        const streams = [py.text, js.text, leaked.text, shell.text];
+        const streams = [selected.text, py.text, js.text, leaked.text, shell.text];
         if (realKey) {
           const realConnection = await call("connections.put", {
             projectId: "main", name: "Live GitHub verification",
@@ -838,6 +1120,11 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
           if (realConnection.status !== 200 || realConnection.text.includes(realKey))
             throw Error("Real GitHub connection failed or leaked its key");
           const realId = realConnection.body.data.id;
+          const liveCheck = await call("connections.test", {
+            projectId: "main", id: realId });
+          if (liveCheck.status !== 200 || !liveCheck.body.data.connected ||
+            liveCheck.text.includes(realKey))
+            throw Error("Real GitHub read-only check failed or leaked its token");
           const realAgent = await call("agents.put", { projectId: "main",
             name: "Live GitHub read", modelId: "test.echo", codeInterpreter: true,
             connectionIds: [realId] });
