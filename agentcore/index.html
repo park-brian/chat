@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-gvEQndP0Vic+9IpVPaRpHGa3L3kUEO94UNwiEcyh7hh21zd70bqpGABZQSGKpUtd' https://cdn.jsdelivr.net; style-src 'sha384-6gtzCXm/dOos6Ceb/92xliWcB8y9NP1IU7F5COe/zUddPYRSaGZ+U4zCmC+GvtRQ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-wxncZgPnGsbQOcNrapQlCo8brh5FJn8u41d0QHCf9snpltxFXLBr9mTIYMoiqW4h' https://cdn.jsdelivr.net; style-src 'sha384-PTd/Hmui+esmKYEnoXxuK3s1M14P6BhKBdRGVhzl+ZMECsUbxx+H5D/KYj7tDeAC'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -317,6 +317,13 @@
       .message b {
         font-size: 13px;
       }
+      .path-bar { display: flex; align-items: center; gap: 10px; color: #718178;
+        font-size: 12px; }
+      .path-bar select { border: 1px solid #dce6dd; border-radius: 8px;
+        padding: 6px 9px; background: #fff; color: #203829; }
+      .message-action { margin-left: 10px; padding: 0; border: 0;
+        background: none; color: #64816f; font-size: 11px; }
+      .message-action:hover { color: #115d4b; text-decoration: underline; }
       .message-text {
         white-space: pre-wrap;
         overflow-wrap: anywhere;
@@ -784,6 +791,9 @@
             verifier,
             state,
             nonce,
+            projectId: projectId(),
+            conversationId: query.get("conversation"),
+            branchId: query.get("branch"),
             redirectUri: callbackUrl,
             createdAt: Date.now(),
           }),
@@ -867,16 +877,25 @@
           }
         }
         setSession(workspace.session);
+        setProjects(workspace.projects || [{ id: "main", name: "Main project", hidden: false }]);
+        setProjectId("main");
         setAgents(workspace.agents);
         setModels(workspace.models);
         setConversations(workspace.conversations.items);
         setConversationCursor(workspace.conversations.nextCursor);
+        if (pending.projectId && pending.projectId !== "main" &&
+          workspace.projects?.some((item) => item.id === pending.projectId))
+          await selectProject(pending.projectId);
+        const saved = conversations().find((item) => item.id === pending.conversationId);
+        if (saved) await openConversation(saved, pending.branchId || "main");
       }
       async function signOut() {
         const config = deployment();
         tokens = null;
         runtimeSessionId = crypto.randomUUID();
         setSession(null);
+        setProjects([]);
+        setProjectId("main");
         setAgents([]);
         setModels([]);
         setComposerChoice(null);
@@ -932,7 +951,10 @@
           thinkingLevel = composerThinking(),
           self = session(),
           config = deployment(),
-          activeId = conversationId();
+          activeId = conversationId(),
+          fork = forkFrom(),
+          sendingBranchId = fork ? crypto.randomUUID() : branchId(),
+          priorMessages = messages();
         if (!message || !agent || !model || !modelAllowed(model, agent) ||
           !self || !config || sending() ||
           loadingConversation() || uncertainConversationId() === activeId) return;
@@ -940,7 +962,7 @@
         setError("");
         setSending(true);
         setMessages((items) => [
-          ...items,
+          ...(fork ? items.slice(0, fork.fromIndex) : items),
           { role: "user", text: message },
           { role: "assistant", text: "", status: "pending" },
         ]);
@@ -954,10 +976,14 @@
               "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSessionId,
             },
             body: JSON.stringify({ v: 1, command: "chat.send", input: {
-              projectId: self.defaultProjectId,
+              projectId: projectId(),
               agentId: agent.id,
               sessionId: activeId,
               requestId: crypto.randomUUID(), message,
+              branchId: sendingBranchId,
+              ...(fork ? { forkEventId: fork.rootEventId,
+                sourceBranchId: branchId() } :
+                { expectedHeadEventId: headEventId() }),
               modelId: model.id,
               ...(thinkingLevel && { thinkingLevel }),
             } }),
@@ -998,10 +1024,22 @@
               if (event.type === "message.done") {
                 completed = true;
                 setMessages((items) => items.map((item, i) =>
-                  i === items.length - 1 ? { ...item, status: "complete" } : item));
+                  i >= items.length - 2 ? { ...item, eventId: event.eventId,
+                    ...(i === items.length - 1 && { status: "complete" }) } : item));
+                setBranchId(event.branchId || sendingBranchId);
+                setHeadEventId(event.eventId);
+                setForkFrom(null);
+                if (fork) setBranches((items) => [...items, {
+                  id: sendingBranchId, name: `Alternative ${items.length}`,
+                  rootEventId: fork.rootEventId, headEventId: event.eventId,
+                }]);
+                else setBranches((items) => items.map((item) =>
+                  item.id === sendingBranchId ? { ...item, headEventId: event.eventId } : item));
+                showRoute(projectId(), activeId, event.branchId || sendingBranchId);
                 setConversations((items) => {
                   const previous = items.find((item) => item.id === activeId);
                   return [{ id: activeId, agentId: agent.id,
+                    activeBranchId: event.branchId || sendingBranchId,
                     title: previous?.title || message.replace(/\s+/g, " ").slice(0, 80),
                     lastActivityAt: new Date().toISOString() },
                   ...items.filter((item) => item.id !== activeId)];
@@ -1016,15 +1054,65 @@
           if (!completed) throw Error("Connection ended before confirmation. Reopen this chat to check whether the turn was saved.");
         } catch (cause) {
           setError(cause.message);
+          if (failed) setDraft(message);
           if (!failed) setUncertainConversationId(activeId);
-          setMessages((items) => items.map((item, i) =>
-            i === items.length - 1 ? { ...item, status: failed ? "failed" : "uncertain" } : item));
+          if (fork && failed) setMessages(priorMessages);
+          else setMessages((items) => items.map((item, i) =>
+            i === items.length - 1 ? { ...item,
+              status: failed ? "failed" : "uncertain" } : item));
         } finally {
           setSending(false);
         }
       }
 
       // 3. Local signals represent only the current view, not a second product database.
+      const [projects, setProjects] = createSignal([]);
+      const [projectId, setProjectId] = createSignal(
+        /^[a-z0-9][a-z0-9-]{0,39}$/.test(query.get("project") || "")
+          ? query.get("project") : "main");
+      const currentProject = () => projects().find((item) => item.id === projectId()) ||
+        { id: "main", name: "Main project", hidden: false };
+      function showRoute(project = projectId(), conversation = null, branch = "main") {
+        const url = new URL(location.href);
+        url.searchParams.set("project", project);
+        if (conversation) url.searchParams.set("conversation", conversation);
+        else url.searchParams.delete("conversation");
+        if (conversation && branch !== "main") url.searchParams.set("branch", branch);
+        else url.searchParams.delete("branch");
+        history.replaceState(history.state, "", url.pathname + url.search);
+      }
+      async function selectProject(id) {
+        if (sending() || id === projectId()) return;
+        const workspace = await rpc("workspace.get", { projectId: id });
+        setProjects(workspace.projects);
+        setProjectId(id);
+        setAgents(workspace.agents);
+        setConversations(workspace.conversations.items);
+        setConversationCursor(workspace.conversations.nextCursor);
+        newChat(null);
+        showRoute(id);
+      }
+      async function createProject(event) {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        setError("");
+        try {
+          const created = await rpc("projects.create", {
+            id: String(form.get("id") || "").trim().toLowerCase(),
+            name: String(form.get("name") || "").trim(),
+          });
+          await selectProject(created.id);
+          setModal(null);
+        } catch (cause) { setError(cause.message); }
+      }
+      async function updateProject(item, command, value) {
+        setError("");
+        try {
+          await rpc(command, { id: item.id, revision: item.revision,
+            ...(command === "projects.rename" ? { name: value } : { hidden: value }) });
+          await loadView("projects");
+        } catch (cause) { setError(cause.message); }
+      }
       const [agents, setAgents] = createSignal([]);
       const [models, setModels] = createSignal([]);
       const [selectedAgent, setSelectedAgent] = createSignal(null);
@@ -1047,6 +1135,10 @@
         return model.thinkingLevels.includes(level) ? level : model.defaultThinkingLevel;
       };
       const [conversationId, setConversationId] = createSignal(crypto.randomUUID());
+      const [branchId, setBranchId] = createSignal("main");
+      const [branches, setBranches] = createSignal([{ id: "main", name: "Main", headEventId: null }]);
+      const [headEventId, setHeadEventId] = createSignal(null);
+      const [forkFrom, setForkFrom] = createSignal(null);
       const [conversations, setConversations] = createSignal([]);
       const [conversationCursor, setConversationCursor] = createSignal(null);
       const [olderCursor, setOlderCursor] = createSignal(null);
@@ -1060,29 +1152,41 @@
         ++conversationRequest;
         setSelectedAgent(agent);
         setConversationId(crypto.randomUUID());
+        setBranchId("main");
+        setBranches([{ id: "main", name: "Main", headEventId: null }]);
+        setHeadEventId(null);
+        setForkFrom(null);
         setOlderCursor(null);
         setUncertainConversationId(null);
         setMessages([]);
         setError("");
         setLoadingConversation(false);
+        showRoute(projectId());
       }
-      async function openConversation(item) {
+      async function openConversation(item, selectedBranch = item.activeBranchId || "main") {
         if (sending()) return;
         const agent = agents().find((entry) => entry.id === item.agentId);
         if (!agent) return;
         const request = ++conversationRequest;
         setSelectedAgent(agent);
         setConversationId(item.id);
+        showRoute(projectId(), item.id, selectedBranch);
         setOlderCursor(null);
         setMessages([]);
         setError("");
         setLoadingConversation(true);
         try {
           const page = await rpc("conversations.get", {
-            projectId: "main", agentId: agent.id, conversationId: item.id,
+            projectId: projectId(), agentId: agent.id, conversationId: item.id,
+            branchId: selectedBranch,
           });
           if (request === conversationRequest) {
             setMessages(page.messages);
+            setBranchId(selectedBranch);
+            setBranches(page.branches);
+            setHeadEventId(page.branches.find((branch) => branch.id === selectedBranch)
+              ?.headEventId || page.messages.at(-1)?.eventId || null);
+            setForkFrom(null);
             setOlderCursor(page.nextCursor);
             setUncertainConversationId(null);
           }
@@ -1091,6 +1195,16 @@
         } finally {
           if (request === conversationRequest) setLoadingConversation(false);
         }
+      }
+      function forkAt(index, retry = false) {
+        if (sending() || loadingConversation() || uncertainConversationId() ||
+          (index < 2 && olderCursor())) return;
+        const items = messages();
+        const userIndex = retry ? index - 1 : index;
+        const rootEventId = items.slice(0, userIndex).at(-1)?.eventId || null;
+        setForkFrom({ fromIndex: userIndex, rootEventId });
+        setDraft(items[userIndex].text);
+        if (retry) send();
       }
       function selectAgent(agent) {
         if (sending()) return;
@@ -1102,7 +1216,7 @@
         const cursor = conversationCursor();
         if (!cursor) return;
         try {
-          const page = await rpc("conversations.list", { projectId: "main", cursor });
+          const page = await rpc("conversations.list", { projectId: projectId(), cursor });
           setConversations((items) => [...items, ...page.items.filter((item) =>
             !items.some((existing) => existing.id === item.id))]);
           setConversationCursor(page.nextCursor);
@@ -1115,7 +1229,8 @@
         if (!cursor || !agent || sending()) return;
         try {
           const page = await rpc("conversations.get", {
-            projectId: "main", agentId: agent.id, conversationId: id, cursor,
+            projectId: projectId(), agentId: agent.id, conversationId: id,
+            branchId: branchId(), cursor,
           });
           if (id === conversationId()) {
             setMessages((items) => [...page.messages, ...items]);
@@ -1136,6 +1251,7 @@
       const [usageRange, setUsageRange] = createSignal("30d");
       const [usageSort, setUsageSort] = createSignal("desc");
       const [usageScope, setUsageScope] = createSignal("self");
+      const [usageProject, setUsageProject] = createSignal("all");
       const [connectionKind, setConnectionKind] = createSignal("github");
       const [error, setError] = createSignal("");
       const [loading, setLoading] = createSignal(
@@ -1145,8 +1261,9 @@
         menu: "Workspace menu",
         deployment: "Connect a deployment",
         account: "Account",
+        projects: "Projects",
         agents: "Agents",
-        skills: "Skills",
+        skills: "Files & skills",
         integrations: "Integrations",
         usage: "Usage",
         users: "Users",
@@ -1155,8 +1272,9 @@
         menu: "Navigation",
         deployment: "AWS account · infrastructure",
         account: "Your Cognito session",
+        projects: "Your private workspaces",
         agents: "Project · Runtime configurations",
-        skills: "Project · skill storage",
+        skills: "Project · persistent objects",
         integrations: "Project · code connections",
         usage: "Account · metering",
         users: "Account · access",
@@ -1172,23 +1290,37 @@
       };
       let viewRequest = 0;
       async function loadView(route) {
-        if (!["users", "usage", "agents", "integrations"].includes(route)) return;
+        if (!["users", "usage", "agents", "integrations", "projects", "skills"].includes(route)) return;
         const request = ++viewRequest;
         setView({ route, loading: true });
         try {
           if (route === "users") {
             const users = await rpc("users.list", {});
             if (request === viewRequest) setView({ route, ...users });
+          } else if (route === "projects") {
+            const result = await rpc("projects.list", {});
+            if (request === viewRequest) {
+              setProjects(result.items);
+              setView({ route, items: result.items });
+            }
+          } else if (route === "skills") {
+            const result = await rpc("objects.list", { projectId: projectId() });
+            if (request === viewRequest) setView({ route, ...result });
           } else if (route === "agents") {
-            const connections = await rpc("connections.list", { projectId: "main" });
+            const [connections, objects] = await Promise.all([
+              rpc("connections.list", { projectId: projectId() }),
+              rpc("objects.list", { projectId: projectId() }),
+            ]);
             if (request === viewRequest)
-              setView({ route, items: models(), connections: connections.items });
+              setView({ route, items: models(), connections: connections.items,
+                skills: objects.items.filter((item) => item.kind === "skill") });
           } else if (route === "integrations") {
-            const result = await rpc("connections.list", { projectId: "main" });
+            const result = await rpc("connections.list", { projectId: projectId() });
             if (request === viewRequest) setView({ route, ...result });
           } else if (route === "usage") {
             const detail = await rpc("usage.get", {
               range: usageRange(), sort: usageSort(), scope: usageScope(),
+              ...(usageProject() !== "all" && { projectId: usageProject() }),
             });
             if (request === viewRequest)
               setView({ route, ...detail });
@@ -1207,6 +1339,7 @@
         try {
           const page = await rpc("usage.list", {
             range: usageRange(), sort: usageSort(), scope: usageScope(), cursor,
+            ...(usageProject() !== "all" && { projectId: usageProject() }),
           });
           if (request === viewRequest)
             setView((current) => ({ ...current, items: [...current.items, ...page.items],
@@ -1214,6 +1347,51 @@
         } catch (cause) {
           if (request === viewRequest) setError(cause.message);
         }
+      }
+      async function moreObjects() {
+        const cursor = view()?.nextCursor;
+        if (!cursor) return;
+        const page = await rpc("objects.list", { projectId: projectId(), cursor });
+        setView((current) => ({ ...current,
+          items: [...current.items, ...page.items], nextCursor: page.nextCursor }));
+      }
+      async function uploadObject(event) {
+        event.preventDefault();
+        const form = event.currentTarget, file = form.elements.file.files[0];
+        if (!file) return;
+        setError("");
+        try {
+          const started = await rpc("objects.beginUpload", { projectId: projectId(),
+            name: file.name, sizeBytes: file.size,
+            contentType: file.type || "application/octet-stream",
+            kind: new FormData(form).get("kind") });
+          const fields = new FormData();
+          for (const [name, value] of Object.entries(started.upload.fields))
+            fields.append(name, value);
+          fields.append("file", file);
+          const uploaded = await fetch(started.upload.url, { method: "POST", body: fields });
+          if (!uploaded.ok) throw Error(`Upload failed (${uploaded.status}). Retry with a new upload.`);
+          await rpc("objects.completeUpload", { projectId: projectId(), id: started.id });
+          form.reset();
+          await loadView("skills");
+        } catch (cause) { setError(cause.message); }
+      }
+      async function downloadObject(item) {
+        try {
+          const result = await rpc("objects.get", { projectId: projectId(), id: item.id });
+          const link = document.createElement("a");
+          link.href = result.url;
+          link.download = item.name;
+          link.rel = "noopener noreferrer";
+          link.click();
+        } catch (cause) { setError(cause.message); }
+      }
+      async function deleteObject(item) {
+        if (!confirm(`Delete ${item.name}?`)) return;
+        try {
+          await rpc("objects.delete", { projectId: projectId(), id: item.id });
+          await loadView("skills");
+        } catch (cause) { setError(cause.message); }
       }
       async function change(command, input, route) {
         setError("");
@@ -1229,7 +1407,7 @@
         try {
           const editing = editingAgent();
           const result = await rpc("agents.put", {
-            projectId: session().defaultProjectId,
+            projectId: projectId(),
             ...(editing && { id: editing.id, revision: editing.revision || 0 }),
             name: form.get("name"),
             modelId: form.get("modelId"),
@@ -1241,6 +1419,7 @@
             webSearchMaxResults: Number(form.get("webSearchMaxResults")),
             browserSessionSeconds: Number(form.get("browserSessionSeconds")),
             connectionIds: form.getAll("connectionId"),
+            skillIds: form.getAll("skillId"),
           });
           setAgents((items) => editing
             ? items.map((item) => item.id === result.id ? result : item)
@@ -1261,8 +1440,8 @@
         setError("");
         try {
           await rpc(id ? "connections.rotate" : "connections.put", id
-            ? { projectId: "main", id, apiKey: fields.get("apiKey") }
-            : { projectId: "main", name: fields.get("name"),
+            ? { projectId: projectId(), id, apiKey: fields.get("apiKey") }
+            : { projectId: projectId(), name: fields.get("name"),
               kind: fields.get("kind"), apiKey: fields.get("apiKey"),
               jiraUrl: fields.get("jiraUrl") || "",
               jiraEmail: fields.get("jiraEmail") || "" });
@@ -1277,7 +1456,7 @@
         if (!confirm(`Delete ${item.name}? Agents using it will stop until reconfigured.`)) return;
         setError("");
         try {
-          await rpc("connections.delete", { projectId: "main", id: item.id });
+          await rpc("connections.delete", { projectId: projectId(), id: item.id });
           await loadView("integrations");
         } catch (cause) {
           setError(cause.message);
@@ -1397,6 +1576,75 @@
                 </button><//
               >
             </div>`;
+        if (route === "projects")
+          return html`<p class="help">Projects separate agents, conversations and files.
+            Your budget, storage limit and private connection vault are shared across them.
+            Hiding a project removes it from the picker, but its direct links still work.</p>
+            <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+              <form onSubmit=${createProject}>
+                <div class="inline-fields">
+                  <div class="field"><label for="project-name">New project name</label>
+                    <input id="project-name" name="name" maxlength="80" required /></div>
+                  <div class="field"><label for="project-id">Permanent slug</label>
+                    <input id="project-id" name="id" pattern="[a-z0-9][a-z0-9-]{0,39}"
+                      maxlength="40" placeholder="my-project" required /></div>
+                </div>
+                <div class="actions"><button class="primary" type="submit">Create project</button></div>
+              </form>
+            <//>
+            <h3 class="section-title">Your projects</h3>
+            <${For} each=${() => view()?.route === "projects" ? view()?.items || [] : []}>
+              ${(item) => html`<div class="item">
+                <strong>${item.name}${item.hidden ? " · Hidden" : ""}</strong>
+                <small>${item.id}</small>
+                <div class="actions"><button class="secondary" onClick=${async () => {
+                  await selectProject(item.id); setModal(null);
+                }}>Open</button>
+                <${Show} when=${() => item.id !== "main" && session()?.user?.role !== "Auditors"}>
+                  <button class="secondary" onClick=${() => updateProject(item,
+                    "projects.setHidden", !item.hidden)}>${item.hidden ? "Show" : "Hide"}</button>
+                <//></div>
+                <${Show} when=${() => item.id !== "main" && session()?.user?.role !== "Auditors"}>
+                  <form onSubmit=${(event) => {
+                    event.preventDefault();
+                    updateProject(item, "projects.rename", new FormData(event.currentTarget).get("name"));
+                  }}><div class="field"><label>Display name</label>
+                    <input name="name" maxlength="80" value=${item.name} required /></div>
+                    <div class="actions"><button class="secondary" type="submit">Rename</button></div>
+                  </form>
+                <//>
+              </div>`}<//>`;
+        if (route === "skills")
+          return html`<p class="help">Saved files, skills and artifacts share your
+            ${() => gb(view()?.limitBytes)} GB account limit. Current use:
+            ${() => gb(view()?.usedBytes)} GB. Temporary code files and chat Memory
+            are not included.</p>
+            <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+              <form onSubmit=${uploadObject}>
+                <div class="inline-fields">
+                  <div class="field"><label for="object-file">File</label>
+                    <input id="object-file" name="file" type="file" required /></div>
+                  <div class="field"><label for="object-kind">Type</label>
+                    <select id="object-kind" name="kind"><option value="file">File</option>
+                      <option value="skill">Skill</option><option value="artifact">Artifact</option></select>
+                  </div>
+                </div>
+                <div class="actions"><button class="primary" type="submit">Upload</button></div>
+              </form>
+            <//>
+            <h3 class="section-title">Saved in ${() => currentProject().name}</h3>
+            <${For} each=${() => view()?.route === "skills" ? view()?.items || [] : []}>
+              ${(item) => html`<div class="item"><strong>${item.name}</strong>
+                <small>${item.kind} · ${item.sizeBytes?.toLocaleString()} bytes</small>
+                <div class="actions"><button class="secondary" onClick=${() =>
+                  downloadObject(item)}>Download</button>
+                  <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+                    <button class="secondary" onClick=${() => deleteObject(item)}>Delete</button><//>
+                </div></div>`}<//>
+            <${Show} when=${() => !view()?.items?.length}>
+              <div class="empty">No saved objects in this project.</div><//>
+            <${Show} when=${() => view()?.nextCursor}>
+              <div class="actions"><button class="secondary" onClick=${moreObjects}>Load more</button></div><//>`;
         if (route === "users")
           return html`<${Show}
             when=${() => session()?.user?.role === "Administrators"}
@@ -1527,12 +1775,10 @@
                         "users.setLimits",
                         {
                           sub: user.sub,
-                          budgetMicroUsd: Math.round(
-                            Number(form.get("budget")) * 1000000,
-                          ),
-                          storageBytes: Math.round(
-                            Number(form.get("storage")) * 1000000000,
-                          ),
+                          budgetMicroUsd: form.has("inheritBudget") ? null :
+                            Math.round(Number(form.get("budget")) * 1000000),
+                          storageBytes: form.has("inheritStorage") ? null :
+                            Math.round(Number(form.get("storage")) * 1000000000),
                         },
                         "users",
                       );
@@ -1547,8 +1793,13 @@
                           min="0"
                           step="0.01"
                           required
+                          disabled=${user.budgetInherited}
                           value=${dollars(user.budgetMicroUsd)}
                         />
+                        <label class="check"><input type="checkbox" name="inheritBudget"
+                          checked=${user.budgetInherited} onChange=${(event) =>
+                            event.currentTarget.form.elements.budget.disabled = event.currentTarget.checked} />
+                          Use account default</label>
                       </div>
                       <div class="field">
                         <label>Storage (GB)</label
@@ -1558,10 +1809,16 @@
                           min="0"
                           step="0.01"
                           required
+                          disabled=${user.storageInherited}
                           value=${gb(user.storageBytes)}
                         />
+                        <label class="check"><input type="checkbox" name="inheritStorage"
+                          checked=${user.storageInherited} onChange=${(event) =>
+                            event.currentTarget.form.elements.storage.disabled = event.currentTarget.checked} />
+                          Use account default</label>
                       </div>
                     </div>
+                    <small>${gb(user.storageUsedBytes)} GB saved</small>
                     <div class="actions">
                       <button class="secondary" type="submit">
                         Save limits
@@ -1616,18 +1873,26 @@
                   }}><option value="self">My usage</option><option value="all">All users</option></select>
                 </div><//
               >
+              <div class="field"><label for="usage-project">Project</label>
+                <select id="usage-project" value=${usageProject} onChange=${(event) => {
+                  setUsageProject(event.currentTarget.value); loadView("usage");
+                }}><option value="all">All projects</option>
+                  <${For} each=${projects}>${(item) => html`
+                    <option value=${item.id}>${item.name}</option>`}<//>
+                </select>
+              </div>
             </div>
             <${For} each=${() => view()?.route === "usage" ? view()?.items || [] : []}>
               ${(item) => html`<div class="item"><strong>${item.name || item.modelId || "Request"}</strong>
                 <small>${new Date(item.occurredAt).toLocaleString()} · ${usageScope() === "all" ? item.userSub + " · " : ""}
-                ${item.quality === "unpriced" ? "Tool · unpriced" : "Model · " + item.inputTokens + " in / " + item.outputTokens + " out"}
+                ${item.projectId || "main"} · ${item.quality === "unpriced" ? "Tool · unpriced" : "Model · " + item.inputTokens + " in / " + item.outputTokens + " out"}
                 · ${item.latencyMs} ms · $${(Number(item.costMicroUsd || 0) / 1000000).toFixed(6)}</small></div>`}<//>
             <${Show} when=${() => !view()?.items?.length}><div class="empty">No requests in this range.</div><//>
             <${Show} when=${() => view()?.nextCursor}><div class="actions">
               <button class="secondary" onClick=${moreUsage}>Load more</button></div><//>`;
         if (route === "integrations")
           return html`<p class="help">
-              Connections belong to your Cognito user in the main project. Keys
+              Connections belong to your Cognito user across projects. Keys
               are never shown again in this UI. An agent receives a connection
               only when you explicitly grant it; code in its public-network
               workspace can then read and transmit that credential.
@@ -1733,6 +1998,15 @@
                       ${item.name} · ${item.kind}</label>`}<//>
                   <p class="help">Enable code workspace to use a grant. Generated code can read the selected keys.</p>
                 </div><//>
+              <${Show} when=${() => view()?.skills?.length}>
+                <div class="field"><label>Use saved skills</label>
+                  <${For} each=${() => view()?.skills || []}>${(item) => html`
+                    <label class="check"><input type="checkbox" name="skillId" value=${item.id}
+                      checked=${() => Boolean(editingAgent()?.skillIds?.includes(item.id))} />
+                      ${item.name}</label>`}<//>
+                  <p class="help">Selected skill text enters this agent's instructions and code workspace.
+                    Removing a skill stops future turns until the agent is reconfigured.</p>
+                </div><//>
               <div class="actions">
                 <${Show} when=${editingAgent}><button class="secondary" type="button"
                   onClick=${() => { setEditingAgent(null); setDraftModelId(null); }}>Cancel edit</button><//>
@@ -1788,14 +2062,18 @@
               ></a
             >
             <section>
-              <div class="eyebrow">Workspace</div>
+              <div class="eyebrow">Project</div>
               <div class="rail-list">
                 <button
                   class="nav active"
-                  onClick=${(e) => openDialog("agents")}
+                  onClick=${(e) => openDialog("projects")}
                 >
-                  <span class="nav-icon">▦</span>Main project
+                  <span class="nav-icon">▦</span>${() => currentProject().name}
                 </button>
+                <${For} each=${() => projects().filter((item) =>
+                  !item.hidden && item.id !== projectId())}>${(item) => html`
+                  <button class="nav" onClick=${() => selectProject(item.id).catch((cause) =>
+                    setError(cause.message))}>${item.name}</button>`}<//>
                 <div class="rail-note">
                   ${() => session()?.user?.email || "Connect your AWS account to see agents."}
                 </div>
@@ -1871,7 +2149,7 @@
                 <div class="top-title">
                   ${() => selectedAgent()?.name || selectedAgent()?.agentName || "Your workspace"}
                 </div>
-                <div class="top-sub">AgentCore · Main project</div>
+              <div class="top-sub">AgentCore · ${() => currentProject().name}</div>
               </div>
               <div class="spacer"></div>
               <span class=${() => "status" + (session() ? "" : " offline")}
@@ -1894,6 +2172,18 @@
             <div class="mobile-agent">${() => selectedAgent()?.name || "Choose an agent"}</div>
             <div class="content">
               <div class="conversation">
+                <${Show} when=${() => branches().length > 1}>
+                  <div class="path-bar"><span>Path</span>
+                    <select aria-label="Conversation path" value=${branchId}
+                      disabled=${sending} onChange=${(event) => openConversation({
+                        id: conversationId(), agentId: selectedAgent()?.id,
+                      }, event.currentTarget.value)}>
+                      <${For} each=${branches}>${(branch) => html`
+                        <option value=${branch.id} selected=${() => branch.id === branchId()}>
+                          ${branch.name}</option>`}<//>
+                    </select>
+                  </div>
+                <//>
                 <${Show} when=${olderCursor}>
                   <button class="link-button" onClick=${(e) => moreMessages()}>Load earlier messages</button><//
                 >
@@ -1942,13 +2232,19 @@
                   </div><//
                 >
                 <${For} each=${messages}
-                  >${(item) =>
+                  >${(item, index) =>
                     html`<article class=${() => "message " + item.role}>
                       <div class="avatar">
                         ${item.role === "user" ? "Y" : "✦"}
                       </div>
                       <div>
                         <b>${item.role === "user" ? "You" : "Agent"}</b>
+                        <${Show} when=${() => item.eventId && !sending() &&
+                          !loadingConversation() && (index() >= 2 || !olderCursor())}>
+                          <button class="message-action" onClick=${() => forkAt(index(),
+                            item.role === "assistant")}>
+                            ${item.role === "user" ? "Edit · new path" : "Retry · new path"}
+                          </button><//>
                         <div class="message-text"><${For} each=${() => item.text.split(/(https:\/\/[^\s<>"']+)/g)}>
                           ${(part) => /^https:\/\/[^\s<>"']+$/.test(part)
                             ? html`<a href=${part} target="_blank" rel="noopener noreferrer">${part}</a>`
@@ -1976,6 +2272,10 @@
             </div>
             <div class="compose-wrap">
               <div class="composer">
+                <${Show} when=${forkFrom}>
+                  <div class="path-bar">Editing an earlier turn creates a new path.
+                    <button class="message-action" onClick=${() => setForkFrom(null)}>Cancel</button>
+                  </div><//>
                 <textarea
                   aria-label="Message"
                   placeholder=${() => (selectedAgent() ? "Message your agent…" : "Choose an agent to start chatting")}

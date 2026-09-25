@@ -117,6 +117,11 @@ async function run(config = options(process.argv.slice(2))) {
 
     browser = await chromium.launch({ headless: !config.headed });
     for (const viewport of config.viewports) {
+      // Each viewport is an independent live story. Reusing one identity leaks
+      // prior mutations into the next layout's assertions and cleanup.
+      if (hooks && !fixture)
+        fixture = await hooks.createLiveFixture({ stackName: config.liveStack,
+          profile: config.profile, region: config.region });
       const context = await browser.newContext({
         viewport: config.sizes[viewport],
         deviceScaleFactor: 1,
@@ -233,6 +238,10 @@ async function run(config = options(process.argv.slice(2))) {
         console.log(report);
       } finally {
         await context.close();
+        if (hooks) {
+          await fixture?.cleanup();
+          fixture = null;
+        }
       }
     }
   } finally {

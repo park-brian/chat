@@ -163,6 +163,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
     cognito,
     dynamodb,
     memoryApi,
+    s3Api,
     { randomUUID, randomBytes },
   ] = await Promise.all([
     import("@aws-sdk/credential-providers"),
@@ -170,6 +171,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
     import("@aws-sdk/client-cognito-identity-provider"),
     import("@aws-sdk/client-dynamodb"),
     import("@aws-sdk/client-bedrock-agentcore"),
+    import("@aws-sdk/client-s3"),
     import("node:crypto"),
   ]);
   const credentials = fromIni({ profile });
@@ -180,6 +182,7 @@ export async function createLiveFixture({ stackName, profile, region }) {
   });
   const db = new dynamodb.DynamoDBClient({ region, credentials });
   const memory = new memoryApi.BedrockAgentCoreClient({ region, credentials });
+  const s3 = new s3Api.S3Client({ region, credentials });
   const result = await cf.send(
     new cloudformation.DescribeStacksCommand({ StackName: stackName }),
   );
@@ -207,16 +210,45 @@ export async function createLiveFixture({ stackName, profile, region }) {
   entry.pathname = local.pathname;
   let created = false;
   let sub;
-  const chatSessions = new Set();
+  const chatSessions = new Map();
   const cleanup = async () => {
     if (sub) {
-      for (const sessionId of chatSessions) {
-        const scope = { memoryId: outputs.MemoryArn, actorId: `${sub}/main`, sessionId };
-        const page = await memory.send(new memoryApi.ListEventsCommand(scope));
-        for (const event of page.events || [])
-          await memory.send(new memoryApi.DeleteEventCommand({ ...scope, eventId: event.eventId }));
+      for (const { projectId, memorySessionIds } of chatSessions.values()) {
+        for (const sessionId of memorySessionIds) {
+          const scope = { memoryId: outputs.MemoryArn,
+            actorId: `${sub}/${projectId}`, sessionId };
+          let nextToken;
+          do {
+            const page = await memory.send(new memoryApi.ListEventsCommand({
+              ...scope, maxResults: 100, nextToken }));
+            for (const event of page.events || [])
+              await memory.send(new memoryApi.DeleteEventCommand({
+                ...scope, eventId: event.eventId }));
+            nextToken = page.nextToken;
+          } while (nextToken);
+        }
       }
-      for (const pk of [`USER#${sub}`, `PROJECT#${sub}/main`]) {
+      for (const prefix of [`users/${sub}/`, `pending/${sub}/`]) {
+        let KeyMarker, VersionIdMarker;
+        do {
+          const page = await s3.send(new s3Api.ListObjectVersionsCommand({
+            Bucket: outputs.SharedBucket, Prefix: prefix,
+            KeyMarker, VersionIdMarker }));
+          for (const object of [...(page.Versions || []), ...(page.DeleteMarkers || [])])
+            await s3.send(new s3Api.DeleteObjectCommand({
+              Bucket: outputs.SharedBucket, Key: object.Key,
+              VersionId: object.VersionId }));
+          KeyMarker = page.IsTruncated ? page.NextKeyMarker : undefined;
+          VersionIdMarker = page.IsTruncated ? page.NextVersionIdMarker : undefined;
+        } while (KeyMarker);
+      }
+      const projectRows = await db.send(new dynamodb.QueryCommand({
+        TableName: outputs.DataTable,
+        KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+        ExpressionAttributeValues: { ":pk": { S: `USER#${sub}` },
+          ":prefix": { S: "PROJECT#" } }, ConsistentRead: true }));
+      const projectIds = ["main", ...(projectRows.Items || []).map((item) => item.id.S)];
+      for (const pk of [`USER#${sub}`, ...projectIds.map((id) => `PROJECT#${sub}/${id}`)]) {
         let nextToken;
         do {
           const page = await db.send(new dynamodb.QueryCommand({
@@ -295,7 +327,15 @@ export async function createLiveFixture({ stackName, profile, region }) {
     controllerUrl,
     hasGemini: Boolean(outputs.GeminiCredentialArn),
     hasScriptedModel: parameters.EnableScriptedModel === "true",
-    trackChat: (agentId, sessionId) => chatSessions.add(`a_${agentId}_${sessionId}`),
+    trackChat: (agentId, sessionId, projectId = "main", rootlessBranchId) => {
+      const key = `${projectId}/${sessionId}`;
+      const memorySessionId = `a_${agentId}_${sessionId}`;
+      const state = chatSessions.get(key) || { projectId,
+        memorySessionIds: new Set([memorySessionId]) };
+      if (rootlessBranchId)
+        state.memorySessionIds.add(`a_${agentId}_b_${rootlessBranchId}`);
+      chatSessions.set(key, state);
+    },
     readAgent: async (agentId) => (await db.send(new dynamodb.GetItemCommand({
       TableName: outputs.DataTable,
       Key: { pk: { S: `PROJECT#${sub}/main` }, sk: { S: `AGENT#${agentId}` } },
@@ -315,9 +355,9 @@ export async function createLiveFixture({ stackName, profile, region }) {
 }
 
 export async function runLiveStory(page, fixture, { story, screenshot }) {
-  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark"].includes(story))
+  if (story && !["login", "runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark", "runtime-foundation"].includes(story))
     throw new Error("Unknown live story: " + story);
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark"].includes(story) && !fixture.controllerUrl)
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-ui", "runtime-model", "runtime-composer", "runtime-benchmark", "runtime-foundation"].includes(story) && !fixture.controllerUrl)
     throw new Error("Live stack has no ControllerArn");
   const uiInvocations = [];
   const uiErrors = [];
@@ -329,8 +369,11 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
   page.on("request", (request) => {
     if (!request.url().includes("/runtimes/")) return;
     const body = request.postDataJSON();
-    if (["runtime-ui", "runtime-composer", "runtime-connections", "runtime-web"].includes(story) && body?.command === "chat.send")
-      fixture.trackChat(body.input.agentId, body.input.sessionId);
+    if (["runtime-ui", "runtime-composer", "runtime-connections", "runtime-web",
+      "runtime-foundation"].includes(story) && body?.command === "chat.send")
+      fixture.trackChat(body.input.agentId, body.input.sessionId,
+        body.input.projectId || "main",
+        body.input.forkEventId === null ? body.input.branchId : null);
     uiInvocations.push({ command: body?.command, input: body?.input,
       runtimeSession: request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"] });
   });
@@ -340,7 +383,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     if (body.includes('"type":"error"')) uiErrors.push(body.slice(0, 1000));
   });
   const tokenResponse =
-    ["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)
+    ["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark", "runtime-foundation"].includes(story)
       ? page.waitForResponse((response) =>
           response.url().includes("/oauth2/token"),
         )
@@ -528,9 +571,187 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       });
     return;
   }
-  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark"].includes(story)) {
+  if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark", "runtime-foundation"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
+    if (story === "runtime-foundation") {
+      if (!fixture.hasScriptedModel)
+        throw new Error("runtime-foundation requires scripted inference");
+      const result = await page.evaluate(async ({ url, token }) => {
+        const headers = { authorization: "Bearer " + token,
+          "content-type": "application/json",
+          "x-amzn-bedrock-agentcore-runtime-session-id": "foundation-" + crypto.randomUUID() };
+        const call = async (command, input) => {
+          const response = await fetch(url, { method: "POST", headers,
+            body: JSON.stringify({ v: 1, command, input }) });
+          return response.json();
+        };
+        const send = async (input) => {
+          const response = await fetch(url, { method: "POST", headers,
+            body: JSON.stringify({ v: 1, command: "chat.send", input: {
+              ...input, requestId: crypto.randomUUID() } }) });
+          const raw = await response.text();
+          const events = raw.split("\n\n").flatMap((chunk) => {
+            const line = chunk.split("\n").find((part) => part.startsWith("data:"));
+            return line ? [JSON.parse(line.slice(5))] : [];
+          });
+          return { done: events.find((event) => event.type === "message.done"),
+            error: events.find((event) => event.type === "error"), events };
+        };
+        const alpha = await call("projects.create", { id: "alpha", name: "Alpha" });
+        const beta = await call("projects.create", { id: "beta", name: "Beta" });
+        const agent = await call("agents.put", { projectId: "alpha",
+          name: "Foundation smoke", modelId: "test.echo" });
+        if (!alpha.ok || !beta.ok || !agent.ok) return { alpha, beta, agent };
+        const agentId = agent.data.id, sessionId = crypto.randomUUID();
+        const base = { projectId: "alpha", agentId, sessionId };
+        const isolated = await call("agents.list", { projectId: "beta" });
+        const first = await send({ ...base, message: "first", branchId: "main",
+          expectedHeadEventId: null });
+        if (!first.done) return { alpha, beta, agent, isolated, first, agentId, sessionId };
+        const second = await send({ ...base, message: "history?", branchId: "main",
+          expectedHeadEventId: first.done.eventId });
+        if (!second.done) return { alpha, beta, agent, isolated, first, second,
+          agentId, sessionId };
+        const alternativeId = crypto.randomUUID();
+        const alternate = await send({ ...base, message: "edited second",
+          branchId: alternativeId, forkEventId: first.done.eventId });
+        if (!alternate.done) return { alpha, beta, agent, isolated, first, second,
+          alternate, agentId, sessionId };
+        const nestedId = crypto.randomUUID();
+        const nested = await send({ ...base, message: "history?", branchId: nestedId,
+          forkEventId: alternate.done.eventId });
+        const firstEditId = crypto.randomUUID();
+        const firstEdit = await send({ ...base, message: "rewritten first",
+          branchId: firstEditId, forkEventId: null, sourceBranchId: "main" });
+        if (!firstEdit.done) return { firstEdit, agentId, sessionId };
+        const firstEditChildId = crypto.randomUUID();
+        const firstEditChild = await send({ ...base, message: "history?",
+          branchId: firstEditChildId, forkEventId: firstEdit.done.eventId,
+          sourceBranchId: firstEditId });
+        const firstEditReopened = await call("conversations.get", {
+          projectId: "alpha", agentId, conversationId: sessionId,
+          branchId: firstEditChildId });
+        const reopened = await call("conversations.get", { projectId: "alpha",
+          agentId, conversationId: sessionId, branchId: nestedId });
+        const main = await call("conversations.get", { projectId: "alpha",
+          agentId, conversationId: sessionId, branchId: "main" });
+        const denied = await call("conversations.get", { projectId: "beta",
+          agentId, conversationId: sessionId });
+        const stale = await send({ ...base, message: "stale",
+          branchId: alternativeId, expectedHeadEventId: first.done.eventId });
+        const self = await call("session.get", {});
+        const limits = await call("users.setLimits", { sub: self.data.user.sub,
+          budgetMicroUsd: null, storageBytes: 5 });
+        const begin = await call("objects.beginUpload", { projectId: "alpha",
+          name: "skill.md", contentType: "text/plain", sizeBytes: 5, kind: "skill" });
+        if (!begin.ok) return { alpha, beta, agent, isolated, first, second,
+          alternate, nested, reopened, main, denied, stale, limits, begin,
+          agentId, sessionId };
+        const fields = new FormData();
+        for (const [name, value] of Object.entries(begin.data.upload.fields))
+          fields.append(name, value);
+        fields.append("file", new Blob(["hello"], { type: "text/plain" }), "skill.md");
+        const posted = await fetch(begin.data.upload.url, { method: "POST", body: fields });
+        const completed = await call("objects.completeUpload", {
+          projectId: "alpha", id: begin.data.id });
+        const listed = await call("objects.list", { projectId: "alpha" });
+        const link = await call("objects.get", { projectId: "alpha", id: begin.data.id });
+        const content = link.ok ? await (await fetch(link.data.url)).text() : "";
+        const quota = await call("objects.beginUpload", { projectId: "alpha",
+          name: "over.txt", contentType: "text/plain", sizeBytes: 1 });
+        const skillAgent = await call("agents.put", { projectId: "alpha", id: agentId,
+          revision: 0, name: "Foundation smoke", modelId: "test.echo",
+          skillIds: [begin.data.id] });
+        const skilled = await send({ ...base, message: "skill-loaded",
+          branchId: "main", expectedHeadEventId: second.done.eventId });
+        const deleted = await call("objects.delete", {
+          projectId: "alpha", id: begin.data.id });
+        const afterDelete = await call("objects.list", { projectId: "alpha" });
+        const unskilledAgent = await call("agents.put", { projectId: "alpha",
+          id: agentId, revision: 1, name: "Foundation smoke",
+          modelId: "test.echo", skillIds: [] });
+        const zeroLimit = await call("users.setLimits", {
+          sub: self.data.user.sub, budgetMicroUsd: null, storageBytes: 0 });
+        const zeroSession = await call("session.get", {});
+        const zeroDenied = await call("objects.beginUpload", { projectId: "alpha",
+          name: "blocked.txt", contentType: "text/plain", sizeBytes: 1 });
+        const inheritLimit = await call("users.setLimits", {
+          sub: self.data.user.sub, budgetMicroUsd: null, storageBytes: null });
+        const inheritedSession = await call("session.get", {});
+        const hidden = await call("projects.setHidden", { id: "alpha",
+          hidden: true, revision: alpha.data.revision });
+        const hiddenAgents = await call("agents.list", { projectId: "alpha" });
+        const projects = await call("projects.list", {});
+        return { alpha, beta, agent, agentId, sessionId, isolated, first, second,
+          alternate, nested, firstEdit, firstEditChild, firstEditReopened,
+          reopened, main, denied, stale, limits, begin,
+          posted: posted.status, completed, listed, content, quota, skillAgent,
+          skilled, deleted, afterDelete, unskilledAgent,
+          zeroLimit, zeroSession, zeroDenied,
+          inheritLimit, inheritedSession, hidden, hiddenAgents, projects };
+      }, { url: fixture.controllerUrl, token: accessToken });
+      if (result.agentId && result.sessionId)
+        fixture.trackChat(result.agentId, result.sessionId, "alpha");
+      if (!result.alpha?.ok || !result.beta?.ok || !result.agent?.ok ||
+        result.isolated?.data?.items?.length || !result.first?.done ||
+        !result.second?.done || !result.alternate?.done || !result.nested?.done ||
+        !result.firstEdit?.done || !result.firstEditChild?.done ||
+        result.firstEditReopened?.data?.messages?.map((item) => item.text).join("|") !==
+          "rewritten first|Echo: rewritten first|history?|History: rewritten first | history?" ||
+        result.reopened?.data?.messages?.map((item) => item.text).join("|") !==
+          "first|Echo: first|edited second|Echo: edited second|history?|History: first | edited second | history?" ||
+        result.main?.data?.messages?.map((item) => item.text).join("|") !==
+          "first|Echo: first|history?|History: first | history?" ||
+        result.denied?.error?.code !== "NOT_FOUND" ||
+        result.stale?.error?.code !== "BRANCH_CONFLICT" ||
+        !result.limits?.ok || result.posted !== 204 || !result.completed?.ok ||
+        result.listed?.data?.usedBytes !== 5 || result.content !== "hello" ||
+        result.quota?.error?.code !== "QUOTA_EXCEEDED" ||
+        !result.skillAgent?.ok || !result.skilled?.done ||
+        !result.deleted?.ok || result.afterDelete?.data?.usedBytes !== 0 ||
+        !result.unskilledAgent?.ok ||
+        !result.zeroLimit?.ok || result.zeroSession?.data?.user?.storageBytes !== 0 ||
+        result.zeroDenied?.error?.code !== "QUOTA_EXCEEDED" ||
+        !result.inheritLimit?.ok ||
+        result.inheritedSession?.data?.user?.storageBytes !== 5000000000 ||
+        !result.hidden?.ok || !result.hiddenAgents?.data?.items?.length ||
+        !result.projects?.data?.items?.find((item) => item.id === "alpha")?.hidden)
+        throw new Error("Foundation live contract failed: " +
+          JSON.stringify(result, (key, value) =>
+            ["upload", "url", "fields"].includes(key) ? "[redacted]" : value)
+            .slice(0, 16000));
+      const mobile = page.viewportSize().width < 761;
+      if (mobile) {
+        await page.getByRole("button", { name: "Open menu" }).click();
+        await page.getByRole("dialog").getByRole("button", {
+          name: "Projects", exact: true }).click();
+      } else await page.getByRole("button", { name: /Main project/ }).first().click();
+      const dialog = page.getByRole("dialog");
+      await dialog.getByText("Alpha").first().waitFor();
+      if (screenshot) await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-projects", document.querySelector("dialog[open]"));
+      });
+      await dialog.locator(".item").filter({ hasText: "Alpha" })
+        .getByRole("button", { name: "Open" }).click();
+      await page.waitForFunction(() =>
+        new URLSearchParams(location.search).get("project") === "alpha");
+      if (mobile) await page.getByRole("button", { name: "Open menu" }).click();
+      await page.getByRole("button", { name: "first", exact: true }).first().click();
+      await page.getByRole("combobox", { name: "Conversation path" }).waitFor();
+      if (screenshot) await page.evaluate(async () => {
+        const { _screenshot } = await import("./tests.js");
+        await _screenshot("live-branched-chat", undefined, { fullPage: true });
+      });
+      await page.getByRole("button", { name: "Edit · new path" }).first().click();
+      await page.getByPlaceholder("Message your agent…").fill("rewritten via UI");
+      await page.getByRole("button", { name: "Send ↑" }).click();
+      await page.getByText("Echo: rewritten via UI").waitFor();
+      if (await page.getByRole("combobox", { name: "Conversation path" }).inputValue() === "main")
+        throw new Error("First-turn edit did not select a new path");
+      return;
+    }
     if (story === "runtime-connections") {
       const result = await page.evaluate(async ({ url, token, realKey }) => {
         const rawKey = `test-${crypto.randomUUID()}'$"`;
@@ -1062,8 +1283,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       throw new Error(
         "Authenticated CodeZip Runtime session.get failed: " + result.status,
       );
-    if ((await fixture.readUserControl())?.budgetMicroUsd?.N !== "5000000")
-      throw new Error("CodeZip Runtime did not persist the default user limit");
+    if (result.body?.data?.user?.budgetMicroUsd !== 5000000)
+      throw new Error("CodeZip Runtime did not resolve the default user limit");
     const configured = await page.evaluate(async ({ url, token }) => {
       const call = async (command, input) => {
         const response = await fetch(url, { method: "POST", headers: {
@@ -1140,6 +1361,7 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     .getByRole("dialog")
     .locator(".item")
     .filter({ hasText: fixture.email });
+  await ownLimits.locator('input[name="inheritBudget"]').uncheck();
   await ownLimits.locator('input[name="budget"]').fill("1.25");
   const changed = page.waitForResponse(
     (response) =>
