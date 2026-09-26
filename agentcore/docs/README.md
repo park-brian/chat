@@ -6,6 +6,34 @@ and one shared S3 bucket. The Runtime is the authorization and accounting
 boundary; a Runtime session is an ephemeral performance optimization, not the
 owner of conversation or account state.
 
+```mermaid
+flowchart LR
+    user["User"] --> page["GitHub Pages<br/>buildless SolidJS page"]
+    page -->|"PKCE login"| cognito["Cognito"]
+    page -->|"JWT-protected invocations"| runtime["AgentCore Runtime V2<br/>one controller, many agent configs"]
+    runtime -->|"verify current user"| cognito
+
+    subgraph state["AWS account state"]
+        dynamo["DynamoDB<br/>projects, agents, grants, limits, usage, object inventory"]
+        memory["AgentCore Memory<br/>conversation events"]
+        s3["Shared private S3<br/>Runtime ZIP, files, skills, chat archives"]
+    end
+    runtime --> dynamo
+    runtime --> memory
+    runtime --> s3
+    page -.->|"presigned file transfer"| s3
+
+    runtime -->|"Converse"| bedrock["Amazon Bedrock models"]
+    runtime -->|"fetch managed API key"| identity["AgentCore Identity"]
+    runtime -->|"direct REST"| gemini["Google Gemini"]
+    runtime --> tools["AgentCore managed tools<br/>Gateway Web Search · Browser · Code Interpreter"]
+```
+
+CloudFormation provisions the shared AWS resources. Agent and project changes
+are data changes in the Runtime, not new deployments. The browser never writes
+the table or reads managed credentials directly; only presigned file bytes
+transfer between the page and S3.
+
 - [ROADMAP-CUTOVER.md](ROADMAP-CUTOVER.md) is the current delivery ledger: what
   shipped, what was verified live, and what remains. Its background/recovery
   section is a future contract, not an implemented worker.
