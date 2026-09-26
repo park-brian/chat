@@ -133,14 +133,24 @@ it. A full credential transport/log audit is **not yet implemented**.
    token selects due task IDs only; it may not select a user. Automate the
    generated machine-secret handoff without printing it. Do not enable the
    rule before a forced-session-loss live test.
-3. Recovery must **investigate**, never blindly replay an uncertain write.
-   Persist intent and observed facts; inspect the external target read-only.
-   If applied, checkpoint. If absent, retry with the original idempotency key
-   where supported, then verify. If unverifiable, assume it may have happened,
-   do other safe work, and finish `completed_with_uncertainty` with a
-   precise visible warning. Bound investigation and recheck current status,
-   grants, and budget before new chargeable work. Recreate ephemeral managed
-   tool sessions and never reinject revoked values.
+3. Recover an interrupted tool call with an ordinary agent read-back, not a
+   provider-specific recovery engine. Before a potentially mutating step,
+   checkpoint its safe intent and target reference; mark its result observed
+   when complete. A started step without an observed result has an unknown
+   outcome. The resumed agent must use normal read-only GET/HEAD/list tools
+   to inspect that target before making a dependent change. A confirmed
+   effect is not repeated. Reliably confirmed absence permits one retry with
+   the original idempotency key where supported. If read-back is ambiguous
+   or the target cannot be identified, do not repeat or depend on the write;
+   continue independent safe work and finish `completed_with_uncertainty`
+   with a precise visible warning. A 404 is not necessarily proof of absence,
+   and multiple effects inside one Code Interpreter call are not atomic.
+   Reuse the existing tool-call bound; add no generic verifier, recovery API,
+   or claim that the Runtime can enforce HTTP methods inside generated code.
+   Recheck current user status, grants, and budget before new chargeable work;
+   recreate ephemeral tool sessions without revoked credentials. This future
+   tool recovery is separate from the implemented `usage.reconcile` ledger
+   repair.
 4. Add work/school OneDrive only with a CloudFormation-owned Microsoft OAuth
    provider and AgentCore Identity token vault. Callback must restore Cognito
    identity and verify the initiating state/user. A dedicated workload

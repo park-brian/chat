@@ -1,6 +1,6 @@
 # AgentCore Chat: Runtime-only architecture
 
-Status: baseline deployed architecture, updated 2026-09-25. [ROADMAP-CUTOVER.md](ROADMAP-CUTOVER.md) supersedes this file for step-ledger accounting, administrator lifecycle, post-cutoff S3 history, conversation deletion, and their current rollout status. [FOUNDATION.md](FOUNDATION.md) records the earlier project/branch/object slice. Older sections below are retained for provenance; where they describe completed-turn-only charges, 30-day Memory, or file-only quota, use the cutover contract and current code instead. "Implemented" below means exercised in a disposable live AWS stack until production rollout is noted explicitly.
+Status: baseline deployed architecture, updated 2026-09-25. Start at [README.md](README.md). [ROADMAP-CUTOVER.md](ROADMAP-CUTOVER.md) supersedes this file for step-ledger accounting, administrator lifecycle, post-cutoff S3 history, conversation deletion, background/recovery design, and current rollout status. [FOUNDATION.md](FOUNDATION.md) records the earlier project/branch/object slice. Older sections below are retained for provenance; where they describe completed-turn-only charges, 30-day Memory, file-only quota, or on-demand-only background work, use the cutover contract and current code instead. "Implemented" below means exercised in a disposable live AWS stack until production rollout is noted explicitly.
 
 ## Product in one sentence
 
@@ -81,6 +81,29 @@ The Runtime advertises only the agent's granted code, Web Search, and Browser to
 Ordinary chat should stay foreground streaming. For a genuinely long job, use Runtime /ping HealthyBusy while active and a durable task row with ID, owner, status, checkpoint, lease-expiry, and result pointer. On demand, tasks.get or tasks.resume may acquire an expired lease; never rely on a process surviving forever, nor leave a permanent pending budget lock. Do not add SQS/EventBridge/worker resources until a real job requires stronger delivery guarantees. Terminal task results should be idempotent and metered only on measured completion. Benchmark cold start, warm control, first SSE chunk, full chat, and real tool turns before accepting any added orchestration layer.
 
 ## Runtime latency decision
+
+The 2026-09-25 opt-in paired benchmark used one disposable Cognito user/JWT
+and the same browser origin and payload per run. It alternated ten sequential
+sticky/fresh-ID pairs for each control command, warmed the sticky session,
+and did no inference. Values below are full-response median [range] in ms;
+`BENCHMARK_PAIRED` also emits every sample's headers, first byte, completion,
+inter-call gap, and status. There were no failed samples. Each run stopped all
+22 created Runtime sessions (`BENCHMARK_CLEANUP remaining: 0`).
+
+| Command | Run 1 sticky | Run 1 fresh | Run 2 sticky | Run 2 fresh |
+| --- | ---: | ---: | ---: | ---: |
+| `session.get` | 604.0 [507.7–1013.0] | 2402.6 [2169.3–6186.3] | 546.1 [495.8–586.6] | 2545.8 [2199.7–4421.5] |
+| `workspace.get` | 615.9 [512.1–751.3] | 2501.8 [2281.4–3482.4] | 553.1 [499.6–652.4] | 2258.3 [2121.0–2871.6] |
+
+Header and first-byte medians were within 1 ms of completion for these small
+JSON replies. Fresh IDs were materially slower in both runs, supporting the
+existing per-page reuse policy; this is not an SLA or an account-cost estimate.
+V2 can reclaim idle memory and a stopped ID can cold-start again, so no
+cross-tab/persistent-ID policy follows from this result. Run only on a
+disposable dev stack with `npm run bench:runtime -- STACK --profile eaap
+--region us-east-1`. This JWT-authorized Runtime must use the documented
+[Bearer-token stop endpoint](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-stop-session.html)
+for cleanup; SigV4 `StopRuntimeSession` is rejected with an auth-method mismatch.
 
 Warm browser-to-Runtime invocations have shown roughly half a second of fixed path latency in small live samples; cold ones are slower. One user-visible action should normally need one invocation. The signed-in browser therefore uses one opaque Runtime session ID for both control and chat. It rotates on login/logout. The durable Memory session remains agent/conversation-specific in the request body; it is not a Runtime microVM key. This keeps new conversations from provisioning a new microVM merely because their Memory histories differ. AgentCore reuses a microVM for the same Runtime session ID until its lifecycle ends, then may start a new one. Never store authoritative budgets, agent configurations, identity, or conversation history in process memory; a warm microVM is an optimization, not a database. Existing microVMs may continue serving an older deployed code version until they terminate, so deployment tests use a fresh Runtime session ID. V2 snapshots state after `/ping`, so startup must not capture user context, short-lived credentials, or request-specific data; the controller creates those inside `/invocations`. One disposable-stack benchmark before/after V2 measured cold 1.739/2.235 s and warm chat-complete p50 505/531 ms (five chats each), too small/noisy to claim an improvement.
 
