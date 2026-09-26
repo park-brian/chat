@@ -8,7 +8,7 @@
     <meta
       id="app-csp"
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-IaWRbrZqR0h0hwFXRxXiNyKqWURRQNKj+g8std91h+04HJNYqgKUOM8qYaXB1sbC' https://cdn.jsdelivr.net; style-src 'sha384-S8ghR21qNALtl9wjJIIIEEh4ACv4Q+gsyFBZjmI17dHyibCwJ4hGnitpGYC/w4fZ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-llKgif6bnFX7Ix7FwqBKQ97PrJ20AJw6JbotS6uLIwoU7P5U5cR+qu8tNLQe+15E' 'sha384-TJIl0k78gbM6Pk4OG9Viw+DiH7FWD8o+Qg0uykb6zluopzB/bTlR1AnIipQV0C7t' https://cdn.jsdelivr.net; style-src 'sha384-S8ghR21qNALtl9wjJIIIEEh4ACv4Q+gsyFBZjmI17dHyibCwJ4hGnitpGYC/w4fZ'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'"
     />
     <style>
       :root {
@@ -1726,7 +1726,7 @@
                   <div class="field"><label for="project-name">New project name</label>
                     <input id="project-name" name="name" maxlength="80" required /></div>
                   <div class="field"><label for="project-id">Permanent slug</label>
-                    <input id="project-id" name="id" pattern="[a-z0-9][a-z0-9-]{0,39}"
+                    <input id="project-id" name="id" pattern="[a-z0-9][a-z0-9\\-]{0,39}"
                       maxlength="40" placeholder="my-project" required /></div>
                 </div>
                 <div class="actions"><button class="primary" type="submit">Create project</button></div>

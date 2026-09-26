@@ -214,7 +214,36 @@ export async function createLiveFixture({ stackName, profile, region,
   let created = false;
   let sub;
   const chatSessions = new Map();
+  const runtimeSessions = new Set();
+  let stoppedRuntimeSessions = 0;
+  let runtimeStopToken;
+  const stopRuntimeSession = async (runtimeSessionId) => {
+    if (!runtimeStopToken) throw new Error("Benchmark OAuth token missing");
+    const url = `https://bedrock-agentcore.${region}.amazonaws.com/runtimes/${encodeURIComponent(outputs.ControllerArn)}/stopruntimesession?qualifier=DEFAULT`;
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(url, { method: "POST", headers: {
+        authorization: "Bearer " + runtimeStopToken,
+        "content-type": "application/json",
+        "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSessionId,
+      }, signal: AbortSignal.timeout(10000) });
+      if (response.ok || response.status === 404) {
+        runtimeSessions.delete(runtimeSessionId);
+        stoppedRuntimeSessions++;
+        return;
+      }
+      if (response.status === 409 && attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt));
+        continue;
+      }
+      throw new Error("StopRuntimeSession HTTP " + response.status + " " +
+        (response.headers.get("x-amzn-errortype") || response.statusText));
+    }
+  };
   const cleanup = async () => {
+    const stopFailures = [];
+    for (const id of runtimeSessions)
+      try { await stopRuntimeSession(id); }
+      catch (error) { stopFailures.push(`${id}: ${error.message}`); }
     if (sub) {
       for (const { projectId, memorySessionIds } of chatSessions.values()) {
         for (const sessionId of memorySessionIds) {
@@ -279,8 +308,15 @@ export async function createLiveFixture({ stackName, profile, region,
           ConditionExpression: "ownerSub = :sub",
           ExpressionAttributeValues: { ":sub": { S: sub } } }));
     }
-    if (created)
+    if (created) {
       await idp.send(new cognito.AdminDeleteUserCommand({ UserPoolId: pool, Username: email }));
+      created = false;
+    }
+    if (stoppedRuntimeSessions)
+      console.log("BENCHMARK_CLEANUP " + JSON.stringify({
+        stopped: stoppedRuntimeSessions, remaining: runtimeSessions.size }));
+    if (stopFailures.length)
+      throw new Error("Could not stop benchmark Runtime sessions: " + stopFailures.join("; "));
   };
   try {
     const createdUser = await idp.send(
@@ -340,6 +376,9 @@ export async function createLiveFixture({ stackName, profile, region,
     controllerUrl,
     hasGemini: Boolean(outputs.GeminiCredentialArn),
     hasScriptedModel: parameters.EnableScriptedModel === "true",
+    trackRuntimeSession: (id) => runtimeSessions.add(id),
+    setRuntimeStopToken: (token) => { runtimeStopToken = token; },
+    stopRuntimeSession,
     createPeer: (peerRole = "Members") => createLiveFixture({
       stackName, profile, region, role: peerRole }),
     trackChat: (agentId, sessionId, projectId = "main", rootlessBranchId) => {
@@ -401,6 +440,8 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         body.input.forkEventId === null ? body.input.branchId : null);
     uiInvocations.push({ command: body?.command, input: body?.input,
       runtimeSession: request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"] });
+    if (story === "runtime-benchmark")
+      fixture.trackRuntimeSession(request.headers()["x-amzn-bedrock-agentcore-runtime-session-id"]);
   });
   if (story === "runtime-ui") page.on("response", async (reply) => {
     if (reply.request().postDataJSON()?.command !== "chat.send") return;
@@ -493,6 +534,22 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         await page.getByRole("button", { name }).first().click();
       }
     };
+    const projectName = `Session smoke ${label}`;
+    const smokeProjectId = "session-" + crypto.randomUUID().slice(0, 8);
+    await chooseConversation(label === "mobile" ? "Projects" : "Main project");
+    const projectDialog = page.getByRole("dialog");
+    await projectDialog.locator("#project-name").fill(projectName);
+    await projectDialog.locator("#project-id").fill(smokeProjectId);
+    await projectDialog.getByRole("button", { name: "Create project" }).click();
+    await projectDialog.waitFor({ state: "hidden" });
+    await page.waitForURL((url) => url.searchParams.get("project") === smokeProjectId);
+    await chooseConversation(label === "mobile" ? "Projects" : projectName);
+    await page.getByRole("dialog").locator(".item")
+      .filter({ hasText: "Main project" }).getByRole("button", { name: "Open" }).click();
+    await page.waitForURL((url) => url.searchParams.get("project") === "main");
+    await chooseConversation("Usage");
+    await page.getByRole("dialog").getByText("Requests and tools").waitFor();
+    await page.getByRole("button", { name: "Close dialog" }).click();
     await chooseConversation("Integrations");
     const connectionDialog = page.getByRole("dialog");
     await connectionDialog.locator("#connection-name").fill(`UI GitHub ${label}`);
@@ -592,11 +649,20 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
     await page.locator(".message-text").getByText(`Echo: ${firstMessage}`).waitFor();
     const chats = uiInvocations.filter((item) => item.command === "chat.send");
     if (chats.length !== 2 || chats[0].input.sessionId === chats[1].input.sessionId ||
+      !uiInvocations.some((item) => item.command === "projects.create") ||
+      !uiInvocations.some((item) => item.command === "workspace.get" &&
+        item.input.projectId !== "main") ||
+      !uiInvocations.some((item) => item.command === "usage.get") ||
       uiInvocations.some((item) => item.command === "agents.list") ||
       uiInvocations.some((item) => item.runtimeSession !== uiInvocations[0].runtimeSession))
       throw new Error("UI did not reuse one Runtime session across control and conversations");
+    const beforeReload = uiInvocations.length;
     await page.reload();
     await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+    const reloaded = uiInvocations.slice(beforeReload).find((item) =>
+      item.command === "workspace.get");
+    if (!reloaded || reloaded.runtimeSession === uiInvocations[0].runtimeSession)
+      throw new Error("Reload did not start a new Runtime session");
     await chooseConversation(firstMessage);
     await page.locator(".message-text").getByText(`Echo: ${firstMessage}`).waitFor();
     if (!uiInvocations.some((item) => item.command === "conversations.get" &&
@@ -607,11 +673,31 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
         const { _screenshot } = await import("./tests.js");
         await _screenshot("live-chat", undefined, { fullPage: true });
       });
+    const beforeReauth = uiInvocations.length;
+    await page.goto(fixture.entryUrl);
+    const password = page.locator('input[type="password"]');
+    await Promise.race([
+      password.waitFor({ state: "visible", timeout: 45000 }),
+      page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 }),
+    ]);
+    if (await password.isVisible()) {
+      await page.locator('input[type="email"], input[name="username"]')
+        .first().fill(fixture.email);
+      await password.fill(fixture.password);
+      await page.locator('button[type="submit"], input[type="submit"]')
+        .first().click();
+    }
+    await page.locator('[data-app-state="ready"]').waitFor({ timeout: 45000 });
+    const reauthenticated = uiInvocations.slice(beforeReauth).find((item) =>
+      item.command === "workspace.get");
+    if (!reauthenticated || reauthenticated.runtimeSession === reloaded.runtimeSession)
+      throw new Error("Reauthentication reused an old Runtime session");
     return;
   }
   if (["runtime", "runtime-chat", "runtime-tool", "runtime-web", "runtime-connections", "runtime-model", "runtime-benchmark", "runtime-foundation", "runtime-roadmap"].includes(story)) {
     const accessToken = (await (await tokenResponse).json()).access_token;
     if (!accessToken) throw new Error("Cognito access token missing");
+    if (story === "runtime-benchmark") fixture.setRuntimeStopToken(accessToken);
     if (story === "runtime-roadmap") {
       if (!fixture.hasScriptedModel)
         throw new Error("runtime-roadmap requires scripted inference");
@@ -1347,81 +1433,94 @@ export async function runLiveStory(page, fixture, { story, screenshot }) {
       return;
     }
     if (story === "runtime-benchmark") {
-      const sample = await page.evaluate(async ({ runtimeUrl, token }) => {
-        const runtimeSession = `bench-${crypto.randomUUID()}`;
-        const call = async (command, input) => {
-          const start = performance.now();
-          const response = await fetch(runtimeUrl, { method: "POST", headers: {
-            authorization: `Bearer ${token}`, "content-type": "application/json",
-            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
-          }, body: JSON.stringify({ v: 1, command, input }) });
-          const data = await response.json();
-          if (!response.ok || !data.ok) throw Error(`${command}: ${response.status}`);
-          return { ms: performance.now() - start, data: data.data };
-        };
-        const coldRuntimeMs = (await call("workspace.get", {})).ms;
-        const controls = [];
-        for (let i = 0; i < 8; i++)
-          controls.push((await call("session.get", {})).ms);
-        const signIn = { separate: [], workspace: [] };
-        for (let i = 0; i < 5; i++) {
-          const start = performance.now();
-          await call("session.get", {});
-          await call("agents.list", { projectId: "main" });
-          signIn.separate.push(performance.now() - start);
-          signIn.workspace.push((await call("workspace.get", {})).ms);
-        }
-        const usageView = { parallel: [], combined: [] };
-        for (let i = 0; i < 5; i++) {
-          const start = performance.now();
-          await Promise.all([call("usage.summary", {}),
-            call("usage.list", { range: "30d" })]);
-          usageView.parallel.push(performance.now() - start);
-          usageView.combined.push((await call("usage.get", { range: "30d" })).ms);
-        }
-        const agentId = (await call("agents.put", {
-          projectId: "main", name: "Benchmark agent", modelId: "test.echo",
-        })).data.id;
-        const sessionId = crypto.randomUUID();
-        const chat = [];
-        for (let i = 0; i < 5; i++) {
-          const start = performance.now();
-          const response = await fetch(runtimeUrl, { method: "POST", headers: {
-            authorization: `Bearer ${token}`, "content-type": "application/json",
-            "x-amzn-bedrock-agentcore-runtime-session-id": runtimeSession,
-          }, body: JSON.stringify({ v: 1, command: "chat.send", input: {
-            projectId: "main", agentId, sessionId, requestId: crypto.randomUUID(), message: `turn ${i}`,
-          } }) });
-          if (!response.ok || !response.body) throw Error(`chat.send: ${response.status}`);
-          const reader = response.body.getReader();
-          const first = await reader.read();
-          const firstChunkMs = performance.now() - start;
-          let text = new TextDecoder().decode(first.value || new Uint8Array());
-          for (;;) {
-            const next = await reader.read();
-            if (next.done) break;
-            text += new TextDecoder().decode(next.value);
+      // Prove cleanup permission before opening the fresh-session arm.
+      try { await fixture.stopRuntimeSession(uiInvocations[0].runtimeSession); }
+      catch (error) {
+        throw new Error("StopRuntimeSession preflight failed: " +
+          error.name + ": " + error.message);
+      }
+      const samples = await page.evaluate(async ({ runtimeUrl, token }) => {
+        const stickyId = "bench-" + crypto.randomUUID();
+        const samples = [];
+        let previousEnd = null;
+        const invoke = async (command, sessionId) => {
+          const started = performance.now();
+          const gapMs = previousEnd === null ? null : started - previousEnd;
+          let headersMs, firstByteMs, status;
+          try {
+            const response = await fetch(runtimeUrl, { method: "POST", headers: {
+              authorization: "Bearer " + token, "content-type": "application/json",
+              "x-amzn-bedrock-agentcore-runtime-session-id": sessionId,
+            }, body: JSON.stringify({ v: 1, command, input: {} }) });
+            status = response.status;
+            headersMs = performance.now() - started;
+            const reader = response.body?.getReader();
+            if (!reader) throw Error("Response body missing");
+            const first = await reader.read();
+            firstByteMs = performance.now() - started;
+            if (first.done) throw Error("Response body empty");
+            const decoder = new TextDecoder();
+            let body = decoder.decode(first.value, { stream: true });
+            for (;;) {
+              const next = await reader.read();
+              if (next.done) break;
+              body += decoder.decode(next.value, { stream: true });
+            }
+            body += decoder.decode();
+            const completeMs = performance.now() - started;
+            const payload = JSON.parse(body);
+            if (!response.ok || !payload.ok)
+              throw Error(command + ": HTTP " + status + " " +
+                (payload.error?.code || "unknown"));
+            return { gapMs, headersMs, firstByteMs, completeMs, status };
+          } catch (error) {
+            return { gapMs, headersMs, firstByteMs,
+              completeMs: performance.now() - started, status,
+              error: String(error.message).slice(0, 160) };
+          } finally {
+            previousEnd = performance.now();
           }
-          if (!text.includes('"type":"message.done"')) throw Error(`Incomplete chat: ${text}`);
-          chat.push({ firstChunkMs, completeMs: performance.now() - start });
-        }
-        return { coldRuntimeMs, controls, signIn, usageView, chat, agentId, sessionId };
+        };
+        const warm = await invoke("session.get", stickyId);
+        if (warm.error) throw Error("Sticky warm-up failed: " + warm.error);
+        for (const command of ["session.get", "workspace.get"])
+          for (let pair = 0; pair < 10; pair++)
+            for (const arm of (pair % 2 ? ["fresh", "sticky"] : ["sticky", "fresh"])) {
+              const id = arm === "sticky" ? stickyId : "bench-" + crypto.randomUUID();
+              samples.push({ command, arm, pair, ...await invoke(command, id) });
+            }
+        return samples;
       }, { runtimeUrl: fixture.controllerUrl, token: accessToken });
-      fixture.trackChat(sample.agentId, sample.sessionId);
-      const percentile = (values, fraction) =>
-        Math.round([...values].sort((a, b) => a - b)[Math.ceil(values.length * fraction) - 1]);
-      const summarize = (values) => ({ p50Ms: percentile(values, 0.5), p95Ms: percentile(values, 0.95) });
-      console.log("BENCHMARK " + JSON.stringify({
-        coldRuntimeMs: Math.round(sample.coldRuntimeMs),
-        warmRuntimeControl: summarize(sample.controls),
-        sequentialSignIn: summarize(sample.signIn.separate),
-        workspaceSignIn: summarize(sample.signIn.workspace),
-        parallelUsageView: summarize(sample.usageView.parallel),
-        combinedUsageView: summarize(sample.usageView.combined),
-        chatFirstChunk: summarize(sample.chat.map((x) => x.firstChunkMs)),
-        chatComplete: summarize(sample.chat.map((x) => x.completeMs)),
-        samples: { controls: 8, signInPerPath: 5, usagePerPath: 5, chat: 5 },
+      const rounded = samples.map((sample) => Object.fromEntries(
+        Object.entries(sample).map(([key, value]) =>
+          [key, typeof value === "number" && key.endsWith("Ms")
+            ? Math.round(value * 10) / 10 : value])));
+      const stats = (values) => {
+        if (!values.length) return null;
+        const sorted = [...values].sort((a, b) => a - b);
+        const middle = Math.floor(sorted.length / 2);
+        const median = sorted.length % 2 ? sorted[middle] :
+          (sorted[middle - 1] + sorted[middle]) / 2;
+        return { medianMs: Math.round(median * 10) / 10,
+          rangeMs: [Math.round(sorted[0] * 10) / 10,
+            Math.round(sorted.at(-1) * 10) / 10] };
+      };
+      const summary = Object.fromEntries(["session.get", "workspace.get"].map(
+        (command) => [command, Object.fromEntries(["sticky", "fresh"].map((arm) => {
+          const rows = samples.filter((sample) =>
+            sample.command === command && sample.arm === arm && !sample.error);
+          return [arm, { successful: rows.length,
+            headers: stats(rows.map((row) => row.headersMs)),
+            firstByte: stats(rows.map((row) => row.firstByteMs)),
+            complete: stats(rows.map((row) => row.completeMs)) }];
+        }))]));
+      const failures = rounded.filter((sample) => sample.error);
+      console.log("BENCHMARK_PAIRED " + JSON.stringify({
+        origin: new URL(fixture.entryUrl).origin,
+        samplesPerArm: 10, summary, failures, samples: rounded,
       }));
+      if (failures.length)
+        throw new Error(failures.length + " paired Runtime samples failed");
       return;
     }
     if (story === "runtime-web") {
