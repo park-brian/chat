@@ -284,6 +284,7 @@ export function createSession() {
         const access = jwt(state.tokens.access_token),
           id = state.tokens.id_token ? jwt(state.tokens.id_token) : {};
         return {
+          sub: access.sub,
           email: id.email || "",
           role: access["cognito:groups"]?.[0] || null,
         };

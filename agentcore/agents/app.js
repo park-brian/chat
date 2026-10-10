@@ -209,20 +209,26 @@ mountPage({
     }
     async function load() {
       await feedback.perform(async () => {
-        setProjects((await rpc("projects.list")).items);
-        setShellProjects(projects());
+        // Project names are needed beside, not before, each section's own reads.
+        const listed = rpc("projects.list").then((result) => {
+          setProjects(result.items);
+          setShellProjects(result.items);
+        });
         if (section() === "projects") {
+          await listed;
           setView({ route: "projects", items: projects() });
           return;
         }
         if (section() === "skills") {
-          setView({
-            route: "skills",
-            ...(await rpc("objects.list", { projectId: projectId() })),
-          });
+          const [, objects] = await Promise.all([
+            listed,
+            rpc("objects.list", { projectId: projectId() }),
+          ]);
+          setView({ route: "skills", ...objects });
           return;
         }
-        const [saved, catalog, connections, objects] = await Promise.all([
+        const [, saved, catalog, connections, objects] = await Promise.all([
+          listed,
           rpc("agents.list", { projectId: projectId(), includeArchived: true }),
           rpc("models.list"),
           rpc("connections.list", { projectId: projectId() }),

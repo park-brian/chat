@@ -17,7 +17,7 @@ const phaseCopy = {
 const booting = (phase) => phase in phaseCopy;
 const initials = (email) => (email || "?").slice(0, 1).toUpperCase();
 
-export async function mountPage({ key, title, render, preload }) {
+export async function mountPage({ key, title, render }) {
   const auth = createSession(),
     api = createApi(auth);
   const query = new URL(location.href).searchParams;
@@ -39,23 +39,30 @@ export async function mountPage({ key, title, render, preload }) {
   const isAdmin = () => identity()?.role === "Administrators";
   const visible = (group) =>
     pages.filter((item) => item.group === group && (!item.admin || isAdmin()));
-  // A page's first data call may start beside session.get; it is used once and
-  // discarded whenever validation replaces the Runtime session.
-  let preloaded = null;
+  // Pages mount on token-derived identity while session.get confirms it, so their
+  // first reads overlap validation. The Runtime still authorizes every call. A cold
+  // or replaced Runtime unmounts the page until validation succeeds, so its load
+  // reruns against the confirmed session instead of surfacing transient errors.
+  const mounted = () =>
+    Boolean(auth.session()) && !["warming", "updating"].includes(phase());
+  // Pages read session().user without null checks; keep the last value while a
+  // signed-out page is being disposed so teardown effects cannot throw.
+  let lastSession = null;
+  const pageSession = () => {
+    const value = auth.session();
+    if (value) lastSession = value;
+    return value || lastSession;
+  };
   const context = {
     ...auth,
     ...api,
+    session: pageSession,
     projectId,
     pageUrl,
     setProjects,
     // Wrapped: a Solid setter would call a view function as an updater.
     setCrumb: (view) => setCrumb(() => view),
     setStatus: (view) => setStatus(() => view),
-    takePreload: () => {
-      const value = preloaded;
-      preloaded = null;
-      return value;
-    },
   };
   const loadProjects = () => {
     if (projects() || !auth.session()) return;
@@ -185,14 +192,14 @@ export async function mountPage({ key, title, render, preload }) {
           <span class="activity" aria-hidden="true"></span>
         </header>
         <main id="page-content" class=${"page-main page-" + key} tabindex="-1">
-          <${Show} when=${() => key !== "chat" && !booting(phase())}
+          <${Show} when=${() => key !== "chat" && (mounted() || !booting(phase()))}
             ><${Heading}
               title=${title}
               description=${() => (page.scoped ? "project · " + projectId() : "")}
           /><//>
           <${Notice} error=${true} text=${error} />
           <${Show}
-            when=${() => !booting(phase())}
+            when=${() => mounted() || !booting(phase())}
             fallback=${html`<section class="boot" role="status" aria-live="polite">
               <span class="boot-mark" aria-hidden="true">✦</span>
               <h1 class="boot-title">${() => phaseCopy[phase()]?.[0]}</h1>
@@ -223,7 +230,7 @@ export async function mountPage({ key, title, render, preload }) {
                 when=${() => !page.admin || auth.session()?.user.role === "Administrators"}
                 fallback=${html`<div class="empty">Administrator access is required.</div>`}
               >
-                ${() => (auth.session() ? render(context) : null)}
+                ${(shown) => render(context)}
               <//>
             <//>
           <//>
@@ -239,7 +246,9 @@ export async function mountPage({ key, title, render, preload }) {
     }
     if (auth.hasTokens()) {
       setPhase("restoring");
-      preloaded = preload?.(context)?.catch(() => null) || null;
+      const claims = auth.claims();
+      if (claims?.sub)
+        auth.setSession({ apiVersion: 2, user: claims, provisional: true });
       let validated,
         replacedWorker = false;
       for (let attempt = 0; attempt < 4; attempt++) {
@@ -248,7 +257,6 @@ export async function mountPage({ key, title, render, preload }) {
           if (validated.apiVersion !== 2) {
             if (replacedWorker)
               throw Error("This deployment is updating. Reload in a moment.");
-            preloaded = null;
             setPhase("updating");
             auth.resetRuntimeSession();
             replacedWorker = true;
@@ -266,7 +274,7 @@ export async function mountPage({ key, title, render, preload }) {
       auth.setSession(validated);
     }
   } catch (cause) {
-    preloaded = null;
+    if (auth.session()?.provisional) auth.setSession(null);
     setError(cause.message);
   } finally {
     if (!redirecting) setPhase(auth.session() ? "ready" : "signed-out");

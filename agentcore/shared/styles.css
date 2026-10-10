@@ -1546,6 +1546,23 @@ dialog::backdrop {
   letter-spacing: -0.02em;
 }
 
+/* Page switches are document loads; a cross-document view transition keeps the
+   top bar still while the content beneath it cross-fades. */
+@view-transition {
+  navigation: auto;
+}
+.topbar {
+  view-transition-name: topbar;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.16s;
+}
+/* The static first paint shows its mark only if Solid is slow to arrive. */
+[data-boot-phase="static"] .boot-mark {
+  animation: appear 0.3s 0.4s both;
+}
+
 /* Motion */
 @keyframes sweep {
   from {
@@ -1597,6 +1614,9 @@ dialog::backdrop {
   }
 }
 @media (prefers-reduced-motion: reduce) {
+  @view-transition {
+    navigation: none;
+  }
   *,
   *::before,
   *::after {

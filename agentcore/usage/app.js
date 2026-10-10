@@ -151,14 +151,21 @@ mountPage({
         if (request === viewRequest) setView({ route: "usage", ...result });
       }, "");
     }
-    feedback.perform(async () => {
-      setProjects((await rpc("projects.list")).items);
-      if (usageUser() && session().user.role === "Administrators")
-        setUsageUser(
-          (await rpc("users.get", { userSub: usageUser().sub })).user,
-        );
-      await loadView();
-    }, "");
+    // The selected user and filters come from the URL, so these reads are
+    // independent; overlap them instead of paying a Runtime round trip each.
+    feedback.perform(
+      () =>
+        Promise.all([
+          rpc("projects.list").then((result) => setProjects(result.items)),
+          usageUser() &&
+            session().user.role === "Administrators" &&
+            rpc("users.get", { userSub: usageUser().sub }).then((result) =>
+              setUsageUser(result.user),
+            ),
+          loadView(),
+        ]),
+      "",
+    );
     return html`${feedback.view}
       <section class="panel">
         <${Show}

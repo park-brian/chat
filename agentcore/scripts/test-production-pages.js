@@ -4,15 +4,23 @@ import { randomUUID } from "node:crypto";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { chromium } from "../../node_modules/playwright/index.mjs";
 import { createLiveFixture } from "../tests/fixtures.js";
+import { startServer } from "../../server.js";
 
 process.loadEnvFile(new URL("../../.env", import.meta.url));
 const visualOnly = process.argv.includes("--visual-only");
+// Measure the currently published release before deploying local changes.
+const baseline = process.argv.includes("--baseline");
+// Serve this checkout on the pool's registered LocalUrl callback instead of the
+// published origin, to exercise unpublished code against production services.
+const local = process.argv.includes("--local");
+let server;
 const fixture = await createLiveFixture({
   stackName: "agentcore-chat-prod",
   region: "us-east-1",
   profile: process.env.AWS_PROFILE,
 });
-let browser;
+let browser, page;
+const consoleLog = [];
 const evidence = {
   stackName: "agentcore-chat-prod",
   startedAt: new Date().toISOString(),
@@ -22,8 +30,15 @@ const evidence = {
 };
 const release = randomUUID();
 try {
-  const base = new URL(fixture.publicEntryUrl);
+  const base = new URL(
+    local ? "http://localhost:8000/agentcore/" : fixture.publicEntryUrl,
+  );
   base.search = "";
+  if (local)
+    server = await startServer(
+      8000,
+      new URL("../../", import.meta.url).pathname.replace(/^[/](\w:)/, "$1"),
+    );
   const files = [
     "index.html",
     "app.js",
@@ -45,7 +60,7 @@ try {
       "importmap.json",
     ].map((file) => "shared/" + file),
   ];
-  for (const file of files) {
+  for (const file of baseline || local ? [] : files) {
     const url = new URL(file, base);
     url.searchParams.set("release", release);
     const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
@@ -57,15 +72,29 @@ try {
       "Published file differs: " + file,
     );
   }
-  console.log(
-    "PASS: all 21 published entrypoints and shared assets match the validated source",
-  );
+  if (!baseline && !local)
+    console.log(
+      "PASS: all 21 published entrypoints and shared assets match the validated source",
+    );
   browser = await chromium.launch();
-  const page = await browser.newPage({
+  page = await browser.newPage({
     viewport: { width: 1440, height: 1000 },
   });
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) =>
+    consoleLog.push(`${message.type()}: ${message.text()}`.slice(0, 300)),
+  );
+  page.on("response", async (response) => {
+    if (response.url() === fixture.controllerUrl && response.status() !== 200)
+      consoleLog.push(
+        `runtime ${response.status()} ${response.request().postDataJSON()?.command}: ` +
+          (await response.text().catch(() => "")).slice(0, 300),
+      );
+  });
+  page.on("framenavigated", (frame) => {
+    if (frame === page.mainFrame()) consoleLog.push("navigated: " + frame.url().slice(0, 120));
+  });
   // Real latency evidence: each Runtime call, and the boot phases each document passes through.
   page.on("requestfinished", async (request) => {
     if (request.url() !== fixture.controllerUrl) return;
@@ -80,17 +109,27 @@ try {
     const start = performance.now(),
       phases = [];
     window.__bootPhases = phases;
+    let content = false;
     new MutationObserver(() => {
       const phase = document
         .querySelector(".page-layout")
         ?.getAttribute("data-boot-phase");
       if (phase && phases.at(-1)?.phase !== phase)
         phases.push({ phase, ms: Math.round(performance.now() - start) });
+      // "content": the page's data is on screen, whether or not session.get has returned.
+      const main = document.getElementById("page-content");
+      if (
+        !content &&
+        main?.querySelector(".panel, .chat-panel, .signin") &&
+        !main.querySelector('[aria-busy="true"], .boot')
+      ) {
+        content = true;
+        phases.push({ phase: "content", ms: Math.round(performance.now() - start) });
+      }
     }).observe(document, {
       subtree: true,
       attributes: true,
       childList: true,
-      attributeFilter: ["data-boot-phase"],
     });
   });
   page.on("requestfailed", (request) => {
@@ -205,6 +244,8 @@ try {
   await page.locator("#usage-range").selectOption("90d");
   await page.reload();
   assert.equal(await page.locator("#usage-range").inputValue(), "90d");
+  const timing = () =>
+    page.evaluate(() => ({ phases: window.__bootPhases }));
   const openLink = async (name) => {
     const link = page.getByRole("link", { name, exact: true });
     if (!(await link.isVisible()))
@@ -229,10 +270,11 @@ try {
     await openLink(
       key === "chat" ? "Chat" : key[0].toUpperCase() + key.slice(1),
     );
-    await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
+    await settled(key);
+    (evidence.nav ??= {})[key] = await timing();
     await page.reload();
     await settled(key);
-    evidence.boot[key] = await page.evaluate(() => window.__bootPhases);
+    evidence.boot[key] = await timing();
     assert.equal(await page.locator('a[aria-current="page"]').count(), 1);
     await page.screenshot({
       path: new URL(key + "-desktop.png", screens).pathname.replace(
@@ -394,8 +436,26 @@ try {
   evidence.completedAt = new Date().toISOString();
   evidence.passed = true;
   evidence.visualOnly = visualOnly;
+} catch (cause) {
+  // Cleanup can fail after a broken login; report the original failure first.
+  console.error("SMOKE FAILURE:", cause);
+  console.error(consoleLog.join("\n"));
+  if (page)
+    console.error(
+      "state:",
+      await page
+        .evaluate(() => ({
+          url: location.href,
+          app: document.querySelector(".page-layout")?.dataset,
+          alerts: [...document.querySelectorAll('[role="alert"]')].map((e) => e.textContent),
+          main: document.getElementById("page-content")?.innerText.slice(0, 300),
+        }))
+        .catch((error) => error.message),
+    );
+  throw cause;
 } finally {
   if (browser) await browser.close();
+  if (server) await new Promise((resolve) => server.close(resolve));
   await fixture.cleanup();
   evidence.cleanedAt = new Date().toISOString();
   await writeFile(

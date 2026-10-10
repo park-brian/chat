@@ -32,27 +32,31 @@ export function createApi(auth) {
     for (const controller of observers) controller.abort();
   });
   async function request(command, input = {}, signal) {
-    const token = await auth.accessToken(),
-      config = auth.deployment();
-    return fetch(
-      `https://bedrock-agentcore.${config.region}.amazonaws.com/runtimes/${encodeURIComponent(config.runtime)}/invocations?qualifier=DEFAULT`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: "Bearer " + token,
-          "x-amzn-bedrock-agentcore-runtime-session-id":
-            auth.runtimeSessionId(),
+    const requestId = crypto.randomUUID();
+    for (let attempt = 0; ; attempt++) {
+      const token = await auth.accessToken(),
+        config = auth.deployment();
+      const response = await fetch(
+        `https://bedrock-agentcore.${config.region}.amazonaws.com/runtimes/${encodeURIComponent(config.runtime)}/invocations?qualifier=DEFAULT`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + token,
+            "x-amzn-bedrock-agentcore-runtime-session-id":
+              auth.runtimeSessionId(),
+          },
+          signal,
+          body: JSON.stringify({ v: 1, command, requestId, input }),
         },
-        signal,
-        body: JSON.stringify({
-          v: 1,
-          command,
-          requestId: crypto.randomUUID(),
-          input,
-        }),
-      },
-    );
+      );
+      // AgentCore answers 409 "Session operation in progress" to calls that
+      // arrive while it is still creating this session's microVM, such as a
+      // page's first reads overlapping session.get after sign-in. Nothing ran;
+      // the controller's own failures never reach the browser as 409.
+      if (response.status !== 409 || attempt >= 20) return response;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
   }
   async function rpc(command, input = {}) {
     setPending((count) => count + 1);
