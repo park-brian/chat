@@ -1,8 +1,8 @@
 # AgentCore Chat cutover contract
 
-Status: implementation and live-test record for the 2026-09-25 roadmap. This
+Status: implementation and live-test record, updated 2026-10-10. This
 document distinguishes a working slice from the remaining milestones. The
-buildless page, one V2 Runtime, one Memory resource, one table, and one shared
+buildless documents, one V2 Runtime, one Memory resource, one table, and one shared
 versioned bucket remain the deployment shape. The production origin is
 `https://park-brian.github.io/chat/agentcore/`.
 
@@ -35,7 +35,7 @@ that bounded detail; `usage.list` supports 30/90-day or bounded explicit
 dates, self/selected/all users, project/agent/request/tool/kind/quality/status
 filters, time order, and filter-bound pagination. `usage.daily` reads the
 same-table daily summaries, including a combined administrator view. The
-single Usage modal shows period and 30/90-day model estimates, request detail,
+Usage page shows period and 30/90-day model estimates, request detail,
 and separate unpriced tools. These are token-and-reviewed-rate estimates,
 **not** delayed AWS billing or a complete dollar cap.
 
@@ -85,8 +85,8 @@ bounded cleanup calls. A failed delete remains recoverable as DELETING.
 
 `agents.setArchived` is revision checked. Archived configurations remain
 available to reopen historical chats, but are absent from active agent
-navigation and cannot run/edit until restored. The Users and Usage controls
-share the existing modal. The company-grouped reviewed `models.json`
+navigation and cannot run/edit until restored. The independent Users and Usage
+pages use the shared authenticated shell. The company-grouped reviewed `runtime/models.json`
 remains the sole model catalog; there is no admin model table.
 
 The renderer formats fenced code as text nodes inside scrollable blocks;
@@ -118,21 +118,63 @@ and a bounded account label. Members cannot test another owner's connection;
 Auditors cannot use a stored credential. The full credentials continue to be
 injected only into explicitly granted code sessions. Generated code can
 exercise the key's full external scope; a UI intent label does not attenuate
-it. A full credential transport/log audit is **not yet implemented**.
+it. The October 10 slice audits the new private credential transport, metadata,
+browser persistence, output redaction, and disposable Runtime logs; arbitrary
+code transformations and account-operator telemetry remain separate audit scope.
+
+## Slice 4: independent pages, private credentials, native background runs
+
+Each of Chat, Profile, Users, Usage, Agents, Connectors, and Credentials owns
+an `index.html` and external `app.js`. Shared bootstrap validates current Runtime
+identity on every document and fetches no feature data. Ordinary directory links
+work under the GitHub Pages installation subdirectory without rewrites. The root
+PKCE callback stores/restores the requested destination. Deployment descriptor,
+tokens, and opaque Runtime session ID use deployment-isolated tab storage;
+sign-out clears authentication and broadcasts to other open documents. A protocol
+version check refreshes an old warm Runtime binding once during rollout.
+
+Users is a compact paginated list with invitation and account defaults. Its links
+open Profile, which uses `users.get` with the exact `users.list` projection, shows
+inherited/effective limits, and links to selected-user Usage. Own profiles are
+available to all roles; another user's profile and edits require administrator
+authorization. Protected administrator controls remain enforced server-side.
+Usage retains detail, summaries, advanced filters, pagination, and reconciliation;
+meaningful filters live in the URL. Agents includes Projects and Files & skills,
+revisioned edits, archive/restore, model/tool compatibility, and explicit grants.
+All entrypoints share typography, responsive navigation, keyboard focus, save
+feedback, errors/loading/empty states, and unsaved-form protection.
+
+Private `CREDENTIAL#id` and `CONNECTION#id` rows replace the legacy bundle in the
+existing user partition. Credentials list/create/rename/rotate/delete never
+return saved secret values. Connector writes accept a compatible `credentialId`,
+never an API key. Revision-checked transactions update both connector configuration
+and credential references. In-use deletion is refused. Each legacy bundle migrates
+atomically and idempotently at its observed revision, preserving connector IDs
+and agent grants. Administrators cannot read another user's credentials.
+
+`chat.start` acknowledges only after accepted identity/context, request row,
+branch lock, and active-conversation metadata are persisted. Matching duplicate
+starts return the existing request; changed input conflicts and competing branch
+turns are rejected. The model/tool loop runs independently of the HTTP observer.
+`chat.status`, bounded reconnectable `chat.watch`, and cooperative `chat.cancel`
+expose its lifecycle; `chat.send` remains a start-and-watch adapter. Private
+sequenced S3 progress chunks expire after seven days. Durable history, request
+records, and accounting remain. `/ping` is `HealthyBusy` while tasks or tool
+cleanup are active and returns `Healthy` in `finally`. Reload, navigation,
+sign-out, and closed browsers detach observers without cancelling work. Metadata
+discovers active main and pending-fork requests on return. Stale Runtime work
+becomes `outcome_unknown`; no automatic inference or tool replay occurs.
 
 ## Remaining ordered milestones
 
-1. Finish workbench: complete focus/keyboard and responsive polish,
-   interrupted-stream resolution, the credential transport/log audit, and
-   saved-output edge cases (large files, interrupted transfer, retries). Verify
-   rotation/revocation in fresh sessions.
-2. Separate work from the SSE observer. At acceptance persist owner, project,
-   agent revision, branch head, grants, request ID and step checkpoint. Add
-   `chat.status`/`chat.watch`, private expiring run state, HealthyBusy only
-   while active, and an EventBridge OAuth `worker.tick` wake path. A machine
-   token selects due task IDs only; it may not select a user. Automate the
-   generated machine-secret handoff without printing it. Do not enable the
-   rule before a forced-session-loss live test.
+1. Validate saved-output edge cases (large files, interrupted transfer, retries),
+   audit account-operator telemetry beyond the new credential paths, and complete
+   billing reconciliation for managed tools/Runtime/storage. Current usage is
+   reported-token estimates plus explicitly unpriced tool events.
+2. Design automatic Runtime-loss recovery separately from native background
+   execution. Any future scheduled wake/worker path must select stored owned task
+   IDs, recheck current authorization, and pass forced-session-loss tests before
+   enabling recovery. No machine secret or EventBridge worker exists in this slice.
 3. Recover an interrupted tool call with an ordinary agent read-back, not a
    provider-specific recovery engine. Before a potentially mutating step,
    checkpoint its safe intent and target reference; mark its result observed
@@ -164,6 +206,74 @@ it. A full credential transport/log audit is **not yet implemented**.
    optional contracts.
 
 ## Verification and release rules
+
+2026-10-10 pages evidence: both repository and AgentCore `npm test` passed.
+The root suite reported 91 tests plus four tab-lifecycle stories. AgentCore
+checks seven CSP/import maps, accounting/model/Gemini protocols, credential
+transactions/migration, independent run admission/final-event ordering,
+controller authorization, desktop/mobile page journeys, PKCE return/refresh,
+deployment isolation, sign-out broadcasts, and confirmation keyboard/focus.
+Desktop/mobile Profile, Users, Usage, Agents, Connectors, Credentials, and Chat
+captures were inspected under `.artifacts/screenshots/pages/`.
+
+Reusable disposable `agentcore-pages-test-1a0fd5f0` validated final
+`controller/d10ad44c002c5e960b60.zip` (443,762 bytes). Preserved foundation and
+roadmap regressions passed project isolation, nested/first-turn branches,
+uploads/skills, quota inheritance, Memory-loss archive reopen, request detail,
+reconciliation, protected administrator controls, archive/restore, and exact-byte
+deletion. Managed Web Search and Browser passed real service calls. The seven
+requested models each passed real inference and Code Interpreter with durable
+results and observed charges during this slice; subsequent fixes changed only
+stream finalization and the `chat.send` admission-error adapter.
+
+The full pages suite passed self/admin/Auditor enforcement, disabled identities,
+foreign-resource denial, credential reuse, concurrent rotation, in-use deletion,
+repeated bundle migration preserving IDs/grants, accepted-request deduplication,
+competing branch denial, navigation, explicit sign-out, fully closed Chromium,
+watcher detach/reconnect, pending-fork refresh, one committed result/charge set,
+cooperative cancellation with observed usage, and forced Runtime loss yielding
+`outcome_unknown` without replay. A real granted Code Interpreter echo verified
+raw/base64 credential output redaction. Scoped CloudWatch Runtime log checks
+found no raw/base64 synthetic credential values. CloudTrail lookup returned no
+`InvokeCodeInterpreter` events to inspect; this is not evidence about unconfigured
+data-event trails or account-operator telemetry. No arbitrary-transformation
+redaction guarantee is claimed.
+
+Disposable artifact updates changed only Controller with replacement `False`.
+A read-only production-template comparison preserved all 20 resource logical
+IDs. After explicit user authorization, the validated artifact was uploaded and
+production change set `pages-review-982f01ce-b302-4625-a706-11b12ae1b3ee`
+was prepared on 2026-10-10. CloudFormation reports `CREATE_COMPLETE` and
+`AVAILABLE`: Controller, ControllerRole, and SharedObjects are modified with
+replacement `False`; every changed property requires recreation `Never`.
+All parameters except ControllerCodeKey retain their production values, including
+the root callback; scripted inference remains disabled. The review record is
+`.artifacts/pages-production-review.json`. Following explicit authorization to
+continue the rollout, the change set was executed on 2026-10-10 and reached
+`UPDATE_COMPLETE`. A before/after comparison verified all 20 physical resource
+identities were preserved. GitHub Pages publication and its production smoke
+gate follow this Runtime update.
+`prepare-production-change-set.js`
+prepares review only, preserves every other parameter with `UsePreviousValue`
+(including NoEcho), refuses production scripted inference, records replacements,
+and never executes the change set. Preserve the root callback and all existing
+resource identities during rollout.
+
+Reproduce from `agentcore/`: `npm test`; `node scripts/test-live-pages.js`
+for the recorded disposable stack; append `runtime-foundation`, `runtime-roadmap`,
+`runtime-web`, or `runtime-model` for the preserved protocol/tool/provider gates;
+`node scripts/test-credential-logs.js` for scoped log checks. Use the exact
+validated ZIP with the production-review script only after authorization.
+Disposable cleanup verifies both stack purpose and retained-bucket stack tags;
+smoke identities, owner records, objects, and Runtime sessions are cleaned in
+fixture `finally` blocks. Native background execution is implemented; automatic
+Runtime recovery, OneDrive OAuth, customer AWS roles, editable personal identity,
+and complete billed-cost reconciliation remain separate work.
+
+After validation, the owned disposable stack and its tagged retained bucket,
+including exact object versions/delete markers, were removed. The initial
+rolled-back bootstrap had zero remaining resources and its stack record was
+also removed. Production resources were excluded from cleanup.
 
 2026-09-25 release evidence: `npm test` in both repository and
 `agentcore/` passed. Against reusable disposable

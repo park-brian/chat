@@ -1,0 +1,12 @@
+{
+  "imports": {
+    "solid-js": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/dist/solid.js",
+    "solid-js/web": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/web/dist/web.js",
+    "solid-js/html": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/html/dist/html.js"
+  },
+  "integrity": {
+    "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/dist/solid.js": "sha384-BE7VFCy88CF6ECpktJQMCXpki/ezM9I9hsndLzUfpDsPvDOeWQlDnnhrmsNxQOYe",
+    "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/web/dist/web.js": "sha384-+WZhEcTm3CsmdNBOtGmaXx6GMXon8WVtuDimlh6qpj6DN3jZVr1XLdwlkrT4f0E5",
+    "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/html/dist/html.js": "sha384-y0dvNquDclIU3TJfM5Jpw+ei8Y9ed9mP9YbaCPOuFq9ncniHaE49SN4JgG/43hOU"
+  }
+}

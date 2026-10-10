@@ -224,12 +224,19 @@ async function run(config = options(process.argv.slice(2))) {
             "Horizontal overflow at " + viewport + ": " + overflow + "px",
           );
         const coverage = await page.coverage.stopJSCoverage();
+        const externalModule = await page.evaluate(() =>
+          [...document.scripts].find((script) => script.type === "module" && script.hasAttribute("src"))?.getAttribute("src"),
+        );
+        const coverageTarget = externalModule ? new URL(externalModule, pageUrl) : pageUrl;
+        const coverageFile = externalModule ? path.resolve(path.dirname(absoluteTarget), externalModule) : absoluteTarget;
+        if (path.relative(repository, coverageFile).startsWith(".."))
+          throw new Error("Coverage module must stay inside the repository");
         const entry = coverage.find((item) =>
-          isCoverageEntryForTarget(item, pageUrl),
+          isCoverageEntryForTarget(item, coverageTarget),
         );
         const { report } = createCoverageReport(
-          relativeTarget.split(path.sep).join("/"),
-          fileSource,
+          path.relative(repository, coverageFile).split(path.sep).join("/"),
+          externalModule ? await readFile(coverageFile, "utf8") : fileSource,
           entry,
           {
             width: process.stdout.columns || 120,

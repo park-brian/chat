@@ -1,10 +1,61 @@
 # AgentCore Chat: Runtime-only architecture
 
-Status: baseline deployed architecture, updated 2026-09-25. Start at [README.md](README.md). [ROADMAP-CUTOVER.md](ROADMAP-CUTOVER.md) supersedes this file for step-ledger accounting, administrator lifecycle, post-cutoff S3 history, conversation deletion, background/recovery design, and current rollout status. [FOUNDATION.md](FOUNDATION.md) records the earlier project/branch/object slice. Older sections below are retained for provenance; where they describe completed-turn-only charges, 30-day Memory, file-only quota, or on-demand-only background work, use the cutover contract and current code instead. "Implemented" below means exercised in a disposable live AWS stack until production rollout is noted explicitly.
+Status: architecture updated 2026-10-10. Start at [README.md](README.md). [ROADMAP-CUTOVER.md](ROADMAP-CUTOVER.md) owns validation and rollout status. [FOUNDATION.md](FOUNDATION.md) records an earlier release. Historical details below are retained for provenance; the current ownership contract immediately below supersedes descriptions of modal navigation, memory-only tokens, credential bundles, or foreground-only execution. "Implemented" means exercised in a disposable live AWS stack until production rollout is noted explicitly.
+
+## Current ownership and structure
+
+Seven independent Solid apps use ordinary directory links: root Chat, Profile,
+Users, Usage, Agents, Connectors, and Credentials. Each HTML document contains
+its title, CSP, pinned import map, external stylesheet, root, and external
+`app.js`. `shared/importmap.json` is canonical; `scripts/sync-csp.js` synchronizes
+and checks every entrypoint. There is no client router, build, or hosting rewrite.
+
+`shared/page.js` exposes `mountPage({key,title,render})`. It validates the session
+through Runtime `session.get` on every bootstrap, then supplies session, RPC,
+stream transport, and navigation to the feature. The shell never imports a page
+app or fetches its feature data. `session.js` owns Cognito PKCE, refresh, sign-out,
+and deployment-isolated tab storage. The root OAuth callback restores the
+validated destination recorded in the PKCE transaction. `api.js` owns JSON RPC
+and reconnectable SSE observation. `navigation.js` derives the installation
+base from its module URL, including the GitHub Pages subdirectory. Shared UI
+owns notices, headings, badges, unsaved-change protection, and focus-restoring
+confirmation dialogs. Features own their forms, filters, pagination, and state.
+
+Profile reads share the exact projection used by Users. Users links to Profile,
+which links to filtered Usage. Admin role/status/limits controls stay on Profile;
+Users owns invitations and account defaults. Agents owns local Projects and
+Files & skills sections, including revisioned grants and archive/restore.
+Connectors own GitHub/Jira configuration and tests; Credentials own reusable
+private secrets and their reference lists.
+
+`runtime/controller.js` owns HTTP dispatch and current Cognito authorization.
+`users.js` owns profile/admin commands; `credentials.js` owns private credential
+and connector records, transactional references, and revision-checked bundle
+migration; `connections.js` owns bounded connection tests. `chat.js` owns the
+existing provider/tool/metering loop. `runs.js` owns admission, branch locks,
+accepted context, sequenced private progress, watching, cancellation, and stale
+outcomes. Accounting and provider helpers remain separate modules. One
+content-addressed CodeZip packages this Runtime; no per-page backend exists.
+
+Accepted work belongs to Runtime, not its HTTP response. Admission persists
+request identity and execution context before acknowledging, rejects competing
+branch turns, and reuses matching duplicate starts. An independent task keeps
+`/ping` at `HealthyBusy` until cleanup completes. Observers detach on navigation,
+reload, sign-out, or closed tabs; `chat.cancel` is the only cancellation action.
+Conversation metadata discovers active work on return. Progress is chunked and
+expires after seven days; request/accounting records remain. Runtime loss yields
+`outcome_unknown` and never automatically repeats inference or tool effects.
+
+Credentials and connectors are owned rows in the existing DynamoDB table.
+Connectors reference `credentialId`; agent grants retain connector IDs. Writes
+use revisions and transactional reference updates; referenced secrets cannot
+be deleted. Migration atomically replaces each legacy bundle at its checked
+revision, preserves connector IDs/grants, and is safe to repeat. Metadata never
+contains saved secrets, and administrator status never grants foreign access.
 
 ## Product in one sentence
 
-A buildless SolidJS page at https://park-brian.github.io/chat/agentcore/ signs users into Cognito and calls one JWT-protected AgentCore CodeZip Runtime; that Runtime executes configurable agents with direct Bedrock Converse, AgentCore Memory and managed tools, while one DynamoDB table stores only app-specific configuration, permissions, budgets, and usage. Plain CloudFormation owns the shared infrastructure.
+Seven small buildless SolidJS apps at https://park-brian.github.io/chat/agentcore/ sign users into Cognito and call one JWT-protected AgentCore CodeZip Runtime; it executes configurable agents with direct providers, Memory and managed tools, while DynamoDB and private S3 own configuration, credentials, runs, usage and durable archives. Plain CloudFormation owns the shared infrastructure.
 
 ## Why this is the smallest shape
 
@@ -17,7 +68,7 @@ A buildless SolidJS page at https://park-brian.github.io/chat/agentcore/ signs u
 
 ## Trust and ownership
 
-Normal browser: non-secret deployment descriptor in URL, Cognito authorization-code PKCE, in-memory access token, authenticated POST to the Runtime /invocations endpoint. No user JWT in localStorage, no secret in URL, no direct DynamoDB writes, no generic AWS-operation proxy. The account state remains AWS, not browser storage. Static assets are pinned; inline-module CSP hashes are checked by npm test. Read the coding notes at the top of index.html before editing Solid expressions.
+Normal browser: non-secret deployment descriptor in URL, Cognito authorization-code PKCE, deployment-isolated tab tokens in sessionStorage, authenticated POST to Runtime /invocations. No user JWT in localStorage, no secret in URL, no direct DynamoDB writes, no generic AWS-operation proxy. The account state remains AWS, not browser storage. Static dependencies are pinned and integrity/CSP checked for every entrypoint by npm test.
 
 Runtime: only the AgentCore front door is public. It checks issuer, client ID, token use, expiry, subject shape, and fixed group cardinality after service validation. A local port must never be exposed as a public auth surface. Administrators can manage defaults, users, and their own agents; Members manage their own agents and chat; Auditors read only their permitted views. Model choice and rates come from reviewed source control, not a model-management UI or table. Admin combined usage is an explicit role gate. All write operations are scoped by the derived subject or a validated target and use least-privilege IAM. Never log tokens, prompts, credential bodies, or third-party secrets.
 
@@ -25,7 +76,7 @@ AWS administrators: CLI bootstrap is allowed. Production Cognito administrators 
 
 ## Current resources and code
 
-CloudFormation template.yaml creates a Cognito user pool, managed-login domain and public PKCE client, three groups, one on-demand DynamoDB table with a sparse UsageByTime index, one versioned private S3 bucket, AgentCore Memory, Gateway/Policy Engine with one managed Web Search target and narrow permit, one PUBLIC custom Code Interpreter, and (after ZIP upload) one Node 22 CodeZip Runtime with its IAM role. The Runtime role can start/invoke/stop the AWS-managed Browser; no custom Browser resource is provisioned. Runtime is explicitly `PlatformVersion: V2`; this is the managed execution platform, not the immutable agentRuntimeVersion number. An optional GeminiApiKey NoEcho parameter creates one AgentCore Identity managed API-key provider; without it Gemini is disabled. The only server source is controller.js, bundled to one index.js ZIP by scripts/build-controller.js. The ZIP key is content-addressed and supplied as ControllerCodeKey in a stack update. The browser app is index.html; tests.js holds opt-in stories and _screenshot, using the shared parent test.js. scripted-model.js is enabled only by a disposable-stack parameter and mocks inference only; Cognito, Runtime, Gateway, Browser, Identity, Memory, DynamoDB, and Code Interpreter remain real in live tests.
+CloudFormation template.yaml creates a Cognito user pool, managed-login domain and public PKCE client, three groups, one on-demand DynamoDB table with a sparse UsageByTime index, one versioned private S3 bucket, AgentCore Memory, Gateway/Policy Engine with one managed Web Search target and narrow permit, one PUBLIC custom Code Interpreter, and (after ZIP upload) one Node 22 CodeZip Runtime with its IAM role. The Runtime role can start/invoke/stop the AWS-managed Browser; no custom Browser resource is provisioned. Runtime is explicitly `PlatformVersion: V2`; this is the managed execution platform, not the immutable agentRuntimeVersion number. An optional GeminiApiKey NoEcho parameter creates one AgentCore Identity managed API-key provider; without it Gemini is disabled. Runtime modules are bundled from runtime/controller.js into one index.js ZIP by scripts/build-controller.js. The ZIP key is content-addressed and supplied as ControllerCodeKey in a stack update. Each browser page owns index.html and app.js; shared/ supplies the foundation. tests.js delegates to tests/ and preserves _screenshot for the parent runner. runtime/scripted-model.js is enabled only by a disposable-stack parameter and mocks inference only; Cognito, Runtime, Gateway, Browser, Identity, Memory, DynamoDB, and Code Interpreter remain real in live tests.
 
 Bootstrap: create the stack with blank ControllerCodeKey; upload the deterministic ZIP into its SharedObjects output; update that same stack with the key; wait for Runtime READY; take ApplicationEntryUrl. Later code iterations reuse the stack and update only the key. Do not create/destroy a stack per browser test. Preserve the stack during development, then delete the exact disposable stack and inspect/delete only its retained bucket and versions. The browser should gain a guided CloudFormation administration dialog after auth/stack APIs are proven in browser CORS; no privileged deployment credentials should be mixed with the Cognito session.
 
@@ -61,6 +112,8 @@ Current dialog routes: Account, Projects, Agents, Files & skills, Integrations, 
 Saved conversation metadata is one per-session row under the owner/project key, indexed by last activity in the existing sparse time index; messages remain only in Memory. The page can list/reopen them after login or reload, and mobile navigation uses the same modal. A turn is visibly pending until message.done; an interrupted stream is marked uncertain and cannot be silently resent in that conversation before reopening. Each Memory event now also contains a JSON receipt with request identity, reported token meters, rate snapshot, estimated cost, and tool facts. The receipt is recovery evidence, not the budget ledger. On-demand idempotent repair of a Memory-success/table-failure split is still unimplemented, so a turn with missing navigation metadata cannot yet be reopened from the UI. Conversation index reads are eventually consistent; direct reopen is strongly scoped and reads Memory. AgentCore may surface a Runtime 404 as HTTP 424 to browser callers.
 
 ## Usage and budget invariants
+
+The 2026-10-10 catalog review adds Haiku 5.5, Sonnet 5.5, and GPT-6.1 Sol alongside Fable 5.1, Opus 5.5, GPT-6 Luna, and Gemini 3.8 Flash. Sonnet 5 and GPT-6 Sol remain available for saved agents. New IDs are also covered by the Runtime IAM allowlist. GPT-6.1 Sol supports low through max effort, with no none setting; Claude uses adaptive thinking. New prices are sourced from [Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing) and the [Bedrock Sol 6.1 card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-sol.html), separately labeled from the older AWS agreement-offer review. Haiku prompts over 100,000 input tokens and Sol 6.1 prompts over 272,000 use their long-context rates for the entire request; prompt length includes cache reads and writes. Usage rows snapshot the selected tier's rates. One capped tool-call request succeeded for each of the seven requested models using the local app credentials. This verifies local provider access; the AgentCore stack still needs its updated catalog, controller bundle, and IAM policy deployed before the new choices become available there.
 
 The default is $5 per user per UTC day and 5,000,000,000 storage bytes. Administrators can change account defaults, per-user limits, and daily/weekly/monthly UTC reset cadence. Reset is lazy: a period key is computed at read/admission time; no cron, scheduled Lambda, or pending reservation exists. Historical rows survive reset. A strongly consistent current-period sum gates a new chat only when already at or above the budget. Concurrent races can overdraft; that is accepted as our error and the user is not charged a synthetic penalty. A failed or stuck pending request cannot block future work.
 
@@ -137,12 +190,22 @@ The September 24 Gemini parity slice passed on the existing production V2 stack 
 
 The GitHub Pages origin passed desktop/mobile login and all four real Gemini stories on the final ZIP. Reusing one fresh Runtime session within each story gave observed warm turn times of 2.4 s text, 4.3 s Code, 5.6 s Search, and 9.9 s for two Browser actions. These single samples are a directional comparison, not a p50/p95 performance claim; tools include managed session startup and external service latency. Local protocol checks cover split SSE, signed/parallel calls, multimodal parts, cumulative/missing/inconsistent usage, blocked/malformed finishes, and request-size rejection. Google's current REST endpoint rejected a documented image `$ref` even with a matching `displayName`; a direct live probe showed a no-reference nested PNG was accepted and visually interpreted. The final Runtime uses that shape and logs neither screenshots nor signatures. Full billed-but-failed model-call reconciliation remains separate work.
 
-Read index.html's header before editing. Change one cohesive region at a time; the file is small enough to reason about as sections: deployment/login, RPC/chat, signals/view loading, dialog bodies, shell. Keep server responsibilities in controller.js and pure math in accounting.js. Use apply_patch, then npm run csp:sync, npm test, and the smallest relevant live story. Run parent node server.js or let the shared browser runner reuse/start it. Run visual desktop/mobile stories and inspect screenshots for typography, spacing, focus, overflow, and contrast. Test local static origin first, then published GitHub Pages origin.
+Edit the owning page or shared module, keeping feature-specific state out of the shell. Runtime domain code lives under runtime/; pure accounting math remains separate. Use apply_patch, then npm run csp:sync, npm test, and the smallest relevant live story. Run parent node server.js or let the shared browser runner reuse/start it. Inspect desktop/mobile screenshots for typography, focus, overflow, and contrast. Validate the local static origin and disposable stack before an approved production rollout and published-origin smoke.
 
 The 2026-09-25 foundation release reused the same production stack and shipped CodeZip `controller/6795a908a8014e5915b6.zip`. The disposable stack passed project isolation/hiding, native nested and separate-session first-turn branches, stale-head conflict, real S3 upload/download/quota/cleanup, skill use, null-versus-zero overrides, and desktop/mobile browser UI stories. Production `test:runtime` and published-origin desktop/mobile login passed with disposable Cognito users. One real published-origin Gemini 3.8 Flash Browser story completed two managed Browser actions, usage/Memory checks, and cleanup in 9.1 seconds; that is one observed sample, not a latency percentile. The existing production user was audited and migrated to inherited version-2 budget/storage markers without deleting legacy numeric values. See [FOUNDATION.md](FOUNDATION.md) for the exact API and remaining reconciliation limits.
 
 Live disposable stacks for these slices were chat-dev-20260922182027, chat-latency-202609230047, and chat-models-20260922-b7, profile eaap, us-east-1; all were removed after development, including the retained test bucket/ZIP. The live suite passed Cognito login, config/control mutations, Memory multi-turn history, real Code Interpreter tool use, chronological 30/90-day usage, admin combined usage, a sticky Runtime session, and the fixed model dropdown. Capped model turns completed in roughly 3–5 seconds, but initial successes can precede failed Marketplace subscription setup; check agreement status before claiming durable availability. In the earlier warm-session benchmark, sequential session.get plus agents.list had p50/p95 775/807 ms versus workspace.get 455/467 ms (five samples each). Two parallel Usage calls had 348/378 ms versus usage.get 313/403 ms (five samples each); the median difference was modest and p95 noisy. Warm session.get was 445/498 ms (eight samples), scripted chat first chunk 396/459 ms and completion 488/589 ms (five each), and one Code Interpreter turn about 3.6 seconds. These are exploratory samples, not an SLA.
 
-Useful commands from agentcore: npm install; npm run csp:sync; npm test; npm run test:visual; npm run build:controller; npm run test:live -- STACK --profile eaap --region us-east-1 --screenshot --viewports desktop,mobile; npm run test:runtime -- STACK --profile eaap --region us-east-1; npm run test:runtime-composer -- STACK --profile eaap --region us-east-1 --screenshot --viewports desktop,mobile; npm run test:runtime-model -- STACK --profile eaap --region us-east-1 (all five Bedrock models); npm run test:runtime-chat -- STACK --profile eaap --region us-east-1; npm run test:runtime-tool -- STACK --profile eaap --region us-east-1; npm run test:runtime-web -- STACK --profile eaap --region us-east-1 --screenshot; `$env:AGENTCORE_TEST_MODEL='gemini-3.8-flash'; npm run test:runtime-model -- STACK --profile eaap --region us-east-1` (then remove the env variable); set `AGENTCORE_TEST_MODEL=global.anthropic.claude-sonnet-5` and `AGENTCORE_TEST_WEB=1` for a paid real Web Search continuation; npm run bench:runtime -- STACK --profile eaap --region us-east-1. Live fixtures remove their temporary Cognito users, agents, Memory sessions, and table rows.
+Current commands from `agentcore/`: `npm test`; `npm run csp:sync`;
+`npm run build:controller`; `npm run test:pages`. On the recorded disposable
+stack, `node scripts/test-live-pages.js` runs the complete pages/background gate;
+append `runtime-foundation`, `runtime-roadmap`, or `runtime-web` for retained
+project/accounting/managed-tool regressions. `runtime-model` tests all seven
+requested live providers with Code Interpreter; `AGENTCORE_TEST_MODEL` can select
+one checked-in model. `npm run bench:runtime -- STACK --profile eaap --region
+us-east-1` preserves the paired Runtime benchmark. Live fixtures clean their
+exact synthetic identities, records, objects, Memory events and Runtime sessions.
+Prepare production change-set review only after explicit authorization; its
+script preserves NoEcho parameters and never executes the review.
 
 Sources: [AgentCore CodeZip Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-get-started-code-deploy-node.html), [Runtime sessions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-sessions.html), [Memory events](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory-customer-scenario.html), [AgentCore Identity credential scoping](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/scope-credential-provider-access.html), [Bedrock model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html), [Claude capacities](https://platform.claude.com/docs/en/models/overview), [Claude effort and adaptive thinking](https://platform.claude.com/docs/en/build-with-claude/effort), [Bedrock Claude adaptive fields](https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html), [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol), [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna), [Gemini 3.8 Flash limits](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash), [Gemini function responses](https://ai.google.dev/gemini-api/docs/generate-content/function-calling), [Gemini thought signatures](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures), [Gemini token usage schema](https://ai.google.dev/api/generate-content), [Gemini thinking levels](https://ai.google.dev/gemini-api/docs/thinking).

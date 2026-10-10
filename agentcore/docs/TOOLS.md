@@ -1,10 +1,21 @@
 # Tools and connected code
 
-Status: Code Interpreter, GitHub/Jira API-key grants, Web Search, and Browser are deployed. Web Search and Browser passed disposable-stack authenticated chats; production Claude Fable, Opus, and Sonnet Browser turns also passed on 2026-09-23. Gemini Code, Search, and a two-step Browser continuation passed production live stories on 2026-09-24. Background tasks, cross-account roles, Jira identity verification, managed-tool price attribution, and the secret-transport/log audit remain planned. A CloudFormation resource alone does not make a tool available.
+Status: updated 2026-10-10. Code Interpreter, GitHub/Jira grants, Web Search,
+and Browser are implemented. Reusable private credentials, bounded connector
+identity tests, independent background execution, and the new-path transport/log
+audit are validated on a disposable stack. All seven current models passed
+real inference and Code Interpreter with durable results and metering. Historical
+production tool evidence below predates this slice; its production rollout is
+pending a separately approved change-set review. Cross-account roles, automatic
+Runtime recovery, and managed-tool price attribution remain separate work.
 
 ## Product decision
 
-Keep **one configured agent per DDB row and one shared Runtime**. Give each agent a short list of capabilities rather than a second harness or a Runtime per integration. The modal agent form becomes the place to enable tools and enter their non-secret options. A separate Connections modal accepts/rotates credentials and binds them to the current user/project; agents reference connection IDs, never secret values.
+Keep **one configured agent per DDB row and one shared Runtime**. Agents owns
+capability switches, non-secret options, and connector grants. Connectors binds
+configuration to owned reusable Credentials. Agents reference connector IDs,
+never secret values. Independent page documents share bootstrap and visual
+components; the Runtime remains the policy and execution owner.
 
 There are three distinct paths:
 
@@ -61,7 +72,7 @@ Code instructions should be short, checked-in, and loaded only for granted tools
 
 ## UI shape
 
-The existing Agents dialog owns the three built-in capability switches; Integrations owns external credentials. Claude and configured Gemini may use all three tools; GPT-6 may use Code and Web Search but not screenshot Browser:
+The Agents page owns the three built-in capability switches and explicit connector grants. Connectors owns GitHub/Jira configuration and tests; Credentials owns reusable private secrets. Claude and configured Gemini may use all three tools; GPT-6 may use Code and Web Search but not screenshot Browser:
 
 - Code workspace: PUBLIC-network warning, maximum run time, read/write connection grants. A full-access grant is explicit because generated code can read and transmit any key placed in its session. Show the exact granted connections before saving.
 - Web Search: enable and 1–25 maximum results. The Runtime appends source links to the answer, including after reload.
@@ -69,7 +80,7 @@ The existing Agents dialog owns the three built-in capability switches; Integrat
 - GitHub: choose a saved connection, default owner/repo/branch, read-only or write-capable intent, and “Test connection.” Do not suggest that an intent toggle can narrow a write-capable PAT inside unrestricted code.
 - Jira: choose a saved connection, site URL/project key, read-only or write-capable intent, auth mode (Cloud email+API token vs bearer token), and “Test connection.”
 
-The Connections dialog lists owned GitHub/Jira metadata and offers Add, Rotate, Delete; the Agents dialog grants selected IDs to full-access code. A key input is write-only: never reveal it on read or return it in a list response. Users and admins manage only their own connections; admin status does not expose another user's keys. Read-only Test and status metadata are future work.
+Connectors lists owned GitHub/Jira metadata and offers create/edit/delete and bounded read-only Test. Credentials offers create/rename/rotate/delete and shows referring connectors. Agents grants connector IDs to full-access code. A secret input is write-only; saved values are never returned by metadata reads. Users and admins manage only their own records; admin status does not expose another user's keys.
 
 ## Minimal Runtime API and data
 
@@ -78,12 +89,28 @@ Keep the single `POST /invocations` contract. Add only:
 | Command | Permission | Result |
 | --- | --- | --- |
 | `connections.list({projectId:"main"})` | signed-in | Own metadata, never key |
-| `connections.put({projectId:"main",name,kind,apiKey,jiraUrl?,jiraEmail?})` | member/admin | Validate and insert GitHub or Jira credential |
-| `connections.rotate({projectId:"main",id,apiKey})` | owner | Replace key without changing agent grants |
-| `connections.delete({projectId:"main",id})` | owner | Delete key; stale grants block future chat until agent edit |
+| `credentials.list({})` | signed-in | Owned metadata and referring connectors, never secret values |
+| `credentials.put({id?,revision?,name,kind,secret?})` | member/admin | Create a private secret or revision-checked rename |
+| `credentials.rotate({id,revision,secret})` | member/admin | Replace secret without changing connectors or grants |
+| `credentials.delete({id,revision})` | member/admin | Delete only if no connector references it |
+| `connections.put({id?,revision?,name,kind,credentialId,jiraUrl?,jiraEmail?})` | member/admin | Validate configuration and transactionally update credential references |
+| `connections.test({id})` | member/admin | Bounded read-only provider identity probe |
+| `connections.delete({id,revision})` | member/admin | Remove connector/reference; stale agent grants block future chat until edited |
 | `agents.put({...,codeInterpreter,connectionIds,revision?})` | member/admin | Validate owned grants; revisioned edit/create |
 
-The existing table has one `USER#sub / CREDENTIALS` row containing `connectionsJson` and an integer `revision`. The JSON maps connection UUIDs to name/kind/createdAt, optional Jira HTTPS URL/email, and the key. This is a deliberate one-bundle-per-user design: the [AgentCore Identity quota is 50 API-key providers per account/Region](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/bedrock-agentcore-limits.html), too low for a provider per connection in a multi-user product. DynamoDB encrypts table data at rest by default, but the Runtime IAM role and account operators with table-read rights can access key material; this is **not** per-secret IAM isolation. Ownership is enforced in Runtime code using the Cognito subject, never tags or browser input. Strong reads plus conditional revision writes prevent lost updates; racing writers retry. A user can keep at most 10 connections. No additional table, Lambda, Identity provider, or Secrets Manager resource is needed. Never return the JSON row to the browser or put it in Memory, S3, usage, agent config, logs, or a URL.
+The existing table stores owned `USER#sub / CREDENTIAL#id` secrets and
+`USER#sub / CONNECTION#id` configuration. Connectors reference a compatible
+`credentialId`; credentials maintain transactional reference sets. Strong reads,
+revisions, and conditional transactions prevent lost updates and refuse in-use
+deletion. A legacy `CREDENTIALS` bundle is migrated atomically at its checked
+revision, preserving connector IDs/grants and replacing the secret-bearing bundle
+with a migration marker. Repeated migration is harmless. No additional table,
+Lambda, Identity provider, or Secrets Manager resource is needed. DynamoDB
+encrypts table data at rest, but account operators with table-read rights can
+access key material; this is not per-secret IAM isolation. Runtime ownership uses
+the derived Cognito subject. Never return private rows to the browser or put
+saved secrets in URLs, browser storage, Memory, S3 progress/history, usage,
+agent configuration, metadata responses, or logs.
 
 Use the repository `.env` for **local tests and explicit bootstrap only**: `GITHUB_PAT`, `JIRA_API_KEY`, and `JIRA_URL` exist; `JIRA_EMAIL` does not, so do not assume Jira Cloud Basic auth. No value belongs in source control, CloudFormation outputs, CodeZip environment variables, browser storage, or test logs. Smoke connections and users must be deleted after testing.
 
@@ -91,7 +118,7 @@ Use the repository `.env` for **local tests and explicit bootstrap only**: `GITH
 
 Code is the **primary** Jira/GitHub integration path: one Code Interpreter tool, small provider-specific guides, and a selected connection. The Runtime is only a credential/authorization broker plus a bounded read-only connection test, not a growing library of Jira/GitHub operations. Use Gateway for native Web Search and later only where its schema/policy materially helps. The Jira integration-provider template is currently console-only and requires hosting an external server, so it is not a no-code native Jira connector.
 
-The user's local `.env` does **not** automatically appear in an AgentCore Code Interpreter session. Nor do the Runtime's environment variables: the Code Interpreter `StartCodeInterpreterSession` API has no environment-variable field. For each chat request, the Runtime derives owner/project, verifies the agent's stored connection IDs, strongly reads that user's credential bundle, and writes **one session-local `.env` file** through Code Interpreter `writeFiles` before model-generated code runs. It contains context and only explicitly granted values: `GITHUB_TOKEN` or `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`. The prompt names variables and connection labels, not values. Keys are base64-serialized within the file to handle shell quoting; this is **not encryption**. Python, Node, and shell wrappers decode values into process environment variables. Generated code can read and transmit any granted key, as intended by a full-access grant. Neither the browser nor agent config sends a key in a chat prompt.
+The user's local `.env` does **not** automatically appear in an AgentCore Code Interpreter session. Nor do the Runtime's environment variables: the Code Interpreter `StartCodeInterpreterSession` API has no environment-variable field. For each chat request, the Runtime derives owner/project, verifies the agent's stored connector IDs, strongly resolves only their owned referenced credentials, and writes **one session-local `.env` file** through Code Interpreter `writeFiles` before model-generated code runs. It contains context and only explicitly granted values: `GITHUB_TOKEN` or `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`. The prompt names variables and connection labels, not values. Keys are base64-serialized within the file to handle shell quoting; this is **not encryption**. Python, Node, and shell wrappers decode values into process environment variables. Generated code can read and transmit any granted key, as intended by a full-access grant. Neither the browser nor agent config sends a key in a chat prompt.
 
 Live dummy-value probes established the loading rule: `writeFiles` accepts a relative `.env` path (not an absolute one); shell/Python run in the shared workspace, but Node `executeCode` has a different working directory. Resolve the file's absolute path with a non-secret `pwd` probe and keep it in the Runtime request state. Every shell, Python, and Node operation reloads the file and decodes only the known variable names; shell exports do not persist across calls. The first slice stops the session at the end of every chat request, so rotation/revocation takes effect on the next request. Do not display file contents or rely on filesystem mode bits as isolation.
 

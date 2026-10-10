@@ -5,7 +5,10 @@ import { build } from "esbuild";
 import { zipSync } from "fflate";
 
 const output = await build({
-  entryPoints: [fileURLToPath(new URL("../controller.js", import.meta.url))],
+  absWorkingDir: fileURLToPath(new URL("../", import.meta.url)),
+  entryPoints: [
+    fileURLToPath(new URL("../runtime/controller.js", import.meta.url)),
+  ],
   bundle: true,
   platform: "node",
   target: "node22",

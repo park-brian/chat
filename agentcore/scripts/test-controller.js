@@ -4,15 +4,20 @@ import { fileURLToPath } from "node:url";
 
 const port = 20000 + Math.floor(Math.random() * 20000);
 const endpoint = `http://127.0.0.1:${port}`;
-const child = spawn(process.execPath, [fileURLToPath(new URL("../controller.js", import.meta.url))], {
-  env: { ...process.env, PORT: String(port) },
-  stdio: "ignore",
-});
+const child = spawn(
+  process.execPath,
+  [fileURLToPath(new URL("../runtime/controller.js", import.meta.url))],
+  {
+    env: { ...process.env, PORT: String(port) },
+    stdio: "ignore",
+  },
+);
 
 try {
   let health;
   for (let attempt = 0; attempt < 60; attempt++) {
-    if (child.exitCode !== null) throw new Error("Controller exited before it was ready");
+    if (child.exitCode !== null)
+      throw new Error("Controller exited before it was ready");
     try {
       health = await fetch(endpoint + "/ping");
       break;
@@ -28,7 +33,8 @@ try {
       headers: authorization ? { authorization } : {},
       body: JSON.stringify({ v: 1, command: "session.get", input: {} }),
     });
-    if (response.status !== 403) throw new Error("Unauthenticated invocation was not denied");
+    if (response.status !== 403)
+      throw new Error("Unauthenticated invocation was not denied");
   }
   console.log("PASS: controller health and unauthenticated denial");
 } finally {
