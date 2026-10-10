@@ -347,6 +347,41 @@ try {
     );
     await page.goto(new URL(`?conversation=${input.sessionId}`, base).href);
     await page.locator(".message.assistant").getByText(/42/).waitFor();
+    await page.waitForFunction(() => !document.querySelector(".topbar[data-busy]"));
+    await page.screenshot({ path: shotPath("chat-conversation-mobile.png") });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.screenshot({
+      path: shotPath("chat-conversation-desktop.png"),
+      mask: [page.locator(".account-head")],
+    });
+    // The same conversation continued through the composer: Send, live run pill,
+    // streamed answer, then the settled saved conversation.
+    await page
+      .getByRole("textbox", { name: "Message" })
+      .fill("What is 50 + 8? Reply with the number only.");
+    const sentAt = Date.now();
+    await page.getByRole("button", { name: "Send ↑" }).click();
+    await page.locator('.run-pill[data-state="working"]').waitFor();
+    evidence.uiTurn = { pillMs: Date.now() - sentAt };
+    await page.screenshot({ path: shotPath("chat-ui-turn-running.png") });
+    await page
+      .locator(".message.assistant")
+      .getByText(/58/)
+      .waitFor({ timeout: 120000 });
+    evidence.uiTurn.answerMs = Date.now() - sentAt;
+    await page.locator(".run-pill").waitFor({ state: "detached", timeout: 60000 });
+    await page.waitForFunction(() => !document.querySelector(".topbar[data-busy]"));
+    evidence.uiTurn.settledMs = Date.now() - sentAt;
+    assert.equal(await page.locator(".message").count(), 4);
+    assert.equal(await page.locator(".message-state").count(), 0);
+    assert.equal(
+      await page.getByRole("textbox", { name: "Message" }).inputValue(),
+      "",
+    );
+    await page.screenshot({
+      path: shotPath("chat-ui-turn-settled.png"),
+      mask: [page.locator(".account-head")],
+    });
     assert.deepEqual(errors, []);
     evidence.completedAt = new Date().toISOString();
     evidence.passed = true;

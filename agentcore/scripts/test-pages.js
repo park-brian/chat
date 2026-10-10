@@ -102,6 +102,19 @@ try {
       const { command, input } = route.request().postDataJSON();
       calls.push({ command, input });
       if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      // Same shape as production: the terminal snapshot repeats the last progress sequence.
+      if (command === "chat.watch")
+        return route.fulfill({
+          status: 200,
+          contentType: "text/event-stream",
+          body: [
+            { type: "message.delta", sequence: 1, text: "Done" },
+            { type: "message.done", sequence: 2, eventId: "3#c", branchId: "main" },
+            { type: "run.status", status: "completed", sequence: 2, branchId: "main" },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(""),
+        });
       if (cold && command === "session.get") {
         cold = false;
         return route.fulfill({
@@ -162,6 +175,7 @@ try {
           ],
           nextCursor: null,
         };
+      else if (command === "chat.start") data = { requestId: input.requestId };
       else if (command === "agents.list") data = { items: [agent] };
       else if (command === "models.list")
         data = { items: catalog.map((model) => ({ ...model, active: true })) };
@@ -263,6 +277,15 @@ try {
     await page.emulateMedia({ colorScheme: "dark" });
     await shot("chat-thread-dark");
     await page.emulateMedia({ colorScheme: "light" });
+    await page.getByRole("textbox", { name: "Message" }).fill("Continue");
+    await page.getByRole("button", { name: "Send ↑" }).click();
+    await page.locator(".run-pill").waitFor({ state: "detached", timeout: 5000 });
+    await page.getByRole("button", { name: "Send ↑" }).waitFor();
+    assert.equal(
+      calls.filter(({ command }) => command === "chat.watch").length,
+      1,
+      "A completed run is observed once, not reconnected forever",
+    );
     await navigation("users/");
     await page.getByRole("link", { name: /member@example.com/ }).click();
     await page.getByRole("heading", { name: "member@example.com" }).waitFor();

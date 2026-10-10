@@ -124,8 +124,12 @@ export function createApi(auth) {
                 .join("\n");
               if (!data) continue;
               const event = JSON.parse(data);
-              if (event.sequence && event.sequence <= after) continue;
-              if (event.sequence) after = event.sequence;
+              // run.status is a state snapshot carrying the last progress
+              // sequence, not a progress event: never drop it as a replay.
+              const progress = event.type !== "run.status";
+              if (progress && event.sequence && event.sequence <= after)
+                continue;
+              if (progress && event.sequence) after = event.sequence;
               onEvent(event);
               if (
                 event.type === "run.status" &&
