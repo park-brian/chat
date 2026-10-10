@@ -290,9 +290,29 @@ while the UI stayed on "Working…". After the client fix (`ce96a49`), a real
 Haiku 5.5 turn sent from the composer showed the run indicator at 0.9 s, the
 answer at 2.9 s, and settled at 3.6 s on one `chat.watch` call. Evidence
 records add `rpc` latencies, `boot` phases and `uiTurn` timings; captures
-include `chat-ui-turn-running.png` and `chat-ui-turn-settled.png`. Pages other
-than Chat still issue their first data call only after `session.get`, adding
-one round trip before content.
+include `chat-ui-turn-running.png` and `chat-ui-turn-settled.png`.
+
+Commit `547a28c` (Pages run for that commit) moved page content to one
+Runtime round trip with no Runtime change. Pages mount on token-derived
+identity while `session.get` confirms it. Usage and Agents overlap their
+independent reads, and page switches use cross-document view transitions.
+Against the published release, content appeared after 0.95-1.66 s on every
+page except Chat (about 0.55 s). After the change it appeared in 0.43-0.72 s
+on all seven pages, including the full smoke and a composer turn settled in
+3.0 s. The first attempt (`314d4e4`) broke published sign-in for about 20
+minutes until revert `f5dbead`. A tab's Runtime session ID is new after login,
+and AgentCore answers HTTP 409 `Session operation in progress, please retry`
+to any call that overlaps creation of that session's microVM; `session.get`
+lost that race. The client now retries that 409, which the controller never
+returns. The same race already affected Chat's overlapped `workspace.get`
+after sign-in. Mocked stories could not show it, so this was diagnosed with
+`node scripts/test-production-pages.js --local`, which serves the checkout on
+the pool's registered `LocalUrl` callback and uses real Cognito and the
+production Runtime without publishing. Hover prerendering with speculation
+rules was left out: automation never showed an activation, and a prerender
+started without the tab's session storage could render a signed-in user as
+signed out. Profile and Users remain about 0.65-0.75 s because `users.get`
+and `users.list` are slower server-side.
 `prepare-production-change-set.js`
 prepares review only, preserves every other parameter with `UsePreviousValue`
 (including NoEcho), refuses production scripted inference, records replacements,
