@@ -234,6 +234,13 @@ try {
     assert.ok(boot.indexOf("workspace.get") < boot.lastIndexOf("session.get"));
     delay = 0;
     calls.length = 0;
+    if (name === "desktop") {
+      await page.getByRole("button", { name: "Account menu" }).click();
+      await page.getByRole("link", { name: "Profile", exact: true }).click();
+      await page.getByRole("heading", { name: "admin@example.com" }).waitFor();
+      await page.goto(base);
+      await page.locator(".welcome").waitFor();
+    }
     const shot = (label) =>
       page.screenshot({
         path: new URL(`${name}-${label}.png`, snapshots).pathname.replace(
@@ -286,6 +293,11 @@ try {
       await navigation(path);
       await page.locator(".empty, .panel, .chat-panel").first().waitFor();
       if (path === "agents/") await page.locator("#agent-name").waitFor();
+      await page.waitForFunction(
+        () => !document.querySelector('#page-content [aria-busy="true"]'),
+        null,
+        { timeout: 5000 },
+      );
       await page.screenshot({
         path: new URL(
           `${name}-${path.replace("/", "") || "chat"}.png`,

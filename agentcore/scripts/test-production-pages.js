@@ -10,13 +10,17 @@ const visualOnly = process.argv.includes("--visual-only");
 const fixture = await createLiveFixture({
   stackName: "agentcore-chat-prod",
   region: "us-east-1",
+  profile: process.env.AWS_PROFILE,
 });
 let browser;
 const evidence = {
   stackName: "agentcore-chat-prod",
   startedAt: new Date().toISOString(),
   pages: [],
+  rpc: [],
+  boot: {},
 };
+const release = randomUUID();
 try {
   const base = new URL(fixture.publicEntryUrl);
   base.search = "";
@@ -43,7 +47,7 @@ try {
   ];
   for (const file of files) {
     const url = new URL(file, base);
-    url.searchParams.set("release", "d10ad44c002c5e960b60");
+    url.searchParams.set("release", release);
     const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
     assert.equal(response.status, 200, file);
     const normalize = (text) => text.replaceAll("\r\n", "\n");
@@ -62,6 +66,33 @@ try {
   });
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
+  // Real latency evidence: each Runtime call, and the boot phases each document passes through.
+  page.on("requestfinished", async (request) => {
+    if (request.url() !== fixture.controllerUrl) return;
+    evidence.rpc.push({
+      command: request.postDataJSON()?.command,
+      page: new URL(page.url()).pathname,
+      ms: Math.round(request.timing().responseEnd),
+      status: (await request.response())?.status(),
+    });
+  });
+  await page.addInitScript(() => {
+    const start = performance.now(),
+      phases = [];
+    window.__bootPhases = phases;
+    new MutationObserver(() => {
+      const phase = document
+        .querySelector(".page-layout")
+        ?.getAttribute("data-boot-phase");
+      if (phase && phases.at(-1)?.phase !== phase)
+        phases.push({ phase, ms: Math.round(performance.now() - start) });
+    }).observe(document, {
+      subtree: true,
+      attributes: true,
+      childList: true,
+      attributeFilter: ["data-boot-phase"],
+    });
+  });
   page.on("requestfailed", (request) => {
     if (["script", "stylesheet"].includes(request.resourceType()))
       errors.push("Failed asset: " + request.url());
@@ -145,6 +176,8 @@ try {
     import.meta.url,
   );
   await mkdir(screens, { recursive: true });
+  const shotPath = (file) =>
+    new URL(file, screens).pathname.replace(/^[/](\w:)/, "$1");
   const settled = async (key) => {
     await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
     await page.waitForFunction(
@@ -172,6 +205,18 @@ try {
   await page.locator("#usage-range").selectOption("90d");
   await page.reload();
   assert.equal(await page.locator("#usage-range").inputValue(), "90d");
+  const openLink = async (name) => {
+    const link = page.getByRole("link", { name, exact: true });
+    if (!(await link.isVisible()))
+      await page.getByRole("button", { name: "Account menu" }).click();
+    try {
+      await link.click({ timeout: 15000 });
+    } catch (cause) {
+      await page.screenshot({ path: shotPath("failure.png") });
+      console.log(await page.locator(".topbar").ariaSnapshot());
+      throw cause;
+    }
+  };
   for (const key of [
     "profile",
     "users",
@@ -181,15 +226,13 @@ try {
     "credentials",
     "chat",
   ]) {
-    await page
-      .getByRole("link", {
-        name: key === "chat" ? "Chat" : key[0].toUpperCase() + key.slice(1),
-        exact: true,
-      })
-      .click();
+    await openLink(
+      key === "chat" ? "Chat" : key[0].toUpperCase() + key.slice(1),
+    );
     await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
     await page.reload();
     await settled(key);
+    evidence.boot[key] = await page.evaluate(() => window.__bootPhases);
     assert.equal(await page.locator('a[aria-current="page"]').count(), 1);
     await page.screenshot({
       path: new URL(key + "-desktop.png", screens).pathname.replace(
@@ -197,7 +240,7 @@ try {
         "$1",
       ),
       fullPage: true,
-      mask: [page.locator(".sidebar-account")],
+      mask: [page.locator(".account-head")],
     });
     evidence.pages.push(key);
   }

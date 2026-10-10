@@ -30,6 +30,7 @@ await mountPage({
       [files, setFiles] = createSignal([]),
       [filesCursor, setFilesCursor] = createSignal(null),
       [filesLoaded, setFilesLoaded] = createSignal(false),
+      [filesRequested, setFilesRequested] = createSignal(false),
       [loaded, setLoaded] = createSignal(false),
       [historyOpen, setHistoryOpen] = createSignal(false);
     let observer, fileDialog, fileDialogTrigger;
@@ -528,6 +529,7 @@ await mountPage({
     // Files only matter once the picker opens, so they no longer delay the first render.
     async function ensureFiles() {
       if (filesLoaded()) return;
+      setFilesRequested(true);
       try {
         const objects = await rpc("objects.list", { projectId: projectId() });
         setFiles(objects.items);
@@ -1158,7 +1160,9 @@ await mountPage({
         <div class="dialog-body">
           <${Show}
             when=${filesLoaded}
-            fallback=${html`<${Skeleton} variant="list" rows=${3} label="Loading files…" />`}
+            fallback=${html`<${Show} when=${filesRequested}
+              ><${Skeleton} variant="list" rows=${3} label="Loading files…"
+            /><//>`}
           >
             <${For}
               each=${() => files().filter((item) => ["file", "artifact"].includes(item.kind))}
