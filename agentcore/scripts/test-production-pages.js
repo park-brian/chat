@@ -7,8 +7,6 @@ import { createLiveFixture } from "../tests/fixtures.js";
 
 process.loadEnvFile(new URL("../../.env", import.meta.url));
 const visualOnly = process.argv.includes("--visual-only");
-// Measure the currently published release before deploying local changes.
-const baseline = process.argv.includes("--baseline");
 const fixture = await createLiveFixture({
   stackName: "agentcore-chat-prod",
   region: "us-east-1",
@@ -47,7 +45,7 @@ try {
       "importmap.json",
     ].map((file) => "shared/" + file),
   ];
-  for (const file of baseline ? [] : files) {
+  for (const file of files) {
     const url = new URL(file, base);
     url.searchParams.set("release", release);
     const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
@@ -82,27 +80,17 @@ try {
     const start = performance.now(),
       phases = [];
     window.__bootPhases = phases;
-    let content = false;
     new MutationObserver(() => {
       const phase = document
         .querySelector(".page-layout")
         ?.getAttribute("data-boot-phase");
       if (phase && phases.at(-1)?.phase !== phase)
         phases.push({ phase, ms: Math.round(performance.now() - start) });
-      // "content": the page's data is on screen, whether or not session.get has returned.
-      const main = document.getElementById("page-content");
-      if (
-        !content &&
-        main?.querySelector(".panel, .chat-panel, .signin") &&
-        !main.querySelector('[aria-busy="true"], .boot')
-      ) {
-        content = true;
-        phases.push({ phase: "content", ms: Math.round(performance.now() - start) });
-      }
     }).observe(document, {
       subtree: true,
       attributes: true,
       childList: true,
+      attributeFilter: ["data-boot-phase"],
     });
   });
   page.on("requestfailed", (request) => {
@@ -217,22 +205,11 @@ try {
   await page.locator("#usage-range").selectOption("90d");
   await page.reload();
   assert.equal(await page.locator("#usage-range").inputValue(), "90d");
-  const timing = () =>
-    page.evaluate(() => ({
-      phases: window.__bootPhases,
-      activationStart: Math.round(
-        performance.getEntriesByType("navigation")[0]?.activationStart || 0,
-      ),
-    }));
   const openLink = async (name) => {
     const link = page.getByRole("link", { name, exact: true });
     if (!(await link.isVisible()))
       await page.getByRole("button", { name: "Account menu" }).click();
     try {
-      // A person's pointer rests on a link briefly before clicking; that is the
-      // window speculation rules use to prerender the target page.
-      await link.hover({ timeout: 15000 });
-      await page.waitForTimeout(700);
       await link.click({ timeout: 15000 });
     } catch (cause) {
       await page.screenshot({ path: shotPath("failure.png") });
@@ -252,11 +229,10 @@ try {
     await openLink(
       key === "chat" ? "Chat" : key[0].toUpperCase() + key.slice(1),
     );
-    await settled(key);
-    (evidence.nav ??= {})[key] = await timing();
+    await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
     await page.reload();
     await settled(key);
-    evidence.boot[key] = await timing();
+    evidence.boot[key] = await page.evaluate(() => window.__bootPhases);
     assert.equal(await page.locator('a[aria-current="page"]').count(), 1);
     await page.screenshot({
       path: new URL(key + "-desktop.png", screens).pathname.replace(

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta id="app-csp" http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-s+MvcLOZCMLfJBiTYQE5auOhq6+iX1l2OrRElgkvpm0s8FJORUkW1MeX3S9aUBGm' 'sha384-r0leDKCebhAYfaJRLmKFm2lu17unfCzMRsMqpEfWu4Y3NwDwFse3bBgnczDrZzBX' 'sha384-kjmiTceKUmscxVf84Yzg6uf3NFOxRYOYUX+86R6ib4dZr5NrXX4oxIx8e6LTNaGh' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'">
+  <meta id="app-csp" http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-s+MvcLOZCMLfJBiTYQE5auOhq6+iX1l2OrRElgkvpm0s8FJORUkW1MeX3S9aUBGm' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'">
   <title>Usage · AgentCore</title>
   <link rel="stylesheet" href="../shared/styles.css">
   <script type="importmap">{
@@ -18,13 +18,11 @@
     "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/html/dist/html.js": "sha384-y0dvNquDclIU3TJfM5Jpw+ei8Y9ed9mP9YbaCPOuFq9ncniHaE49SN4JgG/43hOU"
   }
 }</script>
-  <script type="speculationrules">{"prerender":[{"where":{"selector_matches":".topbar a[href], .menu-panel a[href]"},"eagerness":"moderate"}]}</script>
-  <script>addEventListener("pagereveal",(e)=>{const t=e.viewTransition;if(!t)return;for(const k of["ready","updateCallbackDone","finished"])t[k].catch(()=>{});window.agentcoreReveal=t.finished.catch(()=>{})})</script>
 </head>
 <body>
   <div id="app"><!--boot-->
     <div class="page-layout" data-app-state="connecting" data-boot-phase="static">
-    <header class="topbar" data-busy><span class="brand"><span class="mark" aria-hidden="true">✦</span><span class="brand-name">agentcore</span></span><div class="topbar-status"></div><div class="site-menu"><div class="primary-nav" aria-hidden="true"><span class="nav">Chat</span><span class="nav">Agents</span><span class="nav">Connectors</span><span class="nav active">Usage</span></div><div class="menu account"><span class="menu-trigger"><span class="avatar-mark"></span></span></div></div><span class="menu-toggle" aria-hidden="true">☰</span><span class="activity" aria-hidden="true"></span></header>
+    <header class="topbar" data-busy><span class="brand"><span class="mark" aria-hidden="true">✦</span><span class="brand-name">agentcore</span></span><span class="activity" aria-hidden="true"></span></header>
     <main class="page-main"><section class="boot" role="status"><span class="boot-mark" aria-hidden="true">✦</span><h1 class="boot-title">Opening agentcore</h1><p class="boot-detail">Loading the workspace shell.</p></section></main>
     </div>
     <!--/boot--></div>

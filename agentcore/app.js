@@ -2,7 +2,6 @@ import { createEffect, createSignal, For, Show, onCleanup } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "./shared/page.js";
 import { parseDeployment } from "./shared/session.js";
-import { replaceUrl } from "./shared/navigation.js";
 import { createFeedback, confirmAction, Menu, Skeleton } from "./shared/ui.js";
 
 const routeProject = () => {
@@ -12,11 +11,14 @@ const routeProject = () => {
 await mountPage({
   key: "chat",
   title: "Chat",
+  // workspace.get no longer waits behind session.get.
+  preload: ({ rpc }) => rpc("workspace.get", { projectId: routeProject() }),
   render: ({
     rpc,
     watch,
     session,
     pageUrl,
+    takePreload,
     setCrumb,
     setStatus,
     setProjects: setShellProjects,
@@ -60,7 +62,7 @@ await mountPage({
       if (conversation && branch !== "main")
         url.searchParams.set("branch", branch);
       else url.searchParams.delete("branch");
-      replaceUrl(url.pathname + url.search);
+      history.replaceState(history.state, "", url.pathname + url.search);
     }
     const [agents, setAgents] = createSignal([]);
     const [models, setModels] = createSignal([]);
@@ -479,9 +481,9 @@ await mountPage({
     async function load() {
       await feedback.perform(async () => {
         try {
-          const workspace = await rpc("workspace.get", {
-            projectId: projectId(),
-          });
+          const workspace =
+            (await takePreload()) ||
+            (await rpc("workspace.get", { projectId: projectId() }));
           setProjects(workspace.projects);
           setShellProjects(workspace.projects);
           setAgents(workspace.agents);

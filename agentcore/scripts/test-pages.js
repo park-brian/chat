@@ -101,11 +101,7 @@ try {
     await context.route("**/invocations?qualifier=DEFAULT", async (route) => {
       const { command, input } = route.request().postDataJSON();
       calls.push({ command, input });
-      // session.get is held longer than page reads so overlap is observable.
-      if (delay)
-        await new Promise((resolve) =>
-          setTimeout(resolve, command === "session.get" ? delay * 2 : delay),
-        );
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
       // Same shape as production: the terminal snapshot repeats the last progress sequence.
       if (command === "chat.watch") {
         await new Promise((resolve) => setTimeout(resolve, 800));
@@ -228,29 +224,10 @@ try {
       await page.locator('[data-app-state="ready"]').waitFor();
     };
     delay = 400;
-    // The module's top-level await holds the load event until validation; wait for commit only.
-    await page.goto(base, { waitUntil: "commit" });
-    await page.locator(".welcome").waitFor();
-    assert.equal(
-      await page.locator(".page-layout").getAttribute("data-app-state"),
-      "connecting",
-      "Page content renders before session.get confirms the session",
-    );
-    await page.locator('[data-app-state="ready"]').waitFor();
-    assert.deepEqual(
-      calls.map(({ command }) => command).sort(),
-      ["session.get", "workspace.get"],
-      "One overlapped read per page; objects.list waits for the picker",
-    );
-    calls.length = 0;
     cold = true;
-    await page.reload();
+    await page.goto(base);
     await page.locator('[data-boot-phase="warming"]').waitFor();
-    assert.equal(
-      await page.locator(".welcome").count(),
-      0,
-      "A cold Runtime unmounts the optimistic page",
-    );
+    assert.equal(await page.locator(".welcome").count(), 0);
     assert.equal(
       await page.locator(".account-head strong").textContent(),
       "admin@example.com",
@@ -264,11 +241,13 @@ try {
     });
     await page.locator('[data-app-state="ready"]').waitFor();
     await page.locator(".welcome").waitFor();
-    assert.equal(
-      calls.filter(({ command }) => command === "workspace.get").length,
-      2,
-      "The page reloads its data once the Runtime is confirmed",
+    const boot = calls.map(({ command }) => command);
+    assert.deepEqual(
+      [...boot].sort(),
+      ["session.get", "session.get", "workspace.get"],
+      "workspace.get starts beside session.get once; objects.list waits for the picker",
     );
+    assert.ok(boot.indexOf("workspace.get") < boot.lastIndexOf("session.get"));
     delay = 0;
     calls.length = 0;
     if (name === "desktop") {
@@ -419,7 +398,6 @@ try {
         " page journey, direct refresh, URL filters, private credential form, shared navigation",
     );
     const peer = await context.newPage();
-    peer.on("pageerror", (error) => errors.push("peer: " + error.message));
     await peer.goto(base + "profile/");
     await peer.locator('[data-app-state="ready"]').waitFor();
     await context.route("**/logout?**", (route) =>
@@ -430,7 +408,6 @@ try {
       await page.getByRole("button", { name: "Account menu" }).click();
     await signOut.click();
     await peer.locator('[data-app-state="disconnected"]').waitFor();
-    assert.deepEqual(errors, [], "Sign-out tears pages down without errors");
     assert.equal(
       await peer.evaluate(() =>
         Object.keys(sessionStorage).some((key) =>

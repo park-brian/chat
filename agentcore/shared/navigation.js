@@ -25,23 +25,6 @@ export function pageUrl(key, params = {}) {
       url.searchParams.set(name, value);
   return url.href;
 }
-// Pages mount while the incoming cross-document view transition is still running,
-// and rewriting the URL then aborts it. URL rewrites wait for the transition, and
-// its promises are marked handled so a skipped transition is never an error.
-// The incoming side is recorded by the inline pagereveal handler in index.html,
-// which runs before this module can; this covers the outgoing side.
-let revealed = window.agentcoreReveal || Promise.resolve();
-addEventListener("pageswap", (event) => {
-  const transition = event.viewTransition;
-  if (transition)
-    for (const name of ["ready", "updateCallbackDone", "finished"])
-      transition[name].catch(() => {});
-});
-export function replaceUrl(url) {
-  revealed = revealed.then(() =>
-    history.replaceState(history.state, "", url),
-  );
-}
 export function updateQuery(values) {
   const url = new URL(location.href);
   for (const [name, value] of Object.entries(values)) {
@@ -49,7 +32,7 @@ export function updateQuery(values) {
       url.searchParams.delete(name);
     else url.searchParams.set(name, value);
   }
-  replaceUrl(url);
+  history.replaceState(history.state, "", url);
 }
 export function safeDestination(value) {
   const url = new URL(value || baseUrl.href, baseUrl);
