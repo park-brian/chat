@@ -103,7 +103,8 @@ try {
       calls.push({ command, input });
       if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
       // Same shape as production: the terminal snapshot repeats the last progress sequence.
-      if (command === "chat.watch")
+      if (command === "chat.watch") {
+        await new Promise((resolve) => setTimeout(resolve, 800));
         return route.fulfill({
           status: 200,
           contentType: "text/event-stream",
@@ -115,6 +116,7 @@ try {
             .map((event) => `data: ${JSON.stringify(event)}\n\n`)
             .join(""),
         });
+      }
       if (cold && command === "session.get") {
         cold = false;
         return route.fulfill({
@@ -279,6 +281,8 @@ try {
     await page.emulateMedia({ colorScheme: "light" });
     await page.getByRole("textbox", { name: "Message" }).fill("Continue");
     await page.getByRole("button", { name: "Send ↑" }).click();
+    await page.locator('.run-pill[data-state="working"]').waitFor();
+    await shot("chat-running");
     await page.locator(".run-pill").waitFor({ state: "detached", timeout: 5000 });
     await page.getByRole("button", { name: "Send ↑" }).waitFor();
     assert.equal(

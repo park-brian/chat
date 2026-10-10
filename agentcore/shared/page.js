@@ -147,6 +147,7 @@ export async function mountPage({ key, title, render, preload }) {
             <//>
             ${() => crumb()?.()}
           <//>
+          <div class="topbar-status">${() => status()?.()}</div>
           <div class=${() => "site-menu" + (menu() ? " open" : "")} id="site-menu">
             <nav class="primary-nav" aria-label="Workspace">
               <${For} each=${() => visible("primary")}>${navLink}<//>
@@ -171,7 +172,6 @@ export async function mountPage({ key, title, render, preload }) {
               >
             <//>
           </div>
-          <div class="topbar-status">${() => status()?.()}</div>
           <button
             type="button"
             class="menu-toggle"

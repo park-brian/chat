@@ -211,7 +211,6 @@ a[aria-disabled="true"] {
   display: flex;
   align-items: center;
   gap: 14px;
-  margin-left: auto;
   height: 100%;
 }
 .primary-nav {
@@ -270,9 +269,12 @@ a[aria-disabled="true"] {
   border-radius: 50%;
   animation: spin 3s linear infinite;
 }
+/* Takes the free space left of the nav, so a run pill never shifts the tabs. */
 .topbar-status {
   display: flex;
+  justify-content: flex-end;
   align-items: center;
+  margin-left: auto;
 }
 .menu-toggle {
   display: none;
@@ -424,7 +426,6 @@ a[aria-disabled="true"] {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  margin-right: 6px;
   padding: 4px 9px;
   border: 1px solid currentColor;
   border-radius: 3px;
@@ -1636,6 +1637,17 @@ dialog::backdrop {
   }
   .topbar-status {
     margin-left: auto;
+  }
+  /* Phone width: the pill keeps its dot; the label stays for assistive tech. */
+  .run-pill {
+    padding: 6px;
+  }
+  .run-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
   }
   .menu-toggle {
     display: grid;

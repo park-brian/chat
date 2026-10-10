@@ -653,7 +653,9 @@ await mountPage({
             class="run-pill"
             data-state=${() => (sending() ? "working" : "detached")}
             ><span class="run-dot" aria-hidden="true"></span
-            >${() => (sending() ? "Working" : "Detached")}</span
+            ><span class="run-label"
+              >${() => (sending() ? "Working" : "Detached")}</span
+            ></span
           >`}
         >
           <p class="menu-note" role="status">
