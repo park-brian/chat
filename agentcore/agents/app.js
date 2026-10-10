@@ -2,11 +2,11 @@ import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
 import { updateQuery } from "../shared/navigation.js";
-import { createFeedback, confirmAction, dollars, gb } from "../shared/ui.js";
+import { createFeedback, confirmAction, dollars, gb, Skeleton } from "../shared/ui.js";
 mountPage({
   key: "agents",
   title: "Agents",
-  render: ({ rpc, session, projectId, pageUrl }) => {
+  render: ({ rpc, session, projectId, pageUrl, setProjects: setShellProjects }) => {
     const [section, setSection] = createSignal(
       new URL(location.href).searchParams.get("section") || "agents",
     );
@@ -210,6 +210,7 @@ mountPage({
     async function load() {
       await feedback.perform(async () => {
         setProjects((await rpc("projects.list")).items);
+        setShellProjects(projects());
         if (section() === "projects") {
           setView({ route: "projects", items: projects() });
           return;
@@ -257,22 +258,10 @@ mountPage({
             </button>`}<//
         >
       </nav>
-      <${Show} when=${() => section() !== "projects"}
-        ><label class="project-picker"
-          >Project<select
-            value=${projectId}
-            onChange=${(event) => location.assign(pageUrl("agents", { project: event.currentTarget.value, section: section() }))}
-          >
-            <${For} each=${projects}
-              >${(project) => html`<option value=${project.id}>${project.name}</option>`}<//
-            >
-          </select></label
-        ><//
-      >
       <section class="panel">
         <${Show}
           when=${view}
-          fallback=${html`<div class="empty">Loading…</div>`}
+          fallback=${html`<${Skeleton} rows=${5} label="Loading agents…" />`}
           >${() =>
             section() === "projects"
               ? html`<p class="help">
@@ -465,14 +454,70 @@ mountPage({
                       Create and manage agents for this project. Choose a model,
                       instructions, and the tools it may use.
                     </p>
+                    <div class="agents-split">
+                    <div class="agents-index">
+                    <h3 class="section-title">In this project</h3>
+                    <${Show}
+                      when=${() => agents().length}
+                      fallback=${html`<div class="empty">No agents found in this project.</div>`}
+                    >
+                      <div class="agent-list">
+                        <${For} each=${agents}
+                          >${(agent) =>
+                            html` <div class="item">
+                              <strong
+                                >${agent.name || agent.agentName || agent.id}</strong
+                              >
+                              <small
+                                >${agent.modelId}${agent.archived ? " · Archived" : ""}</small
+                              >
+                              <div class="actions">
+                                <a
+                                  class="secondary"
+                                  href=${agent.archived ? undefined : pageUrl("chat", { agent: agent.id })}
+                                  aria-disabled=${agent.archived}
+                                >
+                                  Open chat
+                                </a>
+                                <button
+                                  class="secondary"
+                                  type="button"
+                                  disabled=${() => agent.archived || session().user.role === "Auditors"}
+                                  onClick=${async () => {
+                                    if (!(await feedback.mayLeave())) return;
+                                    feedback.clean();
+                                    setEditingAgent(agent);
+                                    setDraftModelId(agent.modelId);
+                                  }}
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  class="secondary"
+                                  type="button"
+                                  disabled=${() => session().user.role === "Auditors"}
+                                  onClick=${() => setAgentArchived(agent, !agent.archived)}
+                                >
+                                  ${agent.archived ? "Restore" : "Archive"}
+                                </button>
+                              </div>
+                            </div>`}<//
+                        >
+                      </div><//
+                    >
+                    </div>
                     <${Show} when=${() => session().user.role !== "Auditors"}
                       ><form
+                        class="agent-editor"
                         onInput=${feedback.changed}
                         onSubmit=${(event) => {
                           event.preventDefault();
                           createAgent(new FormData(event.currentTarget));
                         }}
                       >
+                        <h2 class="editor-title">
+                          ${() => (editingAgent() ? "Edit " + (editingAgent().name || "agent") : "New agent")}
+                        </h2>
                         <div class="field">
                           <label for="agent-name">Agent name</label
                           ><input
@@ -709,54 +754,7 @@ mountPage({
                         </div>
                       </form>
                     <//>
-                    <${Show}
-                      when=${() => agents().length}
-                      fallback=${html`<div class="empty">No agents found in this project.</div>`}
-                    >
-                      <div class="rail-list">
-                        <${For} each=${agents}
-                          >${(agent) =>
-                            html` <div class="item">
-                              <strong
-                                >${agent.name || agent.agentName || agent.id}</strong
-                              >
-                              <small
-                                >${agent.modelId}${agent.archived ? " · Archived" : ""}</small
-                              >
-                              <div class="actions">
-                                <a
-                                  class="secondary"
-                                  href=${agent.archived ? undefined : pageUrl("chat", { agent: agent.id })}
-                                  aria-disabled=${agent.archived}
-                                >
-                                  Open chat
-                                </a>
-                                <button
-                                  class="secondary"
-                                  type="button"
-                                  disabled=${() => agent.archived || session().user.role === "Auditors"}
-                                  onClick=${async () => {
-                                    if (!(await feedback.mayLeave())) return;
-                                    feedback.clean();
-                                    setEditingAgent(agent);
-                                    setDraftModelId(agent.modelId);
-                                  }}
-                                >
-                                  Edit
-                                </button>
-                                <button
-                                  class="secondary"
-                                  type="button"
-                                  disabled=${() => session().user.role === "Auditors"}
-                                  onClick=${() => setAgentArchived(agent, !agent.archived)}
-                                >
-                                  ${agent.archived ? "Restore" : "Archive"}
-                                </button>
-                              </div>
-                            </div>`}<//
-                        >
-                      </div><//
-                    >`}<//
+                    </div>`}<//
         >
       </section>`;
   },

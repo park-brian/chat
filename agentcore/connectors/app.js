@@ -1,7 +1,7 @@
 import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import { createFeedback, confirmAction, Field } from "../shared/ui.js";
+import { createFeedback, confirmAction, Field, Skeleton } from "../shared/ui.js";
 
 mountPage({
   key: "connectors",
@@ -123,7 +123,7 @@ mountPage({
         <h2>Saved connectors</h2>
         <${Show}
           when=${items}
-          fallback=${html`<div class="empty">Loading connectors…</div>`}
+          fallback=${html`<${Skeleton} rows=${4} label="Loading connectors…" />`}
         >
           <${For} each=${items}
             >${(item) =>

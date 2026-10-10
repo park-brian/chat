@@ -20,7 +20,12 @@
 }</script>
 </head>
 <body>
-  <div id="app"></div>
+  <div id="app"><!--boot-->
+    <div class="page-layout" data-app-state="connecting" data-boot-phase="static">
+    <header class="topbar" data-busy><span class="brand"><span class="mark" aria-hidden="true">✦</span><span class="brand-name">agentcore</span></span><span class="activity" aria-hidden="true"></span></header>
+    <main class="page-main"><section class="boot" role="status"><span class="boot-mark" aria-hidden="true">✦</span><h1 class="boot-title">Opening agentcore</h1><p class="boot-detail">Loading the workspace shell.</p></section></main>
+    </div>
+    <!--/boot--></div>
   <script type="module" src="./app.js"></script>
 </body>
 </html>

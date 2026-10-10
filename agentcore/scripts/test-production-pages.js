@@ -148,16 +148,11 @@ try {
   const settled = async (key) => {
     await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
     await page.waitForFunction(
-      () =>
-        ![...document.querySelectorAll("#page-content .empty")].some(
-          (element) => /^(Loading|Opening)/.test(element.textContent.trim()),
-        ),
+      () => !document.querySelector('#page-content [aria-busy="true"]'),
     );
     if (key === "chat")
       await page
-        .locator(".chat-history select")
-        .first()
-        .locator("option")
+        .locator(".chat-history .history-item, .chat-history .history-empty")
         .first()
         .waitFor({ state: "attached" });
     assert.deepEqual(

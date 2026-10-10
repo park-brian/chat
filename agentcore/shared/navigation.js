@@ -1,12 +1,14 @@
 export const baseUrl = new URL("../", import.meta.url);
+// "primary" pages are top-bar tabs; "account" pages live in the account menu.
+// Scoped pages read ?project= and show the project crumb.
 export const pages = [
-  { key: "chat", title: "Chat", path: "" },
-  { key: "profile", title: "Profile", path: "profile/" },
-  { key: "users", title: "Users", path: "users/", admin: true },
-  { key: "usage", title: "Usage", path: "usage/" },
-  { key: "agents", title: "Agents", path: "agents/" },
-  { key: "connectors", title: "Connectors", path: "connectors/" },
-  { key: "credentials", title: "Credentials", path: "credentials/" },
+  { key: "chat", title: "Chat", path: "", group: "primary", scoped: true },
+  { key: "agents", title: "Agents", path: "agents/", group: "primary", scoped: true },
+  { key: "connectors", title: "Connectors", path: "connectors/", group: "primary", scoped: true },
+  { key: "usage", title: "Usage", path: "usage/", group: "primary" },
+  { key: "profile", title: "Profile", path: "profile/", group: "account" },
+  { key: "credentials", title: "Credentials", path: "credentials/", group: "account" },
+  { key: "users", title: "Users", path: "users/", group: "account", admin: true },
 ];
 export const projectId = () =>
   new URL(location.href).searchParams.get("project") || "main";

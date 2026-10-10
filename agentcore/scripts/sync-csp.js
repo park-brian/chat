@@ -41,6 +41,15 @@ const folders = [
     .map((entry) => path.join(root, entry.name)),
 ];
 if (folders.length !== 7) throw Error("Expected seven page entrypoints");
+// Painted before Solid loads from the CDN; mountPage replaces it. Kept identical on every page.
+const boot = [
+  '<div id="app"><!--boot-->',
+  '<div class="page-layout" data-app-state="connecting" data-boot-phase="static">',
+  '<header class="topbar" data-busy><span class="brand"><span class="mark" aria-hidden="true">✦</span><span class="brand-name">agentcore</span></span><span class="activity" aria-hidden="true"></span></header>',
+  '<main class="page-main"><section class="boot" role="status"><span class="boot-mark" aria-hidden="true">✦</span><h1 class="boot-title">Opening agentcore</h1><p class="boot-detail">Loading the workspace shell.</p></section></main>',
+  "</div>",
+  "<!--/boot--></div>",
+].join("\n    ");
 for (const folder of folders) {
   const file = path.join(folder, "index.html"),
     // HTML parsing normalizes CRLF before CSP hashing; Git checkouts may use either.
@@ -55,14 +64,16 @@ for (const folder of folders) {
       /(<script type="importmap">)[\s\S]*?(<\/script>)/,
       `$1${canonical}$2`,
     )
+    .replace(/<div id="app">(<!--boot-->[\s\S]*?<!--\/boot-->)?<\/div>/, boot)
     .replace(
       /(<meta id="app-csp" http-equiv="Content-Security-Policy" content=")[^"]*(">)/,
       `$1${policy}$2`,
     );
   if (!updated.includes(policy)) throw Error(`Missing CSP element: ${file}`);
+  if (!updated.includes(boot)) throw Error(`Missing app root: ${file}`);
   if (process.argv.includes("--check")) {
     if (updated !== source)
-      throw Error(`CSP/import map is stale: ${file}; run npm run csp:sync`);
+      throw Error(`CSP/import map/boot shell is stale: ${file}; run npm run csp:sync`);
   } else if (updated !== source) await writeFile(file, updated);
 }
 console.log("CSP and pinned imports checked for seven pages");

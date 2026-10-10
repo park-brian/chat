@@ -1,4 +1,4 @@
-import { createSignal, Show, onCleanup } from "solid-js";
+import { createSignal, For, Show, onCleanup } from "solid-js";
 import html from "solid-js/html";
 
 export const dollars = (micro) => (Number(micro || 0) / 1000000).toFixed(2);
@@ -21,8 +21,65 @@ export const Badge = (props) =>
 export const Heading = (props) =>
   html`<header class="page-heading">
     <h1>${props.title}</h1>
-    <p>${props.description}</p>
+    <p class="mono">${props.description}</p>
   </header>`;
+// Placeholder rows with the eventual layout's rhythm; the label is for assistive tech only.
+export const Skeleton = (props) =>
+  html`<div
+    class=${() => "skeleton " + (props.variant || "panel")}
+    role="status"
+    aria-busy="true"
+  >
+    <span class="visually-hidden">${() => props.label || "Loading…"}</span>
+    <${For} each=${() => Array.from({ length: props.rows || 3 })}
+      >${() => html`<span class="skeleton-line"></span>`}<//
+    >
+  </div>`;
+// Disclosure menu: Escape or an outside click closes it and focus returns to the trigger.
+export function Menu(props) {
+  const [open, setOpen] = createSignal(false);
+  let root, trigger;
+  const close = (restore) => {
+    if (!open()) return;
+    setOpen(false);
+    if (restore) trigger?.focus();
+  };
+  const outside = (event) => {
+    if (root && !root.contains(event.target)) close(false);
+  };
+  const escape = (event) => {
+    if (event.key === "Escape") close(true);
+  };
+  document.addEventListener("pointerdown", outside);
+  document.addEventListener("keydown", escape);
+  onCleanup(() => {
+    document.removeEventListener("pointerdown", outside);
+    document.removeEventListener("keydown", escape);
+  });
+  return html`<div
+    class=${() => "menu " + (props.class || "") + (open() ? " open" : "")}
+    ref=${(element) => (root = element)}
+  >
+    <button
+      type="button"
+      class=${() => "menu-trigger " + (props.triggerClass || "")}
+      aria-label=${() => props.label}
+      aria-expanded=${() => String(open())}
+      disabled=${() => props.disabled}
+      ref=${(element) => (trigger = element)}
+      onClick=${(event) => {
+        const next = !open();
+        setOpen(next);
+        if (next) props.onOpen?.(event);
+      }}
+    >
+      ${props.trigger}
+    </button>
+    <div class="menu-panel" onClick=${(event) => {
+      if (event.target.closest("a, [data-close]")) close(false);
+    }}>${props.children}</div>
+  </div>`;
+}
 export const Field = (props) =>
   html`<label>${props.label}${props.children}</label>`;
 export function createFeedback() {

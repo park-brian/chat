@@ -1,13 +1,7 @@
 import { createSignal, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import {
-  createFeedback,
-  confirmAction,
-  dollars,
-  gb,
-  Badge,
-} from "../shared/ui.js";
+import { createFeedback, confirmAction, dollars, gb, Badge, Skeleton } from "../shared/ui.js";
 
 mountPage({
   key: "profile",
@@ -28,7 +22,7 @@ mountPage({
     feedback.perform(load, "");
     return html`${feedback.view}<${Show}
         when=${profile}
-        fallback=${html`<div class="empty">Loading profile…</div>`}
+        fallback=${html`<${Skeleton} rows=${4} label="Loading profile…" />`}
       >
         ${() => {
           const user = profile().user;

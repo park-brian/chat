@@ -278,6 +278,19 @@ export function createSession() {
     signOut,
     clear,
     hasTokens: () => Boolean(state?.tokens?.access_token),
+    // Display-only identity from tokens this tab already holds; session.get stays authoritative.
+    claims: () => {
+      try {
+        const access = jwt(state.tokens.access_token),
+          id = state.tokens.id_token ? jwt(state.tokens.id_token) : {};
+        return {
+          email: id.email || "",
+          role: access["cognito:groups"]?.[0] || null,
+        };
+      } catch {
+        return null;
+      }
+    },
     runtimeSessionId: () => state?.runtimeSessionId,
     resetRuntimeSession: () => { state.runtimeSessionId = crypto.randomUUID(); save(); },
     dispose: () => channel?.close(),

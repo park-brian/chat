@@ -492,6 +492,7 @@ export async function runLiveStory(
       (await good(rpc, "chat.status", { requestId: input.requestId })).status,
       "running",
     );
+    await page.getByRole("button", { name: "Account menu" }).click();
     await page.getByRole("button", { name: "Sign out", exact: true }).click();
     await page
       .locator('[data-app-state="disconnected"]')

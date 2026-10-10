@@ -57,7 +57,7 @@ export async function runTests({ parseDeployment }) {
         if (innerWidth <= 620) {
           document.querySelector('[aria-label="Toggle navigation"]').click();
           await new Promise((resolve) => requestAnimationFrame(resolve));
-          if (!document.querySelector(".page-sidebar.open"))
+          if (!document.querySelector(".site-menu.open"))
             throw Error("Mobile navigation missing");
           if (window.__captureScreenshot)
             await _screenshot("mobile-menu", undefined, { fullPage: true });

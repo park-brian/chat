@@ -2,7 +2,7 @@ import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
 import { updateQuery } from "../shared/navigation.js";
-import { createFeedback, confirmAction, dollars, gb } from "../shared/ui.js";
+import { createFeedback, confirmAction, dollars, gb, Skeleton } from "../shared/ui.js";
 mountPage({
   key: "usage",
   title: "Usage",
@@ -163,7 +163,7 @@ mountPage({
       <section class="panel">
         <${Show}
           when=${view}
-          fallback=${html`<div class="empty">Loading usage…</div>`}
+          fallback=${html`<${Skeleton} rows=${4} label="Loading usage…" />`}
           >${() =>
             html`<p class="help">
                 Model costs estimate reported tokens using the checked-in rates.

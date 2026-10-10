@@ -1,7 +1,7 @@
 import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import { createFeedback, confirmAction, Field, Empty } from "../shared/ui.js";
+import { createFeedback, confirmAction, Field, Empty, Skeleton } from "../shared/ui.js";
 
 mountPage({
   key: "credentials",
@@ -68,7 +68,7 @@ mountPage({
         <h2>Saved credentials</h2>
         <${Show}
           when=${items}
-          fallback=${html`<${Empty} text="Loading credentials…" />`}
+          fallback=${html`<${Skeleton} rows=${4} label="Loading credentials…" />`}
         >
           <${For} each=${items}
             >${(item) =>

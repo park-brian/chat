@@ -1,31 +1,46 @@
-import { createSignal, For, Show, onCleanup } from "solid-js";
+import { createEffect, createSignal, For, Show, onCleanup } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "./shared/page.js";
 import { parseDeployment } from "./shared/session.js";
-import { createFeedback, confirmAction } from "./shared/ui.js";
+import { createFeedback, confirmAction, Menu, Skeleton } from "./shared/ui.js";
 
+const routeProject = () => {
+  const value = new URL(location.href).searchParams.get("project") || "";
+  return /^[a-z0-9][a-z0-9-]{0,39}$/.test(value) ? value : "main";
+};
 await mountPage({
   key: "chat",
   title: "Chat",
-  render: ({ rpc, watch, session, pageUrl }) => {
+  // workspace.get no longer waits behind session.get.
+  preload: ({ rpc }) => rpc("workspace.get", { projectId: routeProject() }),
+  render: ({
+    rpc,
+    watch,
+    session,
+    pageUrl,
+    takePreload,
+    setCrumb,
+    setStatus,
+    setProjects: setShellProjects,
+  }) => {
     const query = new URL(location.href).searchParams,
       feedback = createFeedback();
     const [error, setError] = createSignal(""),
       [activeRun, setActiveRun] = createSignal(null),
       [files, setFiles] = createSignal([]),
-      [filesCursor, setFilesCursor] = createSignal(null);
+      [filesCursor, setFilesCursor] = createSignal(null),
+      [filesLoaded, setFilesLoaded] = createSignal(false),
+      [loaded, setLoaded] = createSignal(false),
+      [historyOpen, setHistoryOpen] = createSignal(false);
     let observer, fileDialog, fileDialogTrigger;
     onCleanup(() => observer?.abort());
     const openFiles = () => {
       fileDialogTrigger = document.activeElement;
       fileDialog.showModal();
+      ensureFiles();
     };
     const [projects, setProjects] = createSignal([]);
-    const [projectId] = createSignal(
-      /^[a-z0-9][a-z0-9-]{0,39}$/.test(query.get("project") || "")
-        ? query.get("project")
-        : "main",
-    );
+    const [projectId] = createSignal(routeProject());
     const currentProject = () =>
       projects().find((item) => item.id === projectId()) || {
         id: "main",
@@ -297,10 +312,15 @@ await mountPage({
       String(value || "")
         .split(/(```[^\n]*\n[\s\S]*?(?:```|$))/g)
         .filter(Boolean)
-        .map((part) =>
+        .map((part, index, parts) =>
           part.startsWith("```")
             ? { code: part.replace(/^```[^\n]*\n/, "").replace(/\n?```$/, "") }
-            : { text: part },
+            : {
+                // The code block supplies its own spacing; drop blank lines touching it.
+                text: part
+                  .replace(index > 0 ? /^\n+/ : /(?!)/, "")
+                  .replace(index < parts.length - 1 ? /\n+$/ : /(?!)/, ""),
+              },
         );
 
     async function observeRun(requestId, resume = false) {
@@ -459,48 +479,63 @@ await mountPage({
     }
     async function load() {
       await feedback.perform(async () => {
-        const workspace = await rpc("workspace.get", {
-          projectId: projectId(),
-        });
-        setProjects(workspace.projects);
-        setAgents(workspace.agents);
-        setModels(workspace.models);
-        setConversations(workspace.conversations.items);
-        setConversationCursor(workspace.conversations.nextCursor);
+        try {
+          const workspace =
+            (await takePreload()) ||
+            (await rpc("workspace.get", { projectId: projectId() }));
+          setProjects(workspace.projects);
+          setShellProjects(workspace.projects);
+          setAgents(workspace.agents);
+          setModels(workspace.models);
+          setConversations(workspace.conversations.items);
+          setConversationCursor(workspace.conversations.nextCursor);
+          let saved = workspace.conversations.items.find(
+            (item) => item.id === query.get("conversation"),
+          );
+          if (!saved && query.get("conversation") && query.get("agent"))
+            saved = {
+              id: query.get("conversation"),
+              agentId: query.get("agent"),
+            };
+          while (!saved && query.get("conversation") && conversationCursor()) {
+            const page = await rpc("conversations.list", {
+              projectId: projectId(),
+              cursor: conversationCursor(),
+            });
+            setConversations((items) => [...items, ...page.items]);
+            setConversationCursor(page.nextCursor);
+            saved = page.items.find(
+              (item) => item.id === query.get("conversation"),
+            );
+          }
+          if (!saved && query.get("conversation"))
+            throw Error("Conversation not found.");
+          if (saved) {
+            setLoaded(true);
+            await openConversation(
+              saved,
+              query.get("branch") || saved.activeBranchId || "main",
+            );
+          } else if (query.get("agent"))
+            selectAgent(
+              workspace.agents.find((item) => item.id === query.get("agent")),
+            );
+        } finally {
+          setLoaded(true);
+        }
+      }, "");
+    }
+    // Files only matter once the picker opens, so they no longer delay the first render.
+    async function ensureFiles() {
+      if (filesLoaded()) return;
+      try {
         const objects = await rpc("objects.list", { projectId: projectId() });
         setFiles(objects.items);
         setFilesCursor(objects.nextCursor);
-        let saved = workspace.conversations.items.find(
-          (item) => item.id === query.get("conversation"),
-        );
-        if (!saved && query.get("conversation") && query.get("agent"))
-          saved = {
-            id: query.get("conversation"),
-            agentId: query.get("agent"),
-          };
-        while (!saved && query.get("conversation") && conversationCursor()) {
-          const page = await rpc("conversations.list", {
-            projectId: projectId(),
-            cursor: conversationCursor(),
-          });
-          setConversations((items) => [...items, ...page.items]);
-          setConversationCursor(page.nextCursor);
-          saved = page.items.find(
-            (item) => item.id === query.get("conversation"),
-          );
-        }
-        if (!saved && query.get("conversation"))
-          throw Error("Conversation not found.");
-        if (saved)
-          await openConversation(
-            saved,
-            query.get("branch") || saved.activeBranchId || "main",
-          );
-        else if (query.get("agent"))
-          selectAgent(
-            workspace.agents.find((item) => item.id === query.get("agent")),
-          );
-      }, "");
+        setFilesLoaded(true);
+      } catch (cause) {
+        setError(cause.message);
+      }
     }
     function toggleSelectedFile(id) {
       setSelectedFiles((ids) =>
@@ -523,137 +558,341 @@ await mountPage({
         setError(cause.message);
       }
     }
-    load();
-    return html`${feedback.view}
-      <div class="chat-workspace">
-        <aside class="chat-history" aria-label="Chat selection">
-          <label
-            >Project<select
-              value=${projectId}
-              disabled=${sending}
-              onChange=${(event) => location.assign(pageUrl("chat", { project: event.currentTarget.value }))}
-            >
-              <${For} each=${projects}
-                >${(project) => html`<option value=${project.id}>${project.name}</option>`}<//
+    const toolNames = {
+      web_search: "web search",
+      browser: "browser",
+      execute_code: "code workspace",
+      execute_command: "command workspace",
+    };
+    const agentName = (agent) => agent?.name || agent?.agentName || "Agent";
+    const modelName = (id) =>
+      models().find((model) => model.id === id)?.name || id;
+    const agentTools = (agent) =>
+      [
+        agent?.codeInterpreter && "code",
+        agent?.webSearch && "search",
+        agent?.browser && "browser",
+      ].filter(Boolean);
+    const activeAgents = () => agents().filter((agent) => !agent.archived);
+    const currentTitle = () =>
+      conversations().find((item) => item.id === conversationId())?.title ||
+      (messages().length ? "Untitled conversation" : "New conversation");
+    const day = 86400000;
+    const historyGroups = () => {
+      const startOfToday = new Date().setHours(0, 0, 0, 0),
+        groups = [
+          { label: "Today", items: [] },
+          { label: "Yesterday", items: [] },
+          { label: "Earlier", items: [] },
+        ];
+      for (const item of conversations()) {
+        const time = Date.parse(item.lastActivityAt || item.createdAt || "");
+        groups[
+          !time || time < startOfToday - day ? 2 : time < startOfToday ? 1 : 0
+        ].items.push(item);
+      }
+      return groups.filter((group) => group.items.length);
+    };
+    const relativeTime = (value) => {
+      const time = Date.parse(value || "");
+      if (!time) return "";
+      const minutes = Math.round((Date.now() - time) / 60000);
+      if (minutes < 1) return "now";
+      if (minutes < 60) return minutes + "m";
+      if (minutes < 1440) return Math.round(minutes / 60) + "h";
+      return new Date(time).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+      });
+    };
+    // Follow streaming output only while the reader is already near the bottom.
+    let scroller,
+      pinned = true;
+    createEffect(() => {
+      messages();
+      if (scroller && pinned)
+        queueMicrotask(() => (scroller.scrollTop = scroller.scrollHeight));
+    });
+    setCrumb(
+      () => html`<span class="crumb-sep" aria-hidden="true">/</span>
+        <${Menu}
+          class="crumb"
+          label=${() => "Agent: " + (selectedAgent() ? agentName(selectedAgent()) : "none")}
+          disabled=${sending}
+          trigger=${() => html`<span class="crumb-label"
+              >${() => (selectedAgent() ? agentName(selectedAgent()) : "Choose agent")}</span
+            ><span class="caret" aria-hidden="true">▾</span>`}
+        >
+          <div class="menu-heading">Agents</div>
+          <${For}
+            each=${activeAgents}
+            fallback=${html`<div class="menu-note">No agents in this project.</div>`}
+            >${(agent) =>
+              html`<button
+                type="button"
+                class="menu-item"
+                data-close
+                aria-current=${() => (selectedAgent()?.id === agent.id ? "true" : undefined)}
+                onClick=${(event) => selectAgent(agent)}
               >
-            </select></label
+                <span>${agentName(agent)}</span
+                ><span class="mono dim">${() => modelName(agent.modelId)}</span>
+              </button>`}<//
           >
-          <label
-            >Agent<select
-              value=${() => selectedAgent()?.id || ""}
-              disabled=${sending}
-              onChange=${(event) => selectAgent(agents().find((item) => item.id === event.currentTarget.value))}
+          <a class="menu-item subtle" href=${pageUrl("agents")}>Manage agents</a>
+        <//>`,
+    );
+    setStatus(
+      () => html`<${Show} when=${activeRun}>
+        <${Menu}
+          class="run"
+          label="Run status"
+          trigger=${() => html`<span
+            class="run-pill"
+            data-state=${() => (sending() ? "working" : "detached")}
+            ><span class="run-dot" aria-hidden="true"></span
+            >${() => (sending() ? "Working" : "Detached")}</span
+          >`}
+        >
+          <p class="menu-note" role="status">
+            ${() =>
+              sending()
+                ? "Working in AgentCore. You can leave this page; the turn continues."
+                : "Observation detached. The turn may still be running."}
+          </p>
+          <${Show} when=${() => !sending()}
+            ><button
+              type="button"
+              class="menu-item"
+              data-close
+              onClick=${(event) => observeRun(activeRun(), true)}
             >
-              <option value="">Choose an agent</option>
-              <${For} each=${() => agents().filter((agent) => !agent.archived)}
-                >${(agent) => html`<option value=${agent.id}>${agent.name}</option>`}<//
-              >
-            </select></label
+              Reconnect
+            </button><//
           >
           <button
-            class="secondary"
-            disabled=${sending}
-            onClick=${() => newChat()}
+            type="button"
+            class="menu-item danger"
+            data-close
+            onClick=${(event) =>
+              rpc("chat.cancel", { requestId: activeRun() }).catch((cause) =>
+                setError(cause.message),
+              )}
           >
-            ＋ New chat
+            Cancel turn
           </button>
-          <h2 class="eyebrow">Conversations</h2>
-          <${For} each=${conversations}
-            >${(item) => html`<button class=${() => "nav" + (conversationId() === item.id ? " active" : "")} disabled=${sending} onClick=${() => openConversation(item)}>${item.title}${item.activeRequests?.some((run) => run.status === "running") ? " · Working" : ""}</button>`}<//
+        <//>
+      <//>`,
+    );
+    load();
+    return html`${feedback.view}
+      <div
+        class=${() => "chat-workspace" + (historyOpen() ? " history-open" : "")}
+      >
+        <aside class="chat-history" id="chat-history" aria-label="Conversations">
+          <button
+            class="new-chat"
+            disabled=${sending}
+            onClick=${(event) => {
+              newChat();
+              setHistoryOpen(false);
+            }}
           >
-          <${Show} when=${conversationCursor}
-            ><button onClick=${moreConversations}>More conversations</button><//
+            <span aria-hidden="true">＋</span> New chat
+          </button>
+          <${Show}
+            when=${loaded}
+            fallback=${html`<${Skeleton}
+              variant="list"
+              rows=${6}
+              label="Loading conversations…"
+            />`}
           >
-        </aside>
-        <section class="chat-panel">
-          <header class="top">
-            <div>
-              <div class="top-title">
-                ${() => selectedAgent()?.name || selectedAgent()?.agentName || "Your workspace"}
-              </div>
-              <div class="top-sub">
-                AgentCore · ${() => currentProject().name}
-              </div>
-            </div>
-            <div class="spacer"></div>
-            <span class="status">Connected</span>
-            <a class="link-button" href=${pageUrl("profile")}> Account </a>
-          </header>
-          <div class="mobile-agent">
-            ${() => selectedAgent()?.name || "Choose an agent"}
-          </div>
-          <div class="content">
-            <div class="conversation">
-              <${Show} when=${() => branches().length > 1}>
-                <div class="path-bar">
-                  <span>Path</span>
-                  <select
-                    aria-label="Conversation path"
-                    value=${branchId}
-                    disabled=${sending}
-                    onChange=${(event) =>
-                      openConversation(
-                        {
-                          id: conversationId(),
-                          agentId: selectedAgent()?.id,
-                        },
-                        event.currentTarget.value,
-                      )}
-                  >
-                    <${For} each=${branches}
-                      >${(branch) =>
-                        html` <option
-                          value=${branch.id}
-                          selected=${() => branch.id === branchId()}
+            <${Show}
+              when=${() => conversations().length}
+              fallback=${html`<p class="history-empty">
+                Conversations you start appear here.
+              </p>`}
+            >
+              <${For} each=${historyGroups}
+                >${(group) =>
+                  html`<section class="history-group">
+                    <h2 class="eyebrow">${group.label}</h2>
+                    <${For} each=${() => group.items}
+                      >${(item) =>
+                        html`<button
+                          class="history-item"
+                          aria-current=${() => (conversationId() === item.id ? "true" : undefined)}
+                          disabled=${sending}
+                          onClick=${(event) => {
+                            openConversation(item);
+                            setHistoryOpen(false);
+                          }}
                         >
-                          ${branch.name}
-                        </option>`}<//
+                          <span class="history-title">${item.title}</span>
+                          <span class="history-meta mono"
+                            >${() =>
+                              agentName(agents().find((agent) => agent.id === item.agentId)) +
+                              " · " +
+                              relativeTime(item.lastActivityAt)}</span
+                          >
+                        </button>`}<//
                     >
-                  </select>
-                </div>
+                  </section>`}<//
+              >
+            <//>
+            <${Show} when=${conversationCursor}
+              ><button class="link-button" onClick=${(event) => moreConversations()}>
+                More conversations
+              </button><//
+            >
+          <//>
+        </aside>
+        <button
+          class="history-scrim"
+          aria-label="Close conversations"
+          tabindex="-1"
+          onClick=${(event) => setHistoryOpen(false)}
+        ></button>
+        <section class="chat-panel">
+          <header class="thread-head">
+            <button
+              class="history-toggle"
+              aria-label="Show conversations"
+              aria-controls="chat-history"
+              aria-expanded=${() => String(historyOpen())}
+              onClick=${(event) => setHistoryOpen(!historyOpen())}
+            >
+              <span aria-hidden="true">☰</span>
+            </button>
+            <h1 class="thread-title">${currentTitle}</h1>
+            <${Show} when=${() => branches().length > 1}>
+              <${Menu}
+                class="path-menu"
+                label="Conversation path"
+                disabled=${sending}
+                trigger=${() => html`<span class="mono"
+                    >${() => "path: " + (branches().find((branch) => branch.id === branchId())?.name || "main")}</span
+                  ><span class="caret" aria-hidden="true">▾</span>`}
+              >
+                <div class="menu-heading">Paths</div>
+                <${For} each=${branches}
+                  >${(branch) =>
+                    html`<button
+                      type="button"
+                      class="menu-item"
+                      data-close
+                      aria-current=${() => (branch.id === branchId() ? "true" : undefined)}
+                      onClick=${(event) =>
+                        branch.id !== branchId() &&
+                        openConversation(
+                          { id: conversationId(), agentId: selectedAgent()?.id },
+                          branch.id,
+                        )}
+                    >
+                      ${branch.name}
+                    </button>`}<//
+                >
               <//>
-              <${Show}
-                when=${() =>
-                  conversations().some(
-                    (item) => item.id === conversationId(),
-                  ) && !sending()}
+            <//>
+            <${Show}
+              when=${() => conversations().some((item) => item.id === conversationId()) && !sending()}
+            >
+              <${Menu}
+                class="thread-actions"
+                label="Conversation actions"
+                trigger=${() => html`<span aria-hidden="true">⋯</span>`}
               >
-                <button class="link-button" onClick=${deleteConversation}>
+                <button
+                  type="button"
+                  class="menu-item danger"
+                  data-close
+                  onClick=${(event) => deleteConversation()}
+                >
                   Delete conversation
-                </button><//
-              >
+                </button>
+              <//>
+            <//>
+          </header>
+          <div
+            class="content"
+            ref=${(element) => (scroller = element)}
+            onScroll=${(event) => {
+              const element = event.currentTarget;
+              pinned =
+                element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+            }}
+          >
+            <div class="conversation">
               <${Show} when=${olderCursor}>
-                <button class="link-button" onClick=${(e) => moreMessages()}>
+                <button class="load-earlier" onClick=${(event) => moreMessages()}>
                   Load earlier messages
                 </button><//
               >
-              <${Show} when=${loadingConversation}>
-                <div class="empty">Opening conversation…</div><//
+              <${Show} when=${() => !loaded() || loadingConversation()}>
+                <${Skeleton}
+                  variant="thread"
+                  rows=${4}
+                  label=${() => (loaded() ? "Opening conversation…" : "Loading workspace…")}
+                /><//
               >
-              <${Show} when=${() => !messages().length}
+              <${Show}
+                when=${() => loaded() && !loadingConversation() && !messages().length}
                 ><div class="welcome">
-                  <div class="welcome-icon">✦</div>
-                  <h1>
-                    ${() => (selectedAgent() ? "How can I help?" : "Your agents, one place.")}
-                  </h1>
-                  <p>
-                    ${() => (selectedAgent() ? "Ask your agent anything. AgentCore manages its tools, skills and memory." : "Select an agent to begin.")}
-                  </p>
-                  <${Show} when=${() => session() && !selectedAgent()}
-                    ><a class="primary" href=${pageUrl("agents")}>
-                      Choose an agent
-                    </a><//
+                  <${Show}
+                    when=${() => activeAgents().length}
+                    fallback=${html`<span class="boot-mark" aria-hidden="true">✦</span>
+                      <h2>Create your first agent</h2>
+                      <p>
+                        An agent pairs a model with instructions and the tools it
+                        may use: code, web search or a browser.
+                      </p>
+                      <a class="primary" href=${pageUrl("agents")}>Create an agent</a>`}
                   >
+                    <${Show}
+                      when=${selectedAgent}
+                      fallback=${html`<h2>Choose an agent</h2>
+                        <p>Each conversation belongs to one agent.</p>
+                        <div class="agent-grid">
+                          <${For} each=${activeAgents}
+                            >${(agent) =>
+                              html`<button
+                                class="agent-card"
+                                onClick=${(event) => selectAgent(agent)}
+                              >
+                                <strong>${agentName(agent)}</strong>
+                                <span class="mono dim"
+                                  >${() => modelName(agent.modelId)}</span
+                                >
+                                <span class="mono dim"
+                                  >${agentTools(agent).join(" · ") || "chat only"}</span
+                                >
+                              </button>`}<//
+                          >
+                        </div>`}
+                    >
+                      <span class="boot-mark" aria-hidden="true">✦</span>
+                      <h2>${() => agentName(selectedAgent())}</h2>
+                      <p class="mono dim">
+                        ${() =>
+                          [
+                            modelName(composerModel()?.id),
+                            ...agentTools(selectedAgent()),
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                      </p>
+                    <//>
+                  <//>
                 </div><//
               >
               <${For} each=${messages}
                 >${(item, index) =>
                   html`<article class=${() => "message " + item.role}>
-                    <div class="avatar">
-                      ${item.role === "user" ? "Y" : "✦"}
-                    </div>
-                    <div>
-                      <b>${item.role === "user" ? "You" : "Agent"}</b>
+                    <header class="turn-meta">
+                      <span class="turn-role mono"
+                        >${item.role === "user" ? "you" : () => agentName(selectedAgent())}</span
+                      >
                       <${Show}
                         when=${() =>
                           item.eventId &&
@@ -663,110 +902,120 @@ await mountPage({
                       >
                         <button
                           class="message-action"
-                          onClick=${() =>
+                          onClick=${(event) =>
                             forkAt(index(), item.role === "assistant")}
                         >
                           ${item.role === "user" ? "Edit · new path" : "Retry · new path"}
                         </button><//
                       >
-                      <div class="message-text">
-                        <${For} each=${() => messageSections(item.text)}>
-                          ${(section) =>
-                            section.code !== undefined
-                              ? html`<pre><code>${section.code}</code></pre>`
-                              : html`<${For}
-                                  each=${() => section.text.split(/(https:\/\/[^\s<>"']+)/g)}
-                                >
-                                  ${(part) =>
-                                    /^https:\/\/[^\s<>"']+$/.test(part)
-                                      ? html`<a
-                                          href=${part}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          >${part}</a
-                                        >`
-                                      : part}<//
-                                >`}<//
-                        >
-                      </div>
-                      <${Show} when=${() => item.tools?.length}>
-                        <small class="tool-activity"
-                          ><${For} each=${() => item.tools || []}>
-                            ${(tool, index) =>
-                              `${index() ? " · " : ""}${tool.isError ? "Failed: " : "Used "}${
-                                {
-                                  web_search: "web search",
-                                  browser: "browser",
-                                  execute_code: "code workspace",
-                                  execute_command: "command workspace",
-                                }[tool.name] || tool.name
-                              }`}<//
-                          ></small
-                        ><//
-                      >
-                      <${Show}
-                        when=${() => item.status && item.status !== "complete"}
-                      >
-                        <small class="message-state"
-                          >${() =>
-                            item.status === "pending"
-                              ? "Working…"
-                              : item.status === "failed"
-                                ? "Turn failed"
-                                : "Outcome uncertain · reopen to check"}</small
-                        ><//
+                    </header>
+                    <div class="message-text">
+                      <${For} each=${() => messageSections(item.text)}>
+                        ${(section) =>
+                          section.code !== undefined
+                            ? html`<pre><code>${section.code}</code></pre>`
+                            : html`<${For}
+                                each=${() => section.text.split(/(https:\/\/[^\s<>"']+)/g)}
+                              >
+                                ${(part) =>
+                                  /^https:\/\/[^\s<>"']+$/.test(part)
+                                    ? html`<a
+                                        href=${part}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        >${part}</a
+                                      >`
+                                    : part}<//
+                              >`}<//
                       >
                     </div>
+                    <${Show} when=${() => item.tools?.length}>
+                      <ul class="tool-activity" aria-label="Tool activity">
+                        <${For} each=${() => item.tools || []}>
+                          ${(tool) =>
+                            html`<li
+                              class="trace-line"
+                              data-state=${tool.isError ? "error" : "ok"}
+                            >
+                              <span aria-hidden="true">→</span>
+                              ${toolNames[tool.name] || tool.name}
+                              <span class="trace-status"
+                                >${tool.isError ? "failed" : "ok"}</span
+                              >
+                            </li>`}<//
+                        >
+                      </ul>
+                    <//>
+                    <${Show}
+                      when=${() => item.status && item.status !== "complete"}
+                    >
+                      <small
+                        class="message-state"
+                        data-state=${() => item.status}
+                        >${() =>
+                          item.status === "pending"
+                            ? "Working…"
+                            : item.status === "failed"
+                              ? "Turn failed"
+                              : "Outcome uncertain · reopen to check"}</small
+                      ><//
+                    >
                   </article>`}<//
-              >
-              <${Show} when=${error}
-                ><div class="error" role="alert">${error}</div><//
               >
             </div>
           </div>
           <div class="compose-wrap">
+            <${Show} when=${error}
+              ><div class="error" role="alert">${error}</div><//
+            >
             <div class="composer">
-              <${Show} when=${forkFrom}>
-                <div class="path-bar">
-                  Editing an earlier turn creates a new path.
-                  <button
-                    class="message-action"
-                    onClick=${() => setForkFrom(null)}
-                  >
-                    Cancel
-                  </button>
-                </div><//
-              >
-              <${Show} when=${() => selectedAgent()?.codeInterpreter}>
-                <div class="path-bar">
-                  <button class="message-action" onClick=${openFiles}>
-                    Files for this
-                    turn${() =>
-                      selectedFiles().length
-                        ? " · " + selectedFiles().length + " selected"
-                        : ""}
-                  </button>
-                  <${Show} when=${() => selectedFiles().length}>
-                    <button
-                      class="message-action"
-                      onClick=${() => setSelectedFiles([])}
+              <${Show} when=${() => forkFrom() || selectedAgent()?.codeInterpreter}>
+                <div class="composer-tray">
+                  <${Show} when=${forkFrom}>
+                    <span class="tray-chip" data-kind="fork"
+                      >Editing an earlier turn creates a new path
+                      <button
+                        class="message-action"
+                        onClick=${(event) => setForkFrom(null)}
+                      >
+                        Cancel
+                      </button></span
                     >
-                      Clear
-                    </button><//
-                  >
-                  <label class="save-output-toggle">
-                    <input
-                      type="checkbox"
-                      checked=${saveOutputs}
-                      onChange=${(event) => setSaveOutputs(event.currentTarget.checked)}
-                    />
-                    Save outputs
-                  </label>
-                </div><//
-              >
+                  <//>
+                  <${Show} when=${() => selectedAgent()?.codeInterpreter}>
+                    <button class="tray-chip" onClick=${(event) => openFiles()}>
+                      <span aria-hidden="true">⌗</span> Files for this
+                      turn${() =>
+                        selectedFiles().length
+                          ? " · " + selectedFiles().length + " selected"
+                          : ""}
+                    </button>
+                    <${Show} when=${() => selectedFiles().length}>
+                      <button
+                        class="message-action"
+                        onClick=${(event) => setSelectedFiles([])}
+                      >
+                        Clear
+                      </button><//
+                    >
+                    <label class="save-output-toggle">
+                      <input
+                        type="checkbox"
+                        checked=${saveOutputs}
+                        onChange=${(event) => setSaveOutputs(event.currentTarget.checked)}
+                      />
+                      Save outputs
+                    </label>
+                  <//>
+                </div>
+              <//>
               <textarea
                 aria-label="Message"
-                placeholder=${() => (selectedAgent() ? "Message your agent…" : "Choose an agent to start chatting")}
+                rows="2"
+                placeholder=${() =>
+                  selectedAgent()
+                    ? "Message " + agentName(selectedAgent()) + "…"
+                    : "Choose an agent to start chatting"}
                 value=${draft}
                 onInput=${(e) => setDraft(e.currentTarget.value)}
                 onKeyDown=${(e) => {
@@ -793,10 +1042,11 @@ await mountPage({
               <div class="composer-foot">
                 <${Show}
                   when=${selectedAgent}
-                  fallback=${html`<span class="hint">AgentCore handles memory, tools and execution</span>`}
+                  fallback=${html`<span class="hint mono">memory · tools · execution handled by AgentCore</span>`}
                 >
                   <div class="composer-controls">
                     <select
+                      class="model-chip"
                       aria-label="Model for this message"
                       disabled=${() => sending() || loadingConversation()}
                       onChange=${(e) =>
@@ -835,31 +1085,37 @@ await mountPage({
                     <${Show}
                       when=${() => composerModel()?.thinkingLevels?.length}
                     >
-                      <label class="composer-thinking">
-                        <span>Thinking: ${() => composerThinking()}</span>
-                        <input
-                          type="range"
-                          aria-label="Thinking level for this message"
-                          aria-valuetext=${() => composerThinking()}
-                          min="0"
-                          max=${() => composerModel().thinkingLevels.length - 1}
-                          step="1"
-                          value=${() =>
-                            composerModel().thinkingLevels.indexOf(
-                              composerThinking(),
-                            )}
-                          onInput=${(e) =>
-                            setComposerChoice({
-                              agentId: selectedAgent()?.id,
-                              modelId: composerModel()?.id,
-                              thinkingLevel:
-                                composerModel()?.thinkingLevels[
-                                  Number(e.currentTarget.value)
-                                ],
-                            })}
-                          disabled=${() => sending() || loadingConversation()}
-                        />
-                      </label>
+                      <div
+                        class="thinking"
+                        role="radiogroup"
+                        aria-label="Thinking level for this message"
+                      >
+                        <span class="thinking-label mono" aria-hidden="true">think</span>
+                        <${For} each=${() => composerModel()?.thinkingLevels || []}
+                          >${(level) =>
+                            html`<button
+                              type="button"
+                              role="radio"
+                              class="thinking-step"
+                              title=${level}
+                              aria-label=${level}
+                              aria-checked=${() => String(composerThinking() === level)}
+                              data-on=${() =>
+                                (composerModel()?.thinkingLevels || []).indexOf(level) <=
+                                (composerModel()?.thinkingLevels || []).indexOf(composerThinking())
+                                  ? ""
+                                  : undefined}
+                              disabled=${() => sending() || loadingConversation()}
+                              onClick=${(event) =>
+                                setComposerChoice({
+                                  agentId: selectedAgent()?.id,
+                                  modelId: composerModel()?.id,
+                                  thinkingLevel: level,
+                                })}
+                            ></button>`}<//
+                        >
+                        <span class="thinking-value mono">${composerThinking}</span>
+                      </div>
                     <//>
                   </div>
                 <//>
@@ -889,40 +1145,37 @@ await mountPage({
         ref=${(element) => {
           fileDialog = element;
         }}
-        class="panel file-picker"
+        class="file-picker"
         aria-labelledby="file-picker-title"
         onClose=${() => fileDialogTrigger?.focus()}
       >
-        <h2 id="file-picker-title">Files for this turn</h2>
-        <p>Select up to four files.</p>
-        <${For}
-          each=${() => files().filter((item) => ["file", "artifact"].includes(item.kind))}
-          >${(item) => html`<label class="check"><input type="checkbox" checked=${() => selectedFiles().includes(item.id)} disabled=${() => selectedFiles().length >= 4 && !selectedFiles().includes(item.id)} onChange=${() => toggleSelectedFile(item.id)} />${item.name}</label>`}<//
-        >
-        <${Show} when=${filesCursor}
-          ><button onClick=${moreFiles}>Load more files</button><//
-        >
-        <a href=${pageUrl("agents", { section: "skills" })}
-          >Manage files & skills</a
-        ><button autofocus onClick=${() => fileDialog.close()}>Done</button>
-      </dialog>
-      <${Show} when=${activeRun}
-        ><div class="run-controls">
-          <span role="status"
-            >${() => (sending() ? "Working in AgentCore. You can leave this page." : "Observation detached.")}</span
+        <div class="dialog-head">
+          <div>
+            <h2 id="file-picker-title">Files for this turn</h2>
+            <p>Select up to four files.</p>
+          </div>
+        </div>
+        <div class="dialog-body">
+          <${Show}
+            when=${filesLoaded}
+            fallback=${html`<${Skeleton} variant="list" rows=${3} label="Loading files…" />`}
           >
-          <button
-            onClick=${() => rpc("chat.cancel", { requestId: activeRun() }).catch((cause) => setError(cause.message))}
-          >
-            Cancel turn
-          </button>
-          <${Show} when=${() => !sending()}
-            ><button onClick=${() => observeRun(activeRun(), true)}>
-              Reconnect
-            </button><//
-          >
-        </div><//
-      >`;
+            <${For}
+              each=${() => files().filter((item) => ["file", "artifact"].includes(item.kind))}
+              fallback=${html`<div class="empty">No saved files in this project.</div>`}
+              >${(item) => html`<label class="check"><input type="checkbox" checked=${() => selectedFiles().includes(item.id)} disabled=${() => selectedFiles().length >= 4 && !selectedFiles().includes(item.id)} onChange=${() => toggleSelectedFile(item.id)} />${item.name}</label>`}<//
+            >
+            <${Show} when=${filesCursor}
+              ><button class="secondary" onClick=${(event) => moreFiles()}>Load more files</button><//
+            >
+          <//>
+          <div class="actions">
+            <a class="secondary" href=${pageUrl("agents", { section: "skills" })}
+              >Manage files & skills</a
+            ><button class="primary" autofocus onClick=${() => fileDialog.close()}>Done</button>
+          </div>
+        </div>
+      </dialog>`;
   },
 });
 if (new URL(location.href).searchParams.get("test") === "1") {

@@ -67,6 +67,7 @@ try {
               client_id: config.client,
               token_use: "access",
               scope: config.scope,
+              "cognito:groups": ["Administrators"],
               sub,
               exp: Math.floor(Date.now() / 1000) + 3600,
             }),
@@ -76,7 +77,14 @@ try {
         sessionStorage.setItem(
           `agentcore:session:${config.runtime}:${config.client}`,
           JSON.stringify({
-            tokens: { access_token: token },
+            tokens: {
+              access_token: token,
+              id_token:
+                btoa(JSON.stringify({ alg: "none" })) +
+                "." +
+                btoa(JSON.stringify({ email: "admin@example.com" })) +
+                ".test",
+            },
             runtimeSessionId: "pages-test-session",
           }),
         );
@@ -85,13 +93,32 @@ try {
     );
     const calls = [],
       errors = [];
+    // Boot check only: imitate the Runtime's ~400ms round trip and one cold start.
+    let delay = 0,
+      cold = false;
     let credentialItems = [],
       connectionItems = [];
     await context.route("**/invocations?qualifier=DEFAULT", async (route) => {
       const { command, input } = route.request().postDataJSON();
       calls.push({ command, input });
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      if (cold && command === "session.get") {
+        cold = false;
+        return route.fulfill({
+          status: 424,
+          json: { ok: false, error: { code: "RUNTIME_STARTING" } },
+        });
+      }
       let data, error;
       const projectItems = [{ id: "main", name: "Main project" }];
+      const conversation = {
+        id: "44444444-4444-4444-a444-444444444444",
+        agentId: "33333333-3333-4333-a333-333333333333",
+        title: "Quarterly summary",
+        createdAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
+        activeBranchId: "main",
+      };
       const agent = {
         id: "33333333-3333-4333-a333-333333333333",
         name: "Research",
@@ -113,7 +140,27 @@ try {
           projects: projectItems,
           agents: [agent],
           models: catalog.map((model) => ({ ...model, active: true })),
-          conversations: { items: [] },
+          conversations: { items: [conversation] },
+        };
+      else if (command === "conversations.get")
+        data = {
+          messages: [
+            { role: "user", text: "Summarise the Q3 numbers", eventId: "1#a" },
+            {
+              role: "assistant",
+              text: "Revenue grew 12% quarter on quarter.\n\n```\nq3 = 1.12 * q2\n```\nSources: https://example.com/q3",
+              eventId: "2#b",
+              tools: [
+                { name: "web_search", isError: false },
+                { name: "execute_code", isError: true },
+              ],
+            },
+          ],
+          branches: [
+            { id: "main", name: "Main", headEventId: "2#b" },
+            { id: other, name: "Edit 1", headEventId: null },
+          ],
+          nextCursor: null,
         };
       else if (command === "agents.list") data = { items: [agent] };
       else if (command === "models.list")
@@ -160,6 +207,55 @@ try {
       await page.goto(base + path);
       await page.locator('[data-app-state="ready"]').waitFor();
     };
+    delay = 400;
+    cold = true;
+    await page.goto(base);
+    await page.locator('[data-boot-phase="warming"]').waitFor();
+    assert.equal(await page.locator(".welcome").count(), 0);
+    assert.equal(
+      await page.locator(".account-head strong").textContent(),
+      "admin@example.com",
+      "Optimistic identity before session.get resolves",
+    );
+    await page.screenshot({
+      path: new URL(`${name}-boot-warming.png`, snapshots).pathname.replace(
+        /^\/([A-Z]:)/,
+        "$1",
+      ),
+    });
+    await page.locator('[data-app-state="ready"]').waitFor();
+    await page.locator(".welcome").waitFor();
+    const boot = calls.map(({ command }) => command);
+    assert.deepEqual(
+      [...boot].sort(),
+      ["session.get", "session.get", "workspace.get"],
+      "workspace.get starts beside session.get once; objects.list waits for the picker",
+    );
+    assert.ok(boot.indexOf("workspace.get") < boot.lastIndexOf("session.get"));
+    delay = 0;
+    calls.length = 0;
+    const shot = (label) =>
+      page.screenshot({
+        path: new URL(`${name}-${label}.png`, snapshots).pathname.replace(
+          /^\/([A-Z]:)/,
+          "$1",
+        ),
+      });
+    if (name === "mobile")
+      await page.getByRole("button", { name: "Show conversations" }).click();
+    await page.locator(".history-item").first().click();
+    await page.locator(".message.assistant .trace-line").first().waitFor();
+    assert.equal(
+      await page.locator('[data-state="error"] .trace-status').textContent(),
+      "failed",
+    );
+    await page.waitForFunction(
+      () => !document.querySelector(".topbar[data-busy]"),
+    );
+    await shot("chat-thread");
+    await page.emulateMedia({ colorScheme: "dark" });
+    await shot("chat-thread-dark");
+    await page.emulateMedia({ colorScheme: "light" });
     await navigation("users/");
     await page.getByRole("link", { name: /member@example.com/ }).click();
     await page.getByRole("heading", { name: "member@example.com" }).waitFor();
@@ -252,7 +348,9 @@ try {
     await page.getByRole("dialog").waitFor({ state: "hidden" });
     if (name === "mobile") {
       await page.getByRole("button", { name: "Toggle navigation" }).click();
-      await page.locator(".page-sidebar.open").waitFor();
+      await page.locator(".site-menu.open").waitFor();
+      await page.waitForTimeout(300);
+      await shot("menu");
     }
     assert.deepEqual(errors, []);
     console.log(
@@ -266,7 +364,10 @@ try {
     await context.route("**/logout?**", (route) =>
       route.fulfill({ contentType: "text/html", body: "Signed out" }),
     );
-    await page.getByRole("button", { name: "Sign out", exact: true }).click();
+    const signOut = page.getByRole("button", { name: "Sign out", exact: true });
+    if (!(await signOut.isVisible()))
+      await page.getByRole("button", { name: "Account menu" }).click();
+    await signOut.click();
     await peer.locator('[data-app-state="disconnected"]').waitFor();
     assert.equal(
       await peer.evaluate(() =>

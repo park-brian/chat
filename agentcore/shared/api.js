@@ -1,3 +1,4 @@
+import { createSignal } from "solid-js";
 const messages = {
   REVISION_CONFLICT: "This item changed elsewhere. Reload it before saving.",
   CREDENTIAL_IN_USE:
@@ -22,6 +23,8 @@ const errorText = (error, fallback) =>
   error?.message || messages[error?.code] || error?.code || fallback;
 export function createApi(auth) {
   const observers = new Set();
+  // Short RPCs in flight; long-lived chat.watch streams are reported by the run indicator instead.
+  const [pending, setPending] = createSignal(0);
   window.addEventListener("agentcore:signout", () => {
     for (const controller of observers) controller.abort();
   });
@@ -52,6 +55,14 @@ export function createApi(auth) {
     );
   }
   async function rpc(command, input = {}) {
+    setPending((count) => count + 1);
+    try {
+      return await call(command, input);
+    } finally {
+      setPending((count) => count - 1);
+    }
+  }
+  async function call(command, input) {
     const response = await request(command, input),
       result = await response.json();
     if (!response.ok || !result.ok) {
@@ -140,5 +151,5 @@ export function createApi(auth) {
       signal?.removeEventListener("abort", abort);
     }
   }
-  return { rpc, watch };
+  return { rpc, watch, pending };
 }

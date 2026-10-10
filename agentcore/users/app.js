@@ -1,7 +1,7 @@
 import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import { createFeedback, dollars, gb, Badge, Empty } from "../shared/ui.js";
+import { createFeedback, dollars, gb, Badge, Empty, Skeleton } from "../shared/ui.js";
 
 mountPage({
   key: "users",
@@ -18,7 +18,7 @@ mountPage({
         <h2>People</h2>
         <${Show}
           when=${data}
-          fallback=${html`<${Empty} text="Loading users…" />`}
+          fallback=${html`<${Skeleton} rows=${4} label="Loading users…" />`}
         >
           <div class="compact-list">
             <${For} each=${() => data()?.items || []}
