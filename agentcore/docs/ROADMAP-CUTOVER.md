@@ -273,6 +273,26 @@ their Runtime sessions were removed in `finally`. Records are
 captures are under `.artifacts/screenshots/production/`. Reproduce the bounded
 production smoke with `node scripts/test-production-pages.js`; use
 `--visual-only` for page checks without repeating inference or credential writes.
+Set `AWS_PROFILE` to use a named CLI profile instead of `.env` keys.
+
+The top-bar redesign (commits `918b150` through `5dedfb3`, Pages run
+`38083551319`) passed the same production smoke on 2026-10-10, with no Runtime
+or template change. A temporary administrator signed in through published-origin
+PKCE. The account menu reached Profile, Users and Credentials, and the mobile
+sheet reached Credentials. Measured Runtime calls took about 0.4-0.75 s each
+(`session.get` median 521 ms, no non-200 responses). Stored tokens rendered the
+optimistic shell within about 20 ms of document start, and each page reached
+`ready` in 0.44-0.79 s. The smoke now also continues the conversation through
+the composer. That exposed a bug shipped in `9aa26cb`: the terminal `run.status`
+snapshot repeats the last progress `sequence`, the observer dropped it as a
+replay, and every UI-sent turn reconnected `chat.watch` about every 500 ms
+while the UI stayed on "Working…". After the client fix (`ce96a49`), a real
+Haiku 5.5 turn sent from the composer showed the run indicator at 0.9 s, the
+answer at 2.9 s, and settled at 3.6 s on one `chat.watch` call. Evidence
+records add `rpc` latencies, `boot` phases and `uiTurn` timings; captures
+include `chat-ui-turn-running.png` and `chat-ui-turn-settled.png`. Pages other
+than Chat still issue their first data call only after `session.get`, adding
+one round trip before content.
 `prepare-production-change-set.js`
 prepares review only, preserves every other parameter with `UsePreviousValue`
 (including NoEcho), refuses production scripted inference, records replacements,
