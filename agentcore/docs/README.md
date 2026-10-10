@@ -51,10 +51,10 @@ controls; ordinary links switch documents. Tokens and Runtime session IDs live
 in deployment-isolated `sessionStorage`. Credentials are write-only inputs and
 are never browser-persisted or returned on reads.
 
-The October 10 slice passed disposable-stack validation. Its reviewed production
-Runtime update completed with all 20 resource identities preserved; publication
-and checks at the GitHub Pages origin follow in the same authorized rollout.
-See the delivery ledger for the exact artifact and validation evidence.
+The October 10 slice is deployed to production and GitHub Pages. All 20 resource
+identities were preserved, and published-origin authentication, page journeys,
+private credentials, and a real background turn passed. See the delivery ledger
+for the exact artifact and validation evidence.
 
 `FOUNDATION.md` records an earlier release. `PLAN.md`, `API-CONTRACT.md`,
 `IMPLEMENTATION.md`, `STATUS.md`, `PRODUCT-ROADMAP.md`,

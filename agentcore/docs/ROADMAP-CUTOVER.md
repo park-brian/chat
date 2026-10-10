@@ -251,8 +251,28 @@ the root callback; scripted inference remains disabled. The review record is
 `.artifacts/pages-production-review.json`. Following explicit authorization to
 continue the rollout, the change set was executed on 2026-10-10 and reached
 `UPDATE_COMPLETE`. A before/after comparison verified all 20 physical resource
-identities were preserved. GitHub Pages publication and its production smoke
-gate follow this Runtime update.
+identities were preserved. Commit `9aa26cb` published the pages through the
+existing GitHub Pages workflow, run `38053727311` (`success`). The exact staged
+release also passed AgentCore `npm test`, including a CSP-check portability fix
+for Git's Windows/Linux line endings, using an isolated export of the release
+with the original root server and only the required external-module coverage
+change. Unrelated root-app edits were excluded from publication.
+
+From the published production origin, all 21 page/shared assets matched source.
+PKCE returned to Users; Users -> selected Profile -> filtered Usage and `90d`
+refresh passed. All seven direct-page refreshes and mobile navigation passed.
+Temporary private credential creation/reference/rotation/deletion passed.
+A real Haiku 5.5 request completed across navigation, with one Memory event and
+one model-usage row despite a duplicate start, and its saved answer reopened in
+Chat. Production catalog reads exposed all seven requested models with scripted
+inference disabled. Settled desktop/mobile screenshots were inspected, including
+loaded Profile and Agents and the Credentials empty state; no page errors or
+error notices occurred. Both smoke identities, their owned records/objects, and
+their Runtime sessions were removed in `finally`. Records are
+`.artifacts/pages-production-smoke.json` and `pages-production-visuals.json`;
+captures are under `.artifacts/screenshots/production/`. Reproduce the bounded
+production smoke with `node scripts/test-production-pages.js`; use
+`--visual-only` for page checks without repeating inference or credential writes.
 `prepare-production-change-set.js`
 prepares review only, preserves every other parameter with `UsePreviousValue`
 (including NoEcho), refuses production scripted inference, records replacements,

@@ -6,6 +6,7 @@ import { chromium } from "../../node_modules/playwright/index.mjs";
 import { createLiveFixture } from "../tests/fixtures.js";
 
 process.loadEnvFile(new URL("../../.env", import.meta.url));
+const visualOnly = process.argv.includes("--visual-only");
 const fixture = await createLiveFixture({
   stackName: "agentcore-chat-prod",
   region: "us-east-1",
@@ -144,6 +145,27 @@ try {
     import.meta.url,
   );
   await mkdir(screens, { recursive: true });
+  const settled = async (key) => {
+    await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
+    await page.waitForFunction(
+      () =>
+        ![...document.querySelectorAll("#page-content .empty")].some(
+          (element) => /^(Loading|Opening)/.test(element.textContent.trim()),
+        ),
+    );
+    if (key === "chat")
+      await page
+        .locator(".chat-history select")
+        .first()
+        .locator("option")
+        .first()
+        .waitFor({ state: "attached" });
+    assert.deepEqual(
+      await page.locator('#page-content [role="alert"]').allTextContents(),
+      [],
+      key + " error notice",
+    );
+  };
   // Real links exercise the Users -> selected Profile -> filtered Usage journey.
   await page.locator(`a[href*="user=${fixture.sub}"]`).first().click();
   await page.getByRole("heading", { name: fixture.email }).waitFor();
@@ -172,7 +194,7 @@ try {
       .click();
     await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
     await page.reload();
-    await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
+    await settled(key);
     assert.equal(await page.locator('a[aria-current="page"]').count(), 1);
     await page.screenshot({
       path: new URL(key + "-desktop.png", screens).pathname.replace(
@@ -189,7 +211,7 @@ try {
   await page.getByRole("heading", { name: fixture.email }).waitFor();
   await page.getByRole("button", { name: "Toggle navigation" }).click();
   await page.getByRole("link", { name: "Credentials", exact: true }).click();
-  await page.locator('[data-app-state="ready"]').waitFor();
+  await settled("credentials");
   assert.ok(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth + 1,
@@ -205,99 +227,111 @@ try {
   console.log(
     "PASS: published PKCE return, Users -> Profile -> Usage, seven direct refreshes and mobile navigation",
   );
-  let credential = await rpc("credentials.put", {
-    name: "Production smoke",
-    kind: "github",
-    secret: "synthetic-release-" + randomUUID(),
-  });
-  const connection = await rpc("connections.put", {
-    projectId: "main",
-    name: "Production smoke",
-    kind: "github",
-    credentialId: credential.id,
-  });
-  credential = (await rpc("credentials.list")).items.find(
-    (item) => item.id === credential.id,
-  );
-  assert.equal(credential.usedBy.length, 1);
-  assert.equal("secret" in credential, false);
-  credential = await rpc("credentials.rotate", {
-    id: credential.id,
-    revision: credential.revision,
-    secret: "synthetic-rotated-" + randomUUID(),
-  });
-  await rpc("connections.delete", {
-    projectId: "main",
-    id: connection.id,
-    revision: connection.revision,
-  });
-  credential = (await rpc("credentials.list")).items.find(
-    (item) => item.id === credential.id,
-  );
-  await rpc("credentials.delete", {
-    id: credential.id,
-    revision: credential.revision,
-  });
-  const agent = await rpc("agents.put", {
-    projectId: "main",
-    name: "Production smoke",
-    modelId: "global.anthropic.claude-haiku-5-5",
-    thinkingLevel: "low",
-    systemPrompt: "Answer briefly.",
-  });
-  const input = {
-    projectId: "main",
-    agentId: agent.id,
-    sessionId: randomUUID(),
-    requestId: randomUUID(),
-    expectedHeadEventId: null,
-    message: "What is 19 + 23? Reply with the number only.",
-  };
-  fixture.trackChat(agent.id, input.sessionId);
-  await rpc("chat.start", input);
-  await rpc("chat.start", input);
-  await page.goto(new URL("usage/", base).href);
-  await page.locator('[data-app-state="ready"]').waitFor();
-  let run;
-  const deadline = Date.now() + 120000;
-  do {
-    run = await rpc("chat.status", { requestId: input.requestId });
-    if (!["running", "memory_written"].includes(run.status)) break;
-    assert.ok(Date.now() < deadline, "Production turn timed out");
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  } while (true);
-  assert.equal(run.status, "completed");
-  const chat = await rpc("conversations.get", {
-    projectId: "main",
-    agentId: agent.id,
-    conversationId: input.sessionId,
-  });
-  assert.match(chat.messages.at(-1).text, /42/);
-  assert.equal(
-    (await fixture.readChat(agent.id, input.sessionId)).events.length,
-    1,
-  );
-  assert.equal(
-    (await fixture.readUsage()).Items.filter(
-      (row) => row.requestId?.S === input.requestId && row.kind?.S === "model",
-    ).length,
-    1,
-  );
-  await page.goto(new URL(`?conversation=${input.sessionId}`, base).href);
-  await page.locator(".message.assistant").getByText(/42/).waitFor();
+  if (!visualOnly) {
+    let credential = await rpc("credentials.put", {
+      name: "Production smoke",
+      kind: "github",
+      secret: "synthetic-release-" + randomUUID(),
+    });
+    const connection = await rpc("connections.put", {
+      projectId: "main",
+      name: "Production smoke",
+      kind: "github",
+      credentialId: credential.id,
+    });
+    credential = (await rpc("credentials.list")).items.find(
+      (item) => item.id === credential.id,
+    );
+    assert.equal(credential.usedBy.length, 1);
+    assert.equal("secret" in credential, false);
+    credential = await rpc("credentials.rotate", {
+      id: credential.id,
+      revision: credential.revision,
+      secret: "synthetic-rotated-" + randomUUID(),
+    });
+    await rpc("connections.delete", {
+      projectId: "main",
+      id: connection.id,
+      revision: connection.revision,
+    });
+    credential = (await rpc("credentials.list")).items.find(
+      (item) => item.id === credential.id,
+    );
+    await rpc("credentials.delete", {
+      id: credential.id,
+      revision: credential.revision,
+    });
+    const agent = await rpc("agents.put", {
+      projectId: "main",
+      name: "Production smoke",
+      modelId: "global.anthropic.claude-haiku-5-5",
+      thinkingLevel: "low",
+      systemPrompt: "Answer briefly.",
+    });
+    const input = {
+      projectId: "main",
+      agentId: agent.id,
+      sessionId: randomUUID(),
+      requestId: randomUUID(),
+      expectedHeadEventId: null,
+      message: "What is 19 + 23? Reply with the number only.",
+    };
+    fixture.trackChat(agent.id, input.sessionId);
+    await rpc("chat.start", input);
+    await rpc("chat.start", input);
+    await page.goto(new URL("usage/", base).href);
+    await page.locator('[data-app-state="ready"]').waitFor();
+    let run;
+    const deadline = Date.now() + 120000;
+    do {
+      run = await rpc("chat.status", { requestId: input.requestId });
+      if (!["running", "memory_written"].includes(run.status)) break;
+      assert.ok(Date.now() < deadline, "Production turn timed out");
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    } while (true);
+    assert.equal(run.status, "completed");
+    const chat = await rpc("conversations.get", {
+      projectId: "main",
+      agentId: agent.id,
+      conversationId: input.sessionId,
+    });
+    assert.match(chat.messages.at(-1).text, /42/);
+    assert.equal(
+      (await fixture.readChat(agent.id, input.sessionId)).events.length,
+      1,
+    );
+    assert.equal(
+      (await fixture.readUsage()).Items.filter(
+        (row) =>
+          row.requestId?.S === input.requestId && row.kind?.S === "model",
+      ).length,
+      1,
+    );
+    await page.goto(new URL(`?conversation=${input.sessionId}`, base).href);
+    await page.locator(".message.assistant").getByText(/42/).waitFor();
+    assert.deepEqual(errors, []);
+    evidence.completedAt = new Date().toISOString();
+    evidence.passed = true;
+    evidence.models = models.map((model) => model.name);
+    console.log(
+      "PASS: production private credential lifecycle and real background inference, durable result, one charge set",
+    );
+  }
   assert.deepEqual(errors, []);
   evidence.completedAt = new Date().toISOString();
   evidence.passed = true;
-  evidence.models = models.map((model) => model.name);
-  console.log(
-    "PASS: production private credential lifecycle and real background inference, durable result, one charge set",
-  );
+  evidence.visualOnly = visualOnly;
 } finally {
   if (browser) await browser.close();
   await fixture.cleanup();
   evidence.cleanedAt = new Date().toISOString();
   await writeFile(
-    new URL("../.artifacts/pages-production-smoke.json", import.meta.url),
+    new URL(
+      visualOnly
+        ? "../.artifacts/pages-production-visuals.json"
+        : "../.artifacts/pages-production-smoke.json",
+      import.meta.url,
+    ),
     JSON.stringify(evidence, null, 2),
   );
 }
