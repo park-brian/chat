@@ -27,17 +27,6 @@ mountPage({
         (model) => model.id === (draftModelId() || editingAgent()?.modelId),
       ) || models().find((model) => model.active);
     const modelCompanies = ["Anthropic", "OpenAI", "Google", "Amazon", "Other"];
-    const modelCompany = (model) =>
-      model.company ||
-      (/anthropic/.test(model.id)
-        ? "Anthropic"
-        : /openai/.test(model.id)
-          ? "OpenAI"
-          : /gemini/.test(model.id)
-            ? "Google"
-            : /amazon/.test(model.id)
-              ? "Amazon"
-              : "Other");
     async function setAgentArchived(agent, archived) {
       setError("");
       try {
@@ -562,7 +551,7 @@ mountPage({
                                         : []
                                       ).filter(
                                         (model) =>
-                                          modelCompany(model) === company,
+                                          model.company === company,
                                       )}
                                   >
                                     ${(model) =>

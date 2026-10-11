@@ -193,7 +193,7 @@ try {
     );
     return result.data;
   };
-  assert.equal((await rpc("session.get")).apiVersion, 2);
+  assert.equal((await rpc("session.get")).apiVersion, 3);
   assert.equal((await rpc("users.get")).user.sub, fixture.sub);
   const models = (await rpc("models.list")).items;
   for (const name of [

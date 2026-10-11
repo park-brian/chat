@@ -281,17 +281,6 @@ await mountPage({
       }
     }
     const modelCompanies = ["Anthropic", "OpenAI", "Google", "Amazon", "Other"];
-    const modelCompany = (model) =>
-      model.company ||
-      (/anthropic/.test(model.id)
-        ? "Anthropic"
-        : /openai/.test(model.id)
-          ? "OpenAI"
-          : /gemini/.test(model.id)
-            ? "Google"
-            : /amazon/.test(model.id)
-              ? "Amazon"
-              : "Other");
 
     const messageSections = (value) =>
       String(value || "")
@@ -1050,7 +1039,7 @@ await mountPage({
                             <${For}
                               each=${() =>
                                 models().filter(
-                                  (model) => modelCompany(model) === company,
+                                  (model) => model.company === company,
                                 )}
                             >
                               ${(model) =>
