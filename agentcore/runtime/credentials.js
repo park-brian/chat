@@ -1,29 +1,22 @@
+// Private credentials and the connections that use them. Every key is derived
+// from the authenticated owner; a reference change and the revision checks of
+// both sides commit in one transaction, so deletion races cannot orphan either.
 import {
-  GetItemCommand,
-  QueryCommand,
-  TransactWriteItemsCommand,
-} from "@aws-sdk/client-dynamodb";
+  conditionFailed,
+  fail,
+  get,
+  patterns,
+  queryAll,
+  sk,
+  transact,
+  userKey,
+  userPk,
+  uuid,
+} from "./db.js";
 
-const S = (value) => ({ S: String(value) });
-const N = (value) => ({ N: String(value) });
-const key = (sub, type, id = "") => ({
-  pk: S(`USER#${sub}`),
-  sk: S(type + id),
-});
-export class ResourceError extends Error {
-  constructor(code) {
-    super(code);
-    this.code = code;
-  }
-}
-const fail = (code) => {
-  throw new ResourceError(code);
-};
-const conflict = (error) =>
-  ["TransactionCanceledException", "ConditionalCheckFailedException"].includes(
-    error.name,
-  );
-const validId = (id) => /^[0-9a-f-]{36}$/i.test(id || "");
+const kinds = ["github", "jira"];
+const credentialKey = (sub, id) => userKey(sub, sk.credential(id));
+const connectionKey = (sub, id) => userKey(sub, sk.connection(id));
 const nameOf = (name) => {
   if (typeof name !== "string" || !name.trim() || name.length > 80)
     fail("VALIDATION_FAILED");
@@ -39,171 +32,177 @@ const secretOf = (secret) => {
     fail("VALIDATION_FAILED");
   return secret;
 };
-const decode = (row) => (row ? JSON.parse(row.data.S) : null);
-const publicCredential = ({ secret, ...item }) => item;
+const revisionOf = (revision) => {
+  if (!Number.isSafeInteger(revision) || revision < 0)
+    fail("VALIDATION_FAILED");
+  return revision;
+};
+const withoutSecret = ({ secret, ...item }) => item;
 
-// All keys are derived from the authenticated owner. Reference changes and their
-// credential revision checks share one transaction, including deletion races.
-export function createCredentials({ db, table, uuid }) {
-  const get = async (sub, type, id) =>
-    decode(
-      (
-        await db.send(
-          new GetItemCommand({
-            TableName: table,
-            Key: key(sub, type, id),
-            ConsistentRead: true,
-          }),
-        )
-      ).Item,
-    );
-  const put = (sub, type, item, expected) => ({
-    Put: {
-      TableName: table,
-      Item: {
-        ...key(sub, type, item.id),
-        revision: N(item.revision),
-        data: S(JSON.stringify(item)),
-      },
-      ConditionExpression:
-        expected === null ? "attribute_not_exists(pk)" : "revision = :revision",
-      ...(expected !== null && {
-        ExpressionAttributeValues: { ":revision": N(expected) },
-      }),
+// Each record is one JSON document guarded by its revision attribute.
+const decode = (row) => (row ? JSON.parse(row.data) : null);
+const write = (itemKey, item, expected) => ({
+  Put: {
+    Item: {
+      ...itemKey,
+      revision: { N: String(item.revision) },
+      data: { S: JSON.stringify(item) },
     },
-  });
-  const remove = (sub, type, item) => ({
-    Delete: {
-      TableName: table,
-      Key: key(sub, type, item.id),
-      ConditionExpression: "revision = :revision",
-      ExpressionAttributeValues: { ":revision": N(item.revision) },
-    },
-  });
-  const transact = async (items) => {
-    try {
-      await db.send(new TransactWriteItemsCommand({ TransactItems: items }));
-    } catch (error) {
-      if (conflict(error)) fail("REVISION_CONFLICT");
-      throw error;
-    }
-  };
-  async function migrate(sub) {
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const legacyKey = key(sub, "CREDENTIALS");
-      const row = (
-        await db.send(
-          new GetItemCommand({
-            TableName: table,
-            Key: legacyKey,
-            ConsistentRead: true,
-          }),
-        )
-      ).Item;
-      if (!row || row.migrated?.BOOL) return;
-      const revision = Number(row.revision?.N || 0);
-      const records = Object.values(JSON.parse(row.connectionsJson?.S || "{}"));
-      const writes = records.flatMap(({ apiKey, ...connection }) => [
-        put(
-          sub,
-          "CREDENTIAL#",
-          {
-            id: connection.id,
-            name: connection.name,
-            kind: connection.kind,
-            secret: apiKey,
-            revision: 0,
-            createdAt: connection.createdAt,
-            connectionIds: [connection.id],
-          },
-          null,
-        ),
-        put(
-          sub,
-          "CONNECTION#",
-          { ...connection, credentialId: connection.id, revision: 0 },
-          null,
-        ),
-      ]);
-      writes.push({
-        Put: {
-          TableName: table,
-          Item: {
-            ...legacyKey,
-            revision: N(revision + 1),
-            migrated: { BOOL: true },
-          },
+    ...(expected === null
+      ? { ConditionExpression: "attribute_not_exists(pk)" }
+      : {
           ConditionExpression: "revision = :revision",
-          ExpressionAttributeValues: { ":revision": N(revision) },
-        },
-      });
-      try {
-        await transact(writes);
-        return;
-      } catch (error) {
-        if (error.code !== "REVISION_CONFLICT" || attempt === 3) throw error;
-      }
-    }
-  }
-  async function list(sub, type) {
-    await migrate(sub);
-    const items = [];
-    let cursor;
-    do {
-      const page = await db.send(
-        new QueryCommand({
-          TableName: table,
-          KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
-          ExpressionAttributeValues: {
-            ":pk": S(`USER#${sub}`),
-            ":prefix": S(type),
-          },
-          ConsistentRead: true,
-          ExclusiveStartKey: cursor,
+          ExpressionAttributeValues: { ":revision": { N: String(expected) } },
         }),
-      );
-      items.push(...(page.Items || []).map(decode));
-      cursor = page.LastEvaluatedKey;
-    } while (cursor);
-    return items;
+  },
+});
+const erase = (itemKey, item) => ({
+  Delete: {
+    Key: itemKey,
+    ConditionExpression: "revision = :revision",
+    ExpressionAttributeValues: { ":revision": { N: String(item.revision) } },
+  },
+});
+const commit = async (items) => {
+  try {
+    await transact(items);
+  } catch (error) {
+    if (conditionFailed(error)) fail("REVISION_CONFLICT");
+    throw error;
   }
-  const owned = async (sub, type, id) => {
-    if (!validId(id)) fail("VALIDATION_FAILED");
-    const item = await get(sub, type, id);
-    if (!item) fail("NOT_FOUND");
-    return item;
-  };
-  const checkRevision = (item, revision) => {
-    if (!Number.isSafeInteger(revision) || revision < 0)
-      fail("VALIDATION_FAILED");
-    if (item.revision !== revision) fail("REVISION_CONFLICT");
-  };
-  async function command(command, identity, input) {
-    const sub = identity.sub;
-    if (input.userSub !== undefined || input.sub !== undefined)
-      fail("FORBIDDEN");
-    if (command.endsWith(".list")) {
-      if (command === "connections.list")
-        return { items: await list(sub, "CONNECTION#") };
+};
+const list = async (sub, prefix) =>
+  (await queryAll({ pk: userPk(sub), prefix })).map(decode);
+async function owned(itemKey, id) {
+  if (!patterns.id.test(id || "")) fail("VALIDATION_FAILED");
+  const item = decode(await get(itemKey));
+  if (!item) fail("NOT_FOUND");
+  return item;
+}
+const credentialOf = (sub, id) => owned(credentialKey(sub, id), id);
+const connectionOf = (sub, id) => owned(connectionKey(sub, id), id);
+
+export const connectionsOf = (identity) =>
+  list(identity.sub, sk.connection());
+
+// Secrets leave this module only for server-side, explicitly granted tools.
+export async function resolveConnections(identity, ids) {
+  const result = {};
+  for (const id of ids) {
+    const connection = await connectionOf(identity.sub, id).catch((error) => {
+      if (error.code === "NOT_FOUND") fail("CONNECTION_REVOKED");
+      throw error;
+    });
+    const credential = await credentialOf(identity.sub, connection.credentialId);
+    result[id] = { ...connection, apiKey: credential.secret };
+  }
+  return result;
+}
+
+function jiraTarget(input) {
+  let url;
+  try {
+    url = new URL(input.jiraUrl);
+  } catch {
+    fail("VALIDATION_FAILED");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.port ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !/^[a-z0-9-]+\.atlassian\.net$/i.test(url.hostname) ||
+    !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.jiraEmail || "")
+  )
+    fail("VALIDATION_FAILED");
+  return { jiraUrl: url.origin, jiraEmail: input.jiraEmail };
+}
+
+// Checks a connection against its service's "who am I" endpoint. Jira URLs are
+// limited to Atlassian Cloud hosts so a user URL can never become an
+// authenticated request to an arbitrary server.
+async function probe(connection) {
+  const jira = connection.kind === "jira";
+  const url = jira
+    ? new URL("/rest/api/3/myself", connection.jiraUrl).href
+    : "https://api.github.com/user";
+  if (jira && !/^https:\/\/[a-z0-9-]+\.atlassian\.net\//i.test(url))
+    fail("CONNECTION_TEST_UNAVAILABLE");
+  try {
+    const result = await fetch(url, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(8000),
+      headers: {
+        Accept: "application/json",
+        Authorization: jira
+          ? "Basic " +
+            Buffer.from(`${connection.jiraEmail}:${connection.apiKey}`).toString(
+              "base64",
+            )
+          : "Bearer " + connection.apiKey,
+        ...(!jira && { "User-Agent": "agentcore-chat-connection-check" }),
+      },
+    });
+    if (result.status !== 200) {
+      await result.body?.cancel();
+      return { connected: false, account: null, httpStatus: result.status };
+    }
+    const raw = await result.text();
+    if (raw.length > 16384) throw Error("Connection response too large");
+    const label = jira ? JSON.parse(raw).displayName : JSON.parse(raw).login;
+    return {
+      connected: true,
+      account: typeof label === "string" ? label.slice(0, 120) : null,
+      httpStatus: 200,
+    };
+  } catch {
+    return { connected: false, account: null, httpStatus: null };
+  }
+}
+
+// Secrets are only ever the caller's own: naming another person is refused,
+// not silently ignored.
+const ownOnly = (commands) =>
+  Object.fromEntries(
+    Object.entries(commands).map(([name, command]) => [
+      name,
+      {
+        ...command,
+        run: (input, identity, context) => {
+          if (input.userSub !== undefined || input.sub !== undefined)
+            fail("FORBIDDEN");
+          return command.run(input, identity, context);
+        },
+      },
+    ]),
+  );
+
+export const credentialCommands = ownOnly({
+  "credentials.list": {
+    run: async (input, identity) => {
       const [credentials, connections] = await Promise.all([
-        list(sub, "CREDENTIAL#"),
-        list(sub, "CONNECTION#"),
+        list(identity.sub, sk.credential()),
+        list(identity.sub, sk.connection()),
       ]);
       return {
         items: credentials.map((item) => ({
-          ...publicCredential(item),
+          ...withoutSecret(item),
           usedBy: connections
             .filter((connection) => connection.credentialId === item.id)
             .map(({ id, name }) => ({ id, name })),
         })),
       };
-    }
-    if (identity.role === "Auditors") fail("FORBIDDEN");
-    await migrate(sub);
-    if (command.startsWith("credentials.")) {
-      if (command === "credentials.put" && !input.id) {
-        if (!["github", "jira"].includes(input.kind)) fail("VALIDATION_FAILED");
-        if ((await list(sub, "CREDENTIAL#")).length >= 100)
+    },
+  },
+  "credentials.put": {
+    write: true,
+    run: async (input, identity) => {
+      const sub = identity.sub;
+      if (!input.id) {
+        if (!kinds.includes(input.kind)) fail("VALIDATION_FAILED");
+        if ((await list(sub, sk.credential())).length >= 100)
           fail("CREDENTIAL_LIMIT");
         const item = {
           id: uuid(),
@@ -214,142 +213,144 @@ export function createCredentials({ db, table, uuid }) {
           createdAt: new Date().toISOString(),
           connectionIds: [],
         };
-        await transact([put(sub, "CREDENTIAL#", item, null)]);
-        return publicCredential(item);
+        await commit([write(credentialKey(sub, item.id), item, null)]);
+        return withoutSecret(item);
       }
-      const item = await owned(sub, "CREDENTIAL#", input.id);
-      checkRevision(item, input.revision);
-      if (command === "credentials.delete") {
-        if (item.connectionIds.length) fail("CREDENTIAL_IN_USE");
-        await transact([remove(sub, "CREDENTIAL#", item)]);
-        return { deleted: true };
-      }
-      if (command === "credentials.put") item.name = nameOf(input.name);
-      else if (command === "credentials.rotate")
-        item.secret = secretOf(input.secret);
-      else fail("NOT_IMPLEMENTED");
-      item.revision++;
-      await transact([put(sub, "CREDENTIAL#", item, input.revision)]);
-      return publicCredential(item);
-    }
-    if (
-      command === "connections.rotate" ||
-      input.apiKey !== undefined ||
-      input.secret !== undefined
-    )
-      fail("USE_CREDENTIALS");
-    const previous = input.id
-      ? await owned(sub, "CONNECTION#", input.id)
-      : null;
-    if (previous) checkRevision(previous, input.revision);
-    if (command === "connections.delete") {
-      if (!previous) fail("NOT_FOUND");
-      const credential = await owned(sub, "CREDENTIAL#", previous.credentialId);
-      const updated = {
-        ...credential,
-        revision: credential.revision + 1,
-        connectionIds: credential.connectionIds.filter(
-          (id) => id !== previous.id,
-        ),
+      const item = await credentialOf(sub, input.id);
+      if (item.revision !== revisionOf(input.revision)) fail("REVISION_CONFLICT");
+      const renamed = {
+        ...item,
+        name: nameOf(input.name),
+        revision: item.revision + 1,
       };
-      await transact([
-        remove(sub, "CONNECTION#", previous),
-        put(sub, "CREDENTIAL#", updated, credential.revision),
+      await commit([write(credentialKey(sub, item.id), renamed, item.revision)]);
+      return withoutSecret(renamed);
+    },
+  },
+  "credentials.rotate": {
+    write: true,
+    run: async (input, identity) => {
+      const item = await credentialOf(identity.sub, input.id);
+      if (item.revision !== revisionOf(input.revision)) fail("REVISION_CONFLICT");
+      const rotated = {
+        ...item,
+        secret: secretOf(input.secret),
+        revision: item.revision + 1,
+      };
+      await commit([
+        write(credentialKey(identity.sub, item.id), rotated, item.revision),
       ]);
+      return withoutSecret(rotated);
+    },
+  },
+  "credentials.delete": {
+    write: true,
+    run: async (input, identity) => {
+      const item = await credentialOf(identity.sub, input.id);
+      if (item.revision !== revisionOf(input.revision)) fail("REVISION_CONFLICT");
+      if (item.connectionIds.length) fail("CREDENTIAL_IN_USE");
+      await commit([erase(credentialKey(identity.sub, item.id), item)]);
       return { deleted: true };
-    }
-    if (command !== "connections.put") fail("NOT_IMPLEMENTED");
-    const credential = await owned(sub, "CREDENTIAL#", input.credentialId);
-    if (credential.kind !== input.kind) fail("CREDENTIAL_KIND_MISMATCH");
-    let jiraUrl;
-    if (input.kind === "jira") {
-      try {
-        const url = new URL(input.jiraUrl);
-        if (
-          url.protocol !== "https:" ||
-          url.port ||
-          url.username ||
-          url.password ||
-          url.search ||
-          url.hash ||
-          !/^[a-z0-9-]+\.atlassian\.net$/i.test(url.hostname) ||
-          !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.jiraEmail || "")
-        )
-          fail("VALIDATION_FAILED");
-        jiraUrl = url.origin;
-      } catch {
-        fail("VALIDATION_FAILED");
+    },
+  },
+  "connections.list": {
+    run: async (input, identity) => ({ items: await connectionsOf(identity) }),
+  },
+  "connections.put": {
+    write: true,
+    run: async (input, identity) => {
+      const sub = identity.sub;
+      if (input.apiKey !== undefined || input.secret !== undefined)
+        fail("USE_CREDENTIALS");
+      const previous = input.id ? await connectionOf(sub, input.id) : null;
+      if (previous && previous.revision !== revisionOf(input.revision))
+        fail("REVISION_CONFLICT");
+      const credential = await credentialOf(sub, input.credentialId);
+      if (credential.kind !== input.kind) fail("CREDENTIAL_KIND_MISMATCH");
+      const item = {
+        id: previous?.id || uuid(),
+        name: nameOf(input.name),
+        kind: input.kind,
+        credentialId: credential.id,
+        revision: previous ? previous.revision + 1 : 0,
+        createdAt: previous?.createdAt || new Date().toISOString(),
+        ...(input.kind === "jira" && jiraTarget(input)),
+      };
+      const writes = [
+        write(connectionKey(sub, item.id), item, previous?.revision ?? null),
+      ];
+      if (previous?.credentialId === credential.id)
+        writes.push({
+          ConditionCheck: {
+            Key: credentialKey(sub, credential.id),
+            ConditionExpression: "revision = :revision",
+            ExpressionAttributeValues: {
+              ":revision": { N: String(credential.revision) },
+            },
+          },
+        });
+      else {
+        writes.push(
+          write(
+            credentialKey(sub, credential.id),
+            {
+              ...credential,
+              revision: credential.revision + 1,
+              connectionIds: [...credential.connectionIds, item.id],
+            },
+            credential.revision,
+          ),
+        );
+        if (previous) {
+          const old = await credentialOf(sub, previous.credentialId);
+          writes.push(
+            write(
+              credentialKey(sub, old.id),
+              {
+                ...old,
+                revision: old.revision + 1,
+                connectionIds: old.connectionIds.filter((id) => id !== item.id),
+              },
+              old.revision,
+            ),
+          );
+        }
       }
-    }
-    const item = {
-      id: previous?.id || uuid(),
-      name: nameOf(input.name),
-      kind: input.kind,
-      credentialId: credential.id,
-      revision: previous ? previous.revision + 1 : 0,
-      createdAt: previous?.createdAt || new Date().toISOString(),
-      ...(jiraUrl && { jiraUrl, jiraEmail: input.jiraEmail }),
-    };
-    const writes = [put(sub, "CONNECTION#", item, previous?.revision ?? null)];
-    if (!previous || previous.credentialId !== credential.id) {
-      writes.push(
-        put(
-          sub,
-          "CREDENTIAL#",
+      await commit(writes);
+      return item;
+    },
+  },
+  "connections.delete": {
+    write: true,
+    run: async (input, identity) => {
+      const sub = identity.sub;
+      const previous = await connectionOf(sub, input.id);
+      if (previous.revision !== revisionOf(input.revision))
+        fail("REVISION_CONFLICT");
+      const credential = await credentialOf(sub, previous.credentialId);
+      await commit([
+        erase(connectionKey(sub, previous.id), previous),
+        write(
+          credentialKey(sub, credential.id),
           {
             ...credential,
             revision: credential.revision + 1,
-            connectionIds: [...credential.connectionIds, item.id],
+            connectionIds: credential.connectionIds.filter(
+              (id) => id !== previous.id,
+            ),
           },
           credential.revision,
         ),
-      );
-      if (previous) {
-        const old = await owned(sub, "CREDENTIAL#", previous.credentialId);
-        writes.push(
-          put(
-            sub,
-            "CREDENTIAL#",
-            {
-              ...old,
-              revision: old.revision + 1,
-              connectionIds: old.connectionIds.filter((id) => id !== item.id),
-            },
-            old.revision,
-          ),
-        );
-      }
-    } else
-      writes.push({
-        ConditionCheck: {
-          TableName: table,
-          Key: key(sub, "CREDENTIAL#", credential.id),
-          ConditionExpression: "revision = :revision",
-          ExpressionAttributeValues: { ":revision": N(credential.revision) },
-        },
-      });
-    await transact(writes);
-    return item;
-  }
-  // Secrets leave this repository only for server-side, explicitly granted tools.
-  async function resolve(identity, ids) {
-    await migrate(identity.sub);
-    const result = {};
-    for (const id of ids) {
-      const connection = await owned(identity.sub, "CONNECTION#", id);
-      const credential = await owned(
-        identity.sub,
-        "CREDENTIAL#",
-        connection.credentialId,
-      );
-      result[id] = { ...connection, apiKey: credential.secret };
-    }
-    return result;
-  }
-  return {
-    command,
-    migrate,
-    resolve,
-    connections: (identity) => list(identity.sub, "CONNECTION#"),
-  };
-}
+      ]);
+      return { deleted: true };
+    },
+  },
+  "connections.test": {
+    write: true,
+    run: async (input, identity) => {
+      const connection = await connectionOf(identity.sub, input.id);
+      const credential = await credentialOf(identity.sub, connection.credentialId);
+      return probe({ ...connection, apiKey: credential.secret });
+    },
+  },
+});

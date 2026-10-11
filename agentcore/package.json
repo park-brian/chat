@@ -9,7 +9,7 @@
   "scripts": {
     "build:controller": "node scripts/build-controller.js",
     "csp:sync": "node scripts/sync-csp.js",
-    "test": "node scripts/sync-csp.js --check && node scripts/test-accounting.js && node scripts/test-models.js && node scripts/test-gemini.js && node tests/credentials.test.js && node tests/runs.test.js && node scripts/test-controller.js && node scripts/test-pages.js && node scripts/test-session.js && node ../test.js index.html",
+    "test": "node scripts/sync-csp.js --check && node scripts/test-accounting.js && node scripts/test-models.js && node scripts/test-gemini.js && node tests/runtime.test.js && node scripts/test-pages.js && node scripts/test-session.js && node ../test.js index.html",
     "test:pages": "node scripts/test-pages.js",
     "test:live-pages": "node scripts/test-live-pages.js",
     "test:visual": "node scripts/sync-csp.js --check && node ../test.js index.html --screenshot --viewports desktop,mobile --story shell",

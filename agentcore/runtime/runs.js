@@ -1,19 +1,40 @@
-import {
-  GetItemCommand,
-  QueryCommand,
-  TransactWriteItemsCommand,
-  UpdateItemCommand,
-} from "@aws-sdk/client-dynamodb";
+// A turn runs as a Runtime task that owns its execution; HTTP responses are
+// only observers. The heartbeat detects lost execution, never permission to
+// replay it. Progress is kept in memory for watchers on this worker and
+// flushed to S3 for any other worker.
 import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { randomUUID, createHash } from "node:crypto";
+import { createHash } from "node:crypto";
+import { stillAuthorized } from "./accounts.js";
+import { s3 } from "./aws.js";
+import {
+  expression,
+  fail,
+  get,
+  pack,
+  patterns,
+  sk,
+  transact,
+  update,
+  userKey,
+  uuid,
+} from "./db.js";
 
-const S = (value) => ({ S: String(value) });
-const N = (value) => ({ N: String(value) });
-const key = (sub, id) => ({ pk: S(`USER#${sub}`), sk: S(`REQUEST#${id}`) });
-const terminal = (status) => !["running", "memory_written"].includes(status);
-const failure = (code) => Object.assign(new Error(code), { code });
-const idPattern = /^[0-9a-f-]{36}$/i;
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const maxActiveRuns = 3;
+// "running" until the turn is saved, fails or is cancelled; "outcome_unknown"
+// only when its worker stopped heartbeating.
+export const runStatuses = [
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "outcome_unknown",
+];
+const heartbeatMs = 15000;
+const lostAfterMs = 90000;
+const terminal = (status) => status !== "running";
+const bucket = () => process.env.BUCKET;
+const progressLocation = (sub, requestId, chunk) =>
+  `runs/${sub}/${requestId}/progress-${chunk}.json`;
 const fingerprint = (input) =>
   createHash("sha256")
     .update(
@@ -24,536 +45,500 @@ const fingerprint = (input) =>
       ),
     )
     .digest("hex");
+const requestKey = (sub, requestId) => userKey(sub, sk.request(requestId));
+const lockKey = (sub, run) =>
+  userKey(sub, sk.lock(run.projectId, run.conversationId, run.branchId));
+const chatKey = (sub, run) =>
+  userKey(sub, sk.chat(run.projectId, run.conversationId));
 
-// A Runtime task owns execution. HTTP responses are replaceable observers.
-// The heartbeat detects lost execution; it never grants permission to replay it.
-export function createRuns({ db, s3, table, bucket, currentIdentity }) {
-  const workerId = randomUUID();
-  const active = new Map();
-  const objectKey = (sub, id, suffix) =>
-    `users/${sub}/runs/${id}/${suffix}.json`;
-  const read = async (sub, id) =>
-    (
-      await db.send(
-        new GetItemCommand({
-          TableName: table,
-          Key: key(sub, id),
-          ConsistentRead: true,
-        }),
-      )
-    ).Item;
-  const lockKey = (sub, input) => ({
-    pk: S(`PROJECT#${sub}/${input.projectId || "main"}`),
-    sk: S(`RUN#${input.sessionId}#${input.branchId || "main"}`),
-  });
-  async function accept(identity, input, snapshot, requestItem) {
-    const id = input.requestId;
-    const contextKey = objectKey(identity.sub, id, `context-${randomUUID()}`);
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: contextKey,
-        Body: JSON.stringify(snapshot),
-        ContentType: "application/json",
-        Tagging: "agentcore-retention=run-progress",
+// The operations that free a run: its branch lock (only if still its own),
+// one off the conversation's run count, and its slot in the owner's set.
+export const releaseOps = (sub, run) => ({
+  lock: {
+    Delete: {
+      Key: lockKey(sub, run),
+      ...expression({
+        condition: "#requestId = :request",
+        values: { ":request": run.requestId },
       }),
-    );
-    const now = new Date().toISOString();
-    try {
-      await db.send(
-        new TransactWriteItemsCommand({
-          TransactItems: [
-            {
-              Put: {
-                TableName: table,
-                Item: {
-                  ...requestItem,
-                  workerId: S(workerId),
-                  contextObjectKey: S(contextKey),
-                  inputFingerprint: S(fingerprint(input)),
-                  heartbeatAt: S(now),
-                  progressChunks: N(0),
-                  progressSequence: N(0),
-                  progressClosed: { BOOL: false },
-                  progressExpiresAt: N(
-                    Math.floor(Date.now() / 1000) + 7 * 86400,
-                  ),
-                },
-                ConditionExpression: "attribute_not_exists(pk)",
-              },
-            },
-            {
-              Put: {
-                TableName: table,
-                Item: {
-                  ...lockKey(identity.sub, input),
-                  requestId: S(id),
-                  acceptedAt: S(now),
-                  branchId: S(input.branchId || "main"),
-                },
-                ConditionExpression: "attribute_not_exists(pk)",
-              },
-            },
-            {
-              Update: {
-                TableName: table,
-                Key: {
-                  pk: S(`PROJECT#${identity.sub}/${input.projectId || "main"}`),
-                  sk: S(`CONVERSATION#${input.sessionId}`),
-                },
-                UpdateExpression:
-                  "SET id = if_not_exists(id, :id), agentId = if_not_exists(agentId, :agent), title = if_not_exists(title, :title), createdAt = if_not_exists(createdAt, :time), lastActivityAt = :time, gsi1pk = :index, gsi1sk = :sort, durable = if_not_exists(durable, :durable), #status = if_not_exists(#status, :active) ADD activeRunCount :one",
-                ConditionExpression:
-                  "(attribute_not_exists(agentId) OR agentId = :agent) AND (attribute_not_exists(#status) OR #status = :active)" +
-                  (input.forkEventId !== undefined
-                    ? " AND attribute_exists(pk)"
-                    : (input.branchId || "main") === "main"
-                      ? " AND " +
-                        (snapshot.observedHead
-                          ? "mainHeadEventId = :observed"
-                          : "attribute_not_exists(mainHeadEventId)")
-                      : ""),
-                ExpressionAttributeNames: { "#status": "status" },
-                ExpressionAttributeValues: {
-                  ":id": S(input.sessionId),
-                  ":agent": S(input.agentId),
-                  ":title": S(
-                    input.message.trim().replace(/\s+/g, " ").slice(0, 80),
-                  ),
-                  ":time": S(now),
-                  ":index": S(
-                    `CONVERSATIONS#${identity.sub}/${input.projectId || "main"}`,
-                  ),
-                  ":sort": S(`${now}#${input.sessionId}`),
-                  ":durable": requestItem.durable,
-                  ":active": S("ACTIVE"),
-                  ":one": N(1),
-                  ...(input.forkEventId === undefined &&
-                    (input.branchId || "main") === "main" &&
-                    snapshot.observedHead && {
-                      ":observed": S(snapshot.observedHead),
-                    }),
-                },
-              },
-            },
-            ...(input.forkEventId === undefined &&
-            input.branchId &&
-            input.branchId !== "main"
-              ? [
-                  {
-                    ConditionCheck: {
-                      TableName: table,
-                      Key: {
-                        pk: S(
-                          `PROJECT#${identity.sub}/${input.projectId || "main"}`,
-                        ),
-                        sk: S(`BRANCH#${input.sessionId}#${input.branchId}`),
-                      },
-                      ConditionExpression: "headEventId = :observed",
-                      ExpressionAttributeValues: {
-                        ":observed": S(snapshot.observedHead),
-                      },
-                    },
-                  },
-                ]
-              : []),
-          ],
-        }),
-      );
-    } catch (error) {
-      if (error.name === "TransactionCanceledException")
-        throw failure("BRANCH_BUSY_OR_DUPLICATE");
-      throw error;
-    }
-  }
-  async function release(sub, input) {
-    try {
-      await db.send(
-        new TransactWriteItemsCommand({
-          TransactItems: [
-            {
-              Delete: {
-                TableName: table,
-                Key: lockKey(sub, input),
-                ConditionExpression: "requestId = :request",
-                ExpressionAttributeValues: { ":request": S(input.requestId) },
-              },
-            },
-            {
-              Update: {
-                TableName: table,
-                Key: {
-                  pk: S(`PROJECT#${sub}/${input.projectId || "main"}`),
-                  sk: S(`CONVERSATION#${input.sessionId}`),
-                },
-                UpdateExpression: "ADD activeRunCount :minus",
-                ConditionExpression: "activeRunCount > :zero",
-                ExpressionAttributeValues: { ":minus": N(-1), ":zero": N(0) },
-              },
-            },
-          ],
-        }),
-      );
-    } catch (error) {
+    },
+  },
+  chatAdd: { activeRuns: -1 },
+  slot: {
+    Update: {
+      Key: userKey(sub, sk.profile),
+      ...expression({ drop: { activeRequests: new Set([run.requestId]) } }),
+    },
+  },
+});
+
+export function createRuns() {
+  // Created on first use: module state is captured in the Runtime snapshot, so
+  // an id made at load time would be shared by every restored worker.
+  let workerIdentity;
+  const workerId = () => (workerIdentity ||= uuid());
+  const tasks = new Map();
+
+  // The lock, the conversation's run count and the owner's active-run slot are
+  // released together, exactly once: the lock's own condition gates the rest.
+  // A turn's commit includes these same operations, so a finished turn frees
+  // its branch atomically with saving it.
+  async function release(sub, run) {
+    const ops = releaseOps(sub, run);
+    await transact([
+      ops.lock,
+      {
+        Update: {
+          Key: chatKey(sub, run),
+          ...expression({ add: ops.chatAdd }),
+        },
+      },
+      ops.slot,
+    ]).catch((error) => {
       if (error.name !== "TransactionCanceledException") throw error;
-    }
+    });
   }
-  async function state(identity, input) {
-    if (!idPattern.test(input.requestId || ""))
-      throw failure("VALIDATION_FAILED");
-    const row = await read(identity.sub, input.requestId);
-    if (!row) throw failure("NOT_FOUND");
+
+  const view = (row) => ({
+    requestId: row.requestId,
+    status: row.status,
+    projectId: row.projectId,
+    conversationId: row.conversationId,
+    agentId: row.agentId,
+    branchId: row.branchId,
+    forkTurnId: row.forkTurnId ?? null,
+    acceptedAt: row.acceptedAt,
+    costMicroUsd: row.costMicroUsd || 0,
+    turnId: row.turnId || null,
+    cancelRequested: row.cancelRequested === true,
+    progressChunks: row.progressChunks || 0,
+    sequence: row.progressSequence || 0,
+    progressClosed:
+      row.progressClosed !== false ||
+      Date.now() - Date.parse(row.heartbeatAt) >= lostAfterMs,
+  });
+
+  // A running request whose worker stopped heartbeating becomes
+  // outcome_unknown, and only then are its lock and slot released.
+  async function state(identity, requestId) {
+    if (!patterns.id.test(requestId || "")) fail("VALIDATION_FAILED");
+    const row = await get(requestKey(identity.sub, requestId));
+    if (!row) fail("NOT_FOUND");
     if (
-      !terminal(row.status.S) &&
-      Date.now() - Date.parse(row.heartbeatAt?.S || row.acceptedAt.S) >
-        (row.heartbeatAt ? 90000 : 3600000)
+      row.status === "running" &&
+      Date.now() - Date.parse(row.heartbeatAt) > lostAfterMs
     ) {
       try {
-        await db.send(
-          new UpdateItemCommand({
-            TableName: table,
-            Key: key(identity.sub, input.requestId),
-            UpdateExpression: "SET #status = :unknown, failureStage = :stage",
-            ConditionExpression:
-              "(attribute_not_exists(heartbeatAt) OR heartbeatAt = :observed) AND (#status = :running OR #status = :written)",
-            ExpressionAttributeNames: { "#status": "status" },
-            ExpressionAttributeValues: {
-              ":unknown": S("outcome_unknown"),
-              ":stage": S("runtime_lost"),
-              ":observed": row.heartbeatAt || row.acceptedAt,
-              ":running": S("running"),
-              ":written": S("memory_written"),
-            },
-          }),
+        Object.assign(
+          row,
+          await update(
+            requestKey(identity.sub, requestId),
+            expression({
+              set: { status: "outcome_unknown", failureStage: "runtime_lost" },
+              condition: "#status = :running AND #heartbeatAt = :seen",
+              values: { ":running": "running", ":seen": row.heartbeatAt },
+            }),
+          ),
         );
-        row.status = S("outcome_unknown");
-        await release(identity.sub, {
-          requestId: input.requestId,
-          projectId: row.projectId.S,
-          sessionId: row.conversationId.S,
-          branchId: row.branchId.S,
-        });
+        await release(identity.sub, row);
       } catch (error) {
         if (error.name !== "ConditionalCheckFailedException") throw error;
-        return state(identity, input);
+        return state(identity, requestId);
       }
     }
-    if (terminal(row.status.S))
-      await release(identity.sub, {
-        requestId: input.requestId,
-        projectId: row.projectId.S,
-        sessionId: row.conversationId.S,
-        branchId: row.branchId.S,
-      });
-    return {
-      requestId: input.requestId,
-      status: row.status.S,
-      projectId: row.projectId.S,
-      conversationId: row.conversationId.S,
-      agentId: row.agentId.S,
-      branchId: row.branchId.S,
-      acceptedAt: row.acceptedAt.S,
-      costMicroUsd: Number(row.costMicroUsd?.N || 0),
-      progressChunks: Number(row.progressChunks?.N || 0),
-      sequence: Number(row.progressSequence?.N || 0),
-      eventId: row.eventId?.S || null,
-      cancelRequested: row.cancelRequested?.BOOL === true,
-      sourceBranchId: row.sourceBranchId?.S,
-      forkEventId: row.forkEventId?.S || null,
-      progressExpired:
-        Date.now() / 1000 >= Number(row.progressExpiresAt?.N || Infinity),
-      progressClosed:
-        row.progressClosed?.BOOL !== false ||
-        Date.now() - Date.parse(row.heartbeatAt?.S || row.acceptedAt.S) >=
-          90000,
-    };
+    return view(row);
   }
-  async function guard(identity, id) {
-    const row = await read(identity.sub, id);
-    if (row?.cancelRequested?.BOOL) throw failure("CANCELLED");
-    if (!row || terminal(row.status.S)) throw failure("OUTCOME_UNKNOWN");
-    if (!(await currentIdentity(identity))) throw failure("ACCESS_REVOKED");
+
+  // Admission: request row, branch lock, conversation run count, owner's
+  // active-run slot and the observed branch head, all or nothing.
+  async function admit(identity, request, admission) {
+    const sub = identity.sub;
+    const now = new Date().toISOString();
+    const items = [
+      {
+        Put: {
+          Item: {
+            ...requestKey(sub, request.requestId),
+            ...packRequest(request, now),
+          },
+          ConditionExpression: "attribute_not_exists(pk)",
+        },
+      },
+      {
+        Put: {
+          Item: {
+            ...lockKey(sub, request),
+            requestId: { S: request.requestId },
+            acceptedAt: { S: now },
+          },
+          ConditionExpression: "attribute_not_exists(pk)",
+        },
+      },
+      {
+        Update: {
+          Key: chatKey(sub, request),
+          ...expression({
+            init: {
+              id: request.conversationId,
+              agentId: request.agentId,
+              title: admission.title,
+              createdAt: now,
+              status: "ACTIVE",
+            },
+            set: {
+              lastActivityAt: now,
+              gsi1pk: admission.chatIndex,
+              gsi1sk: `${now}#${request.conversationId}`,
+            },
+            add: { activeRuns: 1 },
+            condition:
+              "(attribute_not_exists(#agentId) OR #agentId = :agent) AND (attribute_not_exists(#status) OR #status = :active)",
+            values: { ":agent": request.agentId, ":active": "ACTIVE" },
+          }),
+        },
+      },
+      {
+        ConditionCheck: {
+          Key: userKey(sub, admission.branchKey),
+          ...(admission.observedHead
+            ? expression({
+                condition: "#headTurnId = :head",
+                values: { ":head": admission.observedHead },
+              })
+            : { ConditionExpression: "attribute_not_exists(pk)" }),
+        },
+      },
+      {
+        Update: {
+          Key: userKey(sub, sk.profile),
+          ...expression({
+            add: { activeRequests: new Set([request.requestId]) },
+            condition:
+              "attribute_not_exists(#activeRequests) OR size(#activeRequests) < :max",
+            values: { ":max": maxActiveRuns },
+          }),
+        },
+      },
+    ];
+    try {
+      await transact(items);
+    } catch (error) {
+      if (error.name !== "TransactionCanceledException") throw error;
+      const reasons = (error.CancellationReasons || []).map(
+        (reason) => reason.Code === "ConditionalCheckFailed",
+      );
+      fail(
+        reasons[0]
+          ? "DUPLICATE_REQUEST"
+          : reasons[1]
+            ? "BRANCH_BUSY"
+            : reasons[2]
+              ? "NOT_FOUND"
+              : reasons[3]
+                ? "BRANCH_CONFLICT"
+                : reasons[4]
+                  ? "RUN_LIMIT"
+                  : "ADMISSION_FAILED",
+      );
+    }
   }
-  function taskResponse(identity, input, ready) {
-    let events = [],
+  const packRequest = (request, now) =>
+    pack({
+      ...request,
+      status: "running",
+      acceptedAt: now,
+      heartbeatAt: now,
+      workerId: workerId(),
+      costMicroUsd: 0,
+      modelSteps: 0,
+      toolSteps: 0,
+      progressChunks: 0,
+      progressSequence: 0,
+      progressClosed: false,
+    });
+
+  // A lock or slot can outlive its request only if a worker died between
+  // finishing and releasing. Such leftovers are reclaimed when they block.
+  async function reclaim(identity, request, code) {
+    const ids =
+      code === "BRANCH_BUSY"
+        ? [(await get(lockKey(identity.sub, request)))?.requestId]
+        : [...((await get(userKey(identity.sub, sk.profile)))?.activeRequests || [])];
+    let freed = false;
+    for (const id of ids.filter(Boolean)) {
+      const row = await get(requestKey(identity.sub, id));
+      if (!row) {
+        // A slot without a request: nothing else to release.
+        await update(
+          userKey(identity.sub, sk.profile),
+          expression({ drop: { activeRequests: new Set([id]) } }),
+        );
+        freed = true;
+        continue;
+      }
+      const current = await state(identity, id);
+      if (terminal(current.status)) {
+        await release(identity.sub, row);
+        freed = true;
+      }
+    }
+    return freed;
+  }
+
+  // The event sink a turn writes to. Events are numbered, kept for watchers
+  // on this worker, and flushed to S3 in chunks for watchers elsewhere.
+  function progress(sub, requestId) {
+    const events = [],
+      listeners = new Set();
+    let pending = [],
       bytes = 0,
-      sequence = 0,
-      chunks = 0,
+      chunk = 0,
       queue = Promise.resolve(),
-      persistenceError;
+      failure = null,
+      closed = false;
     const flush = () => {
-      if (!events.length) return queue;
-      const batch = events;
-      events = [];
+      if (!pending.length) return queue;
+      const batch = pending,
+        index = chunk++;
+      pending = [];
       bytes = 0;
-      const chunk = chunks++;
-      if (chunk >= 1024) {
-        persistenceError = failure("PROGRESS_LIMIT");
+      if (index >= 1024) {
+        failure = new Error("PROGRESS_LIMIT");
         return queue;
       }
       queue = queue
         .then(async () => {
           await s3.send(
             new PutObjectCommand({
-              Bucket: bucket,
-              Key: objectKey(
-                identity.sub,
-                input.requestId,
-                `progress-${chunk}`,
-              ),
+              Bucket: bucket(),
+              Key: progressLocation(sub, requestId, index),
               Body: JSON.stringify(batch),
               ContentType: "application/json",
-              Tagging: "agentcore-retention=run-progress",
             }),
           );
-          await db.send(
-            new UpdateItemCommand({
-              TableName: table,
-              Key: key(identity.sub, input.requestId),
-              UpdateExpression:
-                "SET progressChunks = :chunks, progressSequence = :sequence",
-              ExpressionAttributeValues: {
-                ":chunks": N(chunk + 1),
-                ":sequence": N(batch.at(-1).sequence),
+          await update(
+            requestKey(sub, requestId),
+            expression({
+              set: {
+                progressChunks: index + 1,
+                progressSequence: batch.at(-1).sequence,
               },
             }),
           );
         })
         .catch((error) => {
-          persistenceError = error;
+          failure = error;
         });
       return queue;
     };
     const timer = setInterval(flush, 250);
     timer.unref();
-    let accepted = false,
-      rejection;
     return {
-      async accept(snapshot, item) {
-        await accept(identity, input, snapshot, item);
-        accepted = true;
-        this.write(
-          `data: ${JSON.stringify({ type: "message.accepted", message: input.message })}\n\n`,
-        );
-        ready({
-          requestId: input.requestId,
-          status: "running",
-          conversationId: input.sessionId,
-          branchId: input.branchId || "main",
-        });
+      events,
+      listeners,
+      get closed() {
+        return closed;
       },
-      async guard() {
-        if (persistenceError) throw persistenceError;
-        await guard(identity, input.requestId);
+      emit(event) {
+        const saved = { ...event, sequence: events.length + 1 };
+        events.push(saved);
+        pending.push(saved);
+        bytes += JSON.stringify(saved).length;
+        if (bytes >= 32768) flush();
+        for (const listener of listeners) listener(saved);
       },
-      writeHead() {},
-      write(text) {
-        for (const match of text.matchAll(/^data: (.+)$/gm)) {
-          const event = JSON.parse(match[1]);
-          if (!accepted) {
-            rejection = failure(event.code || "VALIDATION_FAILED");
-            continue;
-          }
-          const saved = { ...event, sequence: ++sequence };
-          events.push(saved);
-          bytes += Buffer.byteLength(JSON.stringify(saved));
-          if (bytes >= 32768) flush();
-        }
-      },
-      end(text) {
-        if (text) this.write(text);
+      check() {
+        if (failure) throw failure;
       },
       async close() {
         clearInterval(timer);
         await flush();
-        if (accepted) {
-          await db.send(
-            new UpdateItemCommand({
-              TableName: table,
-              Key: key(identity.sub, input.requestId),
-              UpdateExpression: "SET progressClosed = :yes",
-              ExpressionAttributeValues: { ":yes": { BOOL: true } },
-            }),
-          );
-          await release(identity.sub, input);
-        }
-        if (!accepted) throw rejection || failure("CHAT_REJECTED");
-      },
-      get accepted() {
-        return accepted;
+        await update(
+          requestKey(sub, requestId),
+          expression({ set: { progressClosed: true } }),
+        );
+        closed = true;
+        for (const listener of listeners) listener(null);
       },
     };
   }
+
+  // Starts a turn, or returns the existing one for a repeated request id.
   async function start(chat, input, identity, workloadToken) {
-    if (!idPattern.test(input.requestId || ""))
-      throw failure("VALIDATION_FAILED");
-    const prior = await read(identity.sub, input.requestId);
-    if (prior) {
-      if (
-        prior.inputFingerprint &&
-        prior.inputFingerprint.S !== fingerprint(input)
-      )
-        throw failure("REQUEST_ID_CONFLICT");
-      return state(identity, input);
+    if (!patterns.id.test(input.requestId || "")) fail("VALIDATION_FAILED");
+    const print = fingerprint(input);
+    const existing = async () => {
+      const prior = await get(requestKey(identity.sub, input.requestId));
+      if (!prior) return null;
+      if (prior.inputFingerprint !== print) fail("REQUEST_ID_CONFLICT");
+      return state(identity, input.requestId);
+    };
+    const prior = await existing();
+    if (prior) return prior;
+    const taskKey = `${identity.sub}/${input.requestId}`;
+    if (tasks.has(taskKey)) {
+      if (tasks.get(taskKey).fingerprint !== print) fail("REQUEST_ID_CONFLICT");
+      return tasks.get(taskKey).ready;
     }
-    const activeKey = `${identity.sub}/${input.requestId}`;
-    if (active.has(activeKey)) {
-      if (active.get(activeKey).fingerprint !== fingerprint(input))
-        throw failure("REQUEST_ID_CONFLICT");
-      return active.get(activeKey).ready;
-    }
-    let resolve, reject;
-    const ready = new Promise((yes, no) => {
-      resolve = yes;
-      reject = no;
+    let accepted, rejected;
+    const ready = new Promise((resolve, reject) => {
+      accepted = resolve;
+      rejected = reject;
     });
-    const response = taskResponse(identity, input, resolve);
-    const task = { ready, fingerprint: fingerprint(input) };
-    active.set(activeKey, task);
-    task.execution = (async () => {
-      let heartbeat;
-      try {
-        const work = chat(input, identity, response, workloadToken);
-        ready.then(
-          () => {
-            heartbeat = setInterval(
-              () =>
-                db
-                  .send(
-                    new UpdateItemCommand({
-                      TableName: table,
-                      Key: key(identity.sub, input.requestId),
-                      UpdateExpression: "SET heartbeatAt = :now",
-                      ConditionExpression:
-                        "workerId = :worker AND (#status = :running OR #status = :written)",
-                      ExpressionAttributeNames: { "#status": "status" },
-                      ExpressionAttributeValues: {
-                        ":now": S(new Date().toISOString()),
-                        ":worker": S(workerId),
-                        ":running": S("running"),
-                        ":written": S("memory_written"),
-                      },
-                    }),
-                  )
-                  .catch(() => {}),
-              15000,
-            );
-            heartbeat.unref();
-          },
-          () => {},
+    const task = { ready, fingerprint: print, progress: null };
+    tasks.set(taskKey, task);
+    let heartbeat;
+    const run = {
+      // Called by the turn once its inputs are valid; rejects the turn with a
+      // precise code if admission fails, retrying once after reclaiming a
+      // leftover lock or run slot.
+      async accept(request, admission) {
+        const row = { ...request, inputFingerprint: print };
+        try {
+          await admit(identity, row, admission);
+        } catch (error) {
+          if (
+            !["BRANCH_BUSY", "RUN_LIMIT"].includes(error.code) ||
+            !(await reclaim(identity, row, error.code))
+          )
+            throw error;
+          await admit(identity, row, admission);
+        }
+        task.progress = progress(identity.sub, input.requestId);
+        heartbeat = setInterval(
+          () =>
+            update(
+              requestKey(identity.sub, input.requestId),
+              expression({
+                set: { heartbeatAt: new Date().toISOString() },
+                condition: "#workerId = :worker AND #status = :running",
+                values: { ":worker": workerId(), ":running": "running" },
+              }),
+            ).catch(() => {}),
+          heartbeatMs,
         );
-        await work;
+        heartbeat.unref();
+        task.progress.emit({ type: "message.accepted", message: input.message });
+        accepted({
+          requestId: input.requestId,
+          status: "running",
+          conversationId: request.conversationId,
+          branchId: request.branchId,
+        });
+      },
+      emit: (event) => task.progress?.emit(event),
+      // Before every model or tool step: stop on cancellation, a lost or
+      // finished request, revoked access, or failed progress persistence.
+      async guard() {
+        task.progress?.check();
+        const [row, authorized] = await Promise.all([
+          get(requestKey(identity.sub, input.requestId)),
+          stillAuthorized(identity),
+        ]);
+        if (row?.cancelRequested) fail("CANCELLED");
+        if (!row || terminal(row.status)) fail("OUTCOME_UNKNOWN");
+        if (!authorized) fail("ACCESS_REVOKED");
+      },
+    };
+    (async () => {
+      try {
+        await chat(input, identity, run, workloadToken);
       } catch (error) {
-        reject(error);
+        rejected(error);
       } finally {
         clearInterval(heartbeat);
-        try {
-          await response.close();
-        } catch (error) {
-          reject(error);
+        if (task.progress) {
+          await task.progress.close().catch(() => {});
+          const row = await get(requestKey(identity.sub, input.requestId));
+          await release(identity.sub, row).catch(() =>
+            console.error("Could not release run"),
+          );
         }
-        active.delete(activeKey);
+        tasks.delete(taskKey);
       }
     })();
     try {
       return await ready;
     } catch (error) {
-      if (error.code !== "BRANCH_BUSY_OR_DUPLICATE") throw error;
-      const existing = await read(identity.sub, input.requestId);
-      if (!existing) throw failure("BRANCH_BUSY");
-      if (existing.inputFingerprint?.S !== fingerprint(input))
-        throw failure("REQUEST_ID_CONFLICT");
-      return state(identity, input);
+      if (error.code !== "DUPLICATE_REQUEST") throw error;
+      const raced = await existing();
+      if (!raced) fail("BRANCH_BUSY");
+      return raced;
     }
   }
-  async function watch(
-    identity,
-    input,
-    response,
-    { untilTerminal = false } = {},
-  ) {
+
+  // Streams a run's events after `after`, from memory when the run is on this
+  // worker, else from its S3 chunks. Ends with a run.status event; a stream that
+  // ends without a terminal status means "reconnect".
+  async function watch(identity, input, response, { untilTerminal = false } = {}) {
     let after = input.after ?? 0;
-    if (!Number.isSafeInteger(after) || after < 0)
-      throw failure("VALIDATION_FAILED");
-    let current = await state(identity, input),
-      chunk = 0;
+    if (!Number.isSafeInteger(after) || after < 0) fail("VALIDATION_FAILED");
+    let current = await state(identity, input.requestId);
     response.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-store",
     });
+    const write = (event) => {
+      if (event.sequence > after) {
+        response.write(`data: ${JSON.stringify(event)}\n\n`);
+        after = event.sequence;
+      }
+    };
     const deadline = untilTerminal ? Infinity : Date.now() + 25000;
-    while (!response.destroyed) {
-      for (
-        ;
-        !current.progressExpired && chunk < current.progressChunks;
-        chunk++
-      ) {
-        const stored = await s3.send(
-          new GetObjectCommand({
-            Bucket: bucket,
-            Key: objectKey(identity.sub, input.requestId, `progress-${chunk}`),
-          }),
-        );
-        for (const event of JSON.parse(await stored.Body.transformToString()))
-          if (event.sequence > after) {
-            response.write(`data: ${JSON.stringify(event)}\n\n`);
-            after = event.sequence;
-          }
+    const task = tasks.get(`${identity.sub}/${input.requestId}`);
+    if (task?.progress) {
+      const live = task.progress;
+      for (const event of live.events) write(event);
+      if (!live.closed)
+        await new Promise((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            live.listeners.delete(listener);
+            resolve();
+          };
+          const listener = (event) => (event ? write(event) : done());
+          const timer = setTimeout(done, untilTerminal ? 600000 : 25000);
+          live.listeners.add(listener);
+          response.on("close", done);
+        });
+      current = await state(identity, input.requestId);
+    } else {
+      let chunk = 0;
+      while (!response.destroyed) {
+        for (; chunk < current.progressChunks; chunk++) {
+          const stored = await s3.send(
+            new GetObjectCommand({
+              Bucket: bucket(),
+              Key: progressLocation(identity.sub, input.requestId, chunk),
+            }),
+          );
+          for (const event of JSON.parse(await stored.Body.transformToString()))
+            write(event);
+        }
+        if (
+          (terminal(current.status) && current.progressClosed) ||
+          Date.now() >= deadline
+        )
+          break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        current = await state(identity, input.requestId);
       }
-      if (
-        (terminal(current.status) &&
-          (current.progressClosed || current.progressExpired)) ||
-        Date.now() >= deadline
-      ) {
-        response.write(
-          `data: ${JSON.stringify({ type: "run.status", ...current })}\n\n`,
-        );
-        break;
-      }
-      await sleep(250);
-      current = await state(identity, input);
     }
+    // The status snapshot carries no sequence of its own: it is not progress.
+    const { sequence, ...status } = current;
+    response.write(`data: ${JSON.stringify({ type: "run.status", ...status })}\n\n`);
     response.end();
   }
+
   async function cancel(identity, input) {
-    if (identity.role === "Auditors") throw failure("FORBIDDEN");
-    const current = await state(identity, input);
-    if (!terminal(current.status)) {
-      await db.send(
-        new UpdateItemCommand({
-          TableName: table,
-          Key: key(identity.sub, input.requestId),
-          UpdateExpression: "SET cancelRequested = :yes",
-          ExpressionAttributeValues: { ":yes": { BOOL: true } },
-        }),
+    const current = await state(identity, input.requestId);
+    if (!terminal(current.status))
+      await update(
+        requestKey(identity.sub, input.requestId),
+        expression({ set: { cancelRequested: true } }),
       );
-    }
     return { ...current, cancelRequested: true };
   }
-  async function activeFor(identity, projectId, conversationId) {
-    const page = await db.send(
-      new QueryCommand({
-        TableName: table,
-        KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
-        ConsistentRead: true,
-        ExpressionAttributeValues: {
-          ":pk": S(`PROJECT#${identity.sub}/${projectId}`),
-          ":prefix": S(`RUN#${conversationId}#`),
-        },
-      }),
-    );
-    return Promise.all(
-      (page.Items || []).map((row) =>
-        state(identity, { requestId: row.requestId.S }),
-      ),
-    );
-  }
-  return {
-    start,
-    state,
-    watch,
-    cancel,
-    activeFor,
-    busy: () => active.size > 0,
-  };
+
+  return { start, state, watch, cancel, busy: () => tasks.size > 0 };
 }

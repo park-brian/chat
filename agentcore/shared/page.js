@@ -248,13 +248,13 @@ export async function mountPage({ key, title, render }) {
       setPhase("restoring");
       const claims = auth.claims();
       if (claims?.sub)
-        auth.setSession({ apiVersion: 2, user: claims, provisional: true });
+        auth.setSession({ apiVersion: 3, user: claims, provisional: true });
       let validated,
         replacedWorker = false;
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
           validated = await api.rpc("session.get");
-          if (validated.apiVersion !== 2) {
+          if (validated.apiVersion !== 3) {
             if (replacedWorker)
               throw Error("This deployment is updating. Reload in a moment.");
             setPhase("updating");

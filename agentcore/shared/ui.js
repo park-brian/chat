@@ -1,7 +1,11 @@
 import { createSignal, For, Show, onCleanup } from "solid-js";
 import html from "solid-js/html";
 
-export const dollars = (micro) => (Number(micro || 0) / 1000000).toFixed(2);
+// Amounts under a cent keep four decimals, so small turns never read as $0.00.
+export const dollars = (micro) => {
+  const value = Number(micro || 0) / 1000000;
+  return value > 0 && value < 0.01 ? value.toFixed(4) : value.toFixed(2);
+};
 export const gb = (bytes) => (Number(bytes || 0) / 1000000000).toFixed(2);
 export const Notice = (props) =>
   html`<${Show} when=${() => props.text}

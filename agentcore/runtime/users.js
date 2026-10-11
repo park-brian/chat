@@ -1,370 +1,273 @@
+// People and account limits, for administrators. Identity lives in Cognito
+// (email, enabled, one group); limits and usage live in the person's PROFILE.
 import {
-  AdminGetUserCommand,
-  AdminCreateUserCommand,
   AdminAddUserToGroupCommand,
-  AdminRemoveUserFromGroupCommand,
-  AdminListGroupsForUserCommand,
-  AdminEnableUserCommand,
+  AdminCreateUserCommand,
   AdminDisableUserCommand,
+  AdminEnableUserCommand,
+  AdminGetUserCommand,
+  AdminListGroupsForUserCommand,
+  AdminRemoveUserFromGroupCommand,
   ListUsersCommand,
 } from "@aws-sdk/client-cognito-identity-provider";
-import { GetItemCommand, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
+import {
+  defaults,
+  effectiveLimits,
+  emailOf,
+  forgetAuthorization,
+  owner,
+  roles,
+  subOf,
+} from "./accounts.js";
+import { idp } from "./aws.js";
+import {
+  accountPk,
+  expression,
+  fail,
+  get,
+  getMany,
+  key,
+  patterns,
+  sk,
+  update,
+  userKey,
+} from "./db.js";
 
-export function createUsers(context) {
-  const {
-    idp,
-    db,
-    S,
-    N,
-    key,
-    unpack,
-    protectedAdministrator,
-    defaults,
-    invalid,
-    missing,
-    effectiveLimits,
-    uuidPattern,
-  } = context;
-  async function profile(user, limits, ownerSub) {
-    const sub = (user.Attributes || user.UserAttributes)?.find(
-      (attribute) => attribute.Name === "sub",
-    )?.Value;
-    const [row, groups] = await Promise.all([
-      db.send(
-        new GetItemCommand({
-          TableName: process.env.TABLE,
-          Key: key(`USER#${sub}`, "CONTROL"),
-        }),
-      ),
-      idp.send(
-        new AdminListGroupsForUserCommand({
-          UserPoolId: process.env.POOL,
-          Username: sub,
-          Limit: 10,
-        }),
-      ),
-    ]);
-    return {
-      sub,
-      email: (user.Attributes || user.UserAttributes)?.find(
-        (attribute) => attribute.Name === "email",
-      )?.Value,
-      enabled: user.Enabled,
-      status: user.UserStatus,
-      role: (groups.Groups || []).map((group) => group.GroupName)[0] || null,
-      protected: sub === ownerSub,
-      ...effectiveLimits(row.Item, limits),
-      budgetInherited:
-        row.Item?.limitsVersion?.N === "2"
-          ? row.Item.budgetOverrideMicroUsd?.N === undefined
-          : row.Item?.budgetMicroUsd?.N === undefined ||
-            Number(row.Item.budgetMicroUsd.N) === limits.baselineBudgetMicroUsd,
-      storageInherited:
-        row.Item?.limitsVersion?.N === "2"
-          ? row.Item.storageOverrideBytes?.N === undefined
-          : row.Item?.storageBytes?.N === undefined ||
-            Number(row.Item.storageBytes.N) === limits.baselineStorageBytes,
-      periodInherited: !row.Item?.periodOverride?.S,
-      storageUsedBytes: Number(row.Item?.storageUsedBytes?.N || 0),
-    };
-  }
-  return async function users(body, identity) {
-    if (body.command === "users.get") {
-      const sub = body.input.userSub || identity.sub;
-      if (!uuidPattern.test(sub)) return invalid();
-      if (sub !== identity.sub && identity.role !== "Administrators")
-        return {
-          status: 403,
-          data: { ok: false, error: { code: "FORBIDDEN" } },
-        };
-      let user;
-      try {
-        user = await idp.send(
-          new AdminGetUserCommand({
-            UserPoolId: process.env.POOL,
-            Username: sub,
-          }),
-        );
-      } catch (error) {
-        if (error.name === "UserNotFoundException") return missing();
-        throw error;
-      }
-      const limits = await defaults();
-      const ownerSub =
-        identity.role === "Administrators"
-          ? await protectedAdministrator(identity.sub)
-          : null;
-      return {
-        status: 200,
-        data: {
-          ok: true,
-          data: {
-            user: await profile(user, limits, ownerSub),
-            defaults: limits,
-          },
-        },
-      };
-    }
-    const admin = identity.role === "Administrators";
-    if (
-      [
-        "users.list",
-        "users.invite",
-        "users.setLimits",
-        "users.setRole",
-        "users.setEnabled",
-        "users.startNewBudgetPeriod",
-        "defaults.get",
-        "defaults.set",
-      ].includes(body.command) &&
-      !admin
+const pool = () => process.env.POOL;
+const subjectOf = (sub) => {
+  if (!patterns.id.test(sub || "")) fail("VALIDATION_FAILED");
+  return sub;
+};
+const cognito = (command) =>
+  idp.send(command).catch((error) => {
+    if (error.name === "UserNotFoundException") fail("NOT_FOUND");
+    throw error;
+  });
+const groupsOf = async (sub) =>
+  (
+    await cognito(
+      new AdminListGroupsForUserCommand({
+        UserPoolId: pool(),
+        Username: sub,
+        Limit: 10,
+      }),
     )
-      return { status: 403, data: { ok: false, error: { code: "FORBIDDEN" } } };
-    if (body.command === "users.list") {
-      if (
-        body.input.cursor !== undefined &&
-        (typeof body.input.cursor !== "string" ||
-          body.input.cursor.length > 4096)
-      )
-        return invalid();
-      const page = await idp.send(
-        new ListUsersCommand({
-          UserPoolId: process.env.POOL,
-          Limit: 20,
-          PaginationToken: body.input.cursor || undefined,
-        }),
-      );
-      const [limits, ownerSub] = await Promise.all([
+  ).Groups.map((group) => group.GroupName);
+
+const person = (user, groups, profile, base, ownerSub) => {
+  const sub = subOf(user);
+  return {
+    sub,
+    email: emailOf(user),
+    enabled: user.Enabled,
+    status: user.UserStatus,
+    role: groups[0] || null,
+    protected: sub === ownerSub,
+    ...effectiveLimits(profile, base),
+  };
+};
+const nullableAmount = (value) =>
+  value === null || (Number.isSafeInteger(value) && value >= 0);
+const period = (value) => ["daily", "weekly", "monthly"].includes(value);
+
+export const userCommands = {
+  "users.get": {
+    run: async (input, identity) => {
+      const sub = subjectOf(input.userSub || identity.sub);
+      if (sub !== identity.sub && identity.role !== "Administrators")
+        fail("FORBIDDEN");
+      const [user, groups, profile, base, ownerSub] = await Promise.all([
+        cognito(new AdminGetUserCommand({ UserPoolId: pool(), Username: sub })),
+        groupsOf(sub),
+        get(userKey(sub, sk.profile)),
         defaults(),
-        protectedAdministrator(identity.sub),
+        identity.role === "Administrators" ? owner(identity.sub) : null,
       ]);
-      const items = await Promise.all(
-        page.Users.map((user) => profile(user, limits, ownerSub)),
-      );
       return {
-        status: 200,
-        data: {
-          ok: true,
-          data: {
-            items,
-            cursor: page.PaginationToken || null,
-            defaults: limits,
-          },
-        },
+        user: person(user, groups, profile, base, ownerSub),
+        defaults: base,
       };
-    }
-    if (body.command === "users.invite") {
-      const { email, role } = body.input;
+    },
+  },
+  "users.list": {
+    admin: true,
+    run: async (input, identity) => {
       if (
-        !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email || "") ||
-        !["Members", "Auditors", "Administrators"].includes(role)
+        input.cursor !== undefined &&
+        (typeof input.cursor !== "string" || input.cursor.length > 4096)
       )
-        return {
-          status: 400,
-          data: { ok: false, error: { code: "VALIDATION_FAILED" } },
-        };
+        fail("VALIDATION_FAILED");
+      const [page, base, ownerSub] = await Promise.all([
+        idp.send(
+          new ListUsersCommand({
+            UserPoolId: pool(),
+            Limit: 20,
+            PaginationToken: input.cursor || undefined,
+          }),
+        ),
+        defaults(),
+        owner(identity.sub),
+      ]);
+      const subs = page.Users.map(subOf);
+      const [profiles, groups] = await Promise.all([
+        getMany(subs.map((sub) => userKey(sub, sk.profile))),
+        Promise.all(subs.map(groupsOf)),
+      ]);
+      return {
+        items: page.Users.map((user, index) =>
+          person(user, groups[index], profiles[index], base, ownerSub),
+        ),
+        cursor: page.PaginationToken || null,
+        defaults: base,
+      };
+    },
+  },
+  "users.invite": {
+    admin: true,
+    run: async (input) => {
+      if (
+        !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.email || "") ||
+        !roles.includes(input.role)
+      )
+        fail("VALIDATION_FAILED");
       await idp.send(
         new AdminCreateUserCommand({
-          UserPoolId: process.env.POOL,
-          Username: email,
+          UserPoolId: pool(),
+          Username: input.email,
           UserAttributes: [
-            { Name: "email", Value: email },
+            { Name: "email", Value: input.email },
             { Name: "email_verified", Value: "true" },
           ],
         }),
       );
       await idp.send(
         new AdminAddUserToGroupCommand({
-          UserPoolId: process.env.POOL,
-          Username: email,
-          GroupName: role,
+          UserPoolId: pool(),
+          Username: input.email,
+          GroupName: input.role,
         }),
       );
-      return { status: 200, data: { ok: true, data: { invited: true } } };
-    }
-    if (body.command === "users.setLimits") {
-      const { sub, budgetMicroUsd, storageBytes, period = null } = body.input;
+      return { invited: true };
+    },
+  },
+  // null means "use the account default" for each limit.
+  "users.setLimits": {
+    admin: true,
+    run: async (input) => {
+      const sub = subjectOf(input.sub);
+      const { budgetMicroUsd, storageBytes } = input;
+      const chosenPeriod = input.period ?? null;
       if (
-        !/^[0-9a-f-]{36}$/i.test(sub || "") ||
-        (budgetMicroUsd !== null &&
-          (!Number.isSafeInteger(budgetMicroUsd) || budgetMicroUsd < 0)) ||
-        (storageBytes !== null &&
-          (!Number.isSafeInteger(storageBytes) || storageBytes < 0)) ||
-        (period !== null && !["daily", "weekly", "monthly"].includes(period))
+        !nullableAmount(budgetMicroUsd) ||
+        !nullableAmount(storageBytes) ||
+        (chosenPeriod !== null && !period(chosenPeriod))
       )
-        return {
-          status: 400,
-          data: { ok: false, error: { code: "VALIDATION_FAILED" } },
-        };
-      await idp.send(
-        new AdminGetUserCommand({
-          UserPoolId: process.env.POOL,
-          Username: sub,
-        }),
-      );
-      const limits = await defaults();
-      await db.send(
-        new UpdateItemCommand({
-          TableName: process.env.TABLE,
-          Key: key(`USER#${sub}`, "CONTROL"),
-          UpdateExpression:
-            "SET limitsVersion = :version, budgetOverrideMicroUsd = :budgetOverride, storageOverrideBytes = :storageOverride, budgetMicroUsd = :budget, storageBytes = :storage, periodOverride = :period",
-          ExpressionAttributeValues: {
-            ":version": N(2),
-            ":budgetOverride":
-              budgetMicroUsd === null ? { NULL: true } : N(budgetMicroUsd),
-            ":storageOverride":
-              storageBytes === null ? { NULL: true } : N(storageBytes),
-            ":budget": N(budgetMicroUsd ?? limits.budgetMicroUsd),
-            ":storage": N(storageBytes ?? limits.storageBytes),
-            ":period": period === null ? { NULL: true } : S(period),
-          },
-        }),
-      );
-      return { status: 200, data: { ok: true, data: { updated: true } } };
-    }
-    if (body.command === "users.startNewBudgetPeriod") {
-      const { sub } = body.input;
-      if (!/^[0-9a-f-]{36}$/i.test(sub || "")) return invalid();
-      await idp.send(
-        new AdminGetUserCommand({
-          UserPoolId: process.env.POOL,
-          Username: sub,
-        }),
-      );
-      const row = await db.send(
-        new UpdateItemCommand({
-          TableName: process.env.TABLE,
-          Key: key(`USER#${sub}`, "CONTROL"),
-          UpdateExpression: "ADD budgetEpoch :one",
-          ExpressionAttributeValues: { ":one": N(1) },
-          ReturnValues: "ALL_NEW",
-        }),
-      );
-      return {
-        status: 200,
-        data: {
-          ok: true,
-          data: { budgetEpoch: Number(row.Attributes.budgetEpoch.N) },
-        },
+        fail("VALIDATION_FAILED");
+      await cognito(new AdminGetUserCommand({ UserPoolId: pool(), Username: sub }));
+      const overrides = {
+        budgetOverrideMicroUsd: budgetMicroUsd,
+        storageOverrideBytes: storageBytes,
+        periodOverride: chosenPeriod,
       };
-    }
-    if (["users.setRole", "users.setEnabled"].includes(body.command)) {
-      const { sub } = body.input;
-      if (!/^[0-9a-f-]{36}$/i.test(sub || "")) return invalid();
-      if (sub === (await protectedAdministrator(identity.sub)))
-        return {
-          status: 403,
-          data: { ok: false, error: { code: "PROTECTED_ADMIN" } },
-        };
-      await idp.send(
-        new AdminGetUserCommand({
-          UserPoolId: process.env.POOL,
+      await update(
+        userKey(sub, sk.profile),
+        expression({
+          set: Object.fromEntries(
+            Object.entries(overrides).filter(([, value]) => value !== null),
+          ),
+          remove: Object.keys(overrides).filter((name) => overrides[name] === null),
+        }),
+      );
+      return { updated: true };
+    },
+  },
+  // Spending starts again from zero now, without editing recorded usage.
+  "users.startNewBudgetPeriod": {
+    admin: true,
+    run: async (input) => {
+      const sub = subjectOf(input.sub);
+      await cognito(new AdminGetUserCommand({ UserPoolId: pool(), Username: sub }));
+      const saved = await update(
+        userKey(sub, sk.profile),
+        expression({ add: { budgetEpoch: 1 } }),
+      );
+      return { budgetEpoch: saved.budgetEpoch };
+    },
+  },
+  "users.setEnabled": {
+    admin: true,
+    run: async (input, identity) => {
+      const sub = subjectOf(input.sub);
+      if (typeof input.enabled !== "boolean") fail("VALIDATION_FAILED");
+      if (sub === (await owner(identity.sub))) fail("PROTECTED_ADMIN");
+      await cognito(
+        new (input.enabled ? AdminEnableUserCommand : AdminDisableUserCommand)({
+          UserPoolId: pool(),
           Username: sub,
         }),
       );
-      if (body.command === "users.setEnabled") {
-        if (typeof body.input.enabled !== "boolean") return invalid();
-        await idp.send(
-          new (body.input.enabled
-            ? AdminEnableUserCommand
-            : AdminDisableUserCommand)({
-            UserPoolId: process.env.POOL,
-            Username: sub,
-          }),
+      forgetAuthorization(sub);
+      return { enabled: input.enabled };
+    },
+  },
+  // Adds the new group before removing the old one, so a failure part-way
+  // leaves two groups, which every token check rejects, never zero.
+  "users.setRole": {
+    admin: true,
+    run: async (input, identity) => {
+      const sub = subjectOf(input.sub);
+      if (!roles.includes(input.role)) fail("VALIDATION_FAILED");
+      if (sub === (await owner(identity.sub))) fail("PROTECTED_ADMIN");
+      const current = await groupsOf(sub);
+      if (current.length !== 1 || !roles.includes(current[0]))
+        fail("ROLE_CONFLICT");
+      if (current[0] === input.role) return { role: input.role };
+      const membership = (Command, group) =>
+        idp.send(new Command({ UserPoolId: pool(), Username: sub, GroupName: group }));
+      await membership(AdminAddUserToGroupCommand, input.role);
+      try {
+        await membership(AdminRemoveUserFromGroupCommand, current[0]);
+      } catch (error) {
+        await membership(AdminRemoveUserFromGroupCommand, input.role).catch(() =>
+          console.error("Role change needs administrator repair"),
         );
-        return {
-          status: 200,
-          data: { ok: true, data: { enabled: body.input.enabled } },
-        };
+        throw error;
       }
-      const role = body.input.role;
-      if (!["Administrators", "Members", "Auditors"].includes(role))
-        return invalid();
-      const groups = await idp.send(
-        new AdminListGroupsForUserCommand({
-          UserPoolId: process.env.POOL,
-          Username: sub,
-          Limit: 10,
-        }),
-      );
-      const old = (groups.Groups || []).map((group) => group.GroupName);
-      if (
-        old.length !== 1 ||
-        !["Administrators", "Members", "Auditors"].includes(old[0])
-      )
-        return {
-          status: 409,
-          data: { ok: false, error: { code: "ROLE_CONFLICT" } },
-        };
-      if (old[0] !== role) {
-        await idp.send(
-          new AdminAddUserToGroupCommand({
-            UserPoolId: process.env.POOL,
-            Username: sub,
-            GroupName: role,
-          }),
-        );
-        try {
-          await idp.send(
-            new AdminRemoveUserFromGroupCommand({
-              UserPoolId: process.env.POOL,
-              Username: sub,
-              GroupName: old[0],
-            }),
-          );
-        } catch (error) {
-          await idp
-            .send(
-              new AdminRemoveUserFromGroupCommand({
-                UserPoolId: process.env.POOL,
-                Username: sub,
-                GroupName: role,
-              }),
-            )
-            .catch(() =>
-              console.error("Role update needs administrator repair"),
-            );
-          throw error;
-        }
-      }
-      return { status: 200, data: { ok: true, data: { role } } };
-    }
-    if (body.command === "defaults.get")
-      return { status: 200, data: { ok: true, data: await defaults() } };
-    if (body.command === "defaults.set") {
-      const { budgetMicroUsd, storageBytes, period, revision } = body.input;
+      forgetAuthorization(sub);
+      return { role: input.role };
+    },
+  },
+  "defaults.get": { admin: true, run: () => defaults() },
+  "defaults.set": {
+    admin: true,
+    run: async (input) => {
+      const { budgetMicroUsd, storageBytes, revision } = input;
       if (
         !Number.isSafeInteger(budgetMicroUsd) ||
         budgetMicroUsd < 0 ||
         !Number.isSafeInteger(storageBytes) ||
         storageBytes < 0 ||
-        !["daily", "weekly", "monthly"].includes(period) ||
+        !period(input.period) ||
         !Number.isSafeInteger(revision)
       )
-        return {
-          status: 400,
-          data: { ok: false, error: { code: "VALIDATION_FAILED" } },
-        };
-      const row = await db.send(
-        new UpdateItemCommand({
-          TableName: process.env.TABLE,
-          Key: key("ACCOUNT#CONTROL", "DEFAULTS"),
-          UpdateExpression:
-            "SET budgetMicroUsd = :budget, storageBytes = :storage, #period = :period, revision = revision + :one",
-          ConditionExpression: "revision = :revision",
-          ExpressionAttributeNames: { "#period": "period" },
-          ExpressionAttributeValues: {
-            ":budget": N(budgetMicroUsd),
-            ":storage": N(storageBytes),
-            ":period": S(period),
-            ":revision": N(revision),
-            ":one": N(1),
-          },
-          ReturnValues: "ALL_NEW",
-        }),
-      );
-      return { status: 200, data: { ok: true, data: unpack(row.Attributes) } };
-    }
-  };
-}
+        fail("VALIDATION_FAILED");
+      await defaults();
+      try {
+        const { pk, sk: sortKey, ...saved } = await update(
+          key(accountPk, "DEFAULTS"),
+          expression({
+            set: { budgetMicroUsd, storageBytes, period: input.period },
+            add: { revision: 1 },
+            condition: "#revision = :revision",
+            values: { ":revision": revision },
+          }),
+        );
+        return saved;
+      } catch (error) {
+        if (error.name === "ConditionalCheckFailedException")
+          fail("REVISION_CONFLICT");
+        throw error;
+      }
+    },
+  },
+};

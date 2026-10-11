@@ -129,7 +129,9 @@ Resources:
       ClientId: !Ref Client
       UseCognitoProvidedValues: true
 
-  Data:
+  # One partition per person (pk USER#sub); sort keys lead with the item type.
+  # ByTime orders conversations by activity and usage across people by time.
+  Table:
     Type: AWS::DynamoDB::Table
     Properties:
       BillingMode: PAY_PER_REQUEST
@@ -142,7 +144,7 @@ Resources:
         - {AttributeName: pk, KeyType: HASH}
         - {AttributeName: sk, KeyType: RANGE}
       GlobalSecondaryIndexes:
-        - IndexName: UsageByTime
+        - IndexName: ByTime
           KeySchema:
             - {AttributeName: gsi1pk, KeyType: HASH}
             - {AttributeName: gsi1sk, KeyType: RANGE}
@@ -180,9 +182,8 @@ Resources:
             Status: Enabled
             NoncurrentVersionExpiration: {NoncurrentDays: 1}
           - Id: ExpireRunProgress
+            Prefix: runs/
             Status: Enabled
-            TagFilters:
-              - {Key: agentcore-retention, Value: run-progress}
             ExpirationInDays: 7
             NoncurrentVersionExpiration: {NoncurrentDays: 1}
       CorsConfiguration:
@@ -194,15 +195,6 @@ Resources:
       Tags:
         - {Key: app, Value: agentcore-chat}
         - {Key: stack, Value: !Ref 'AWS::StackName'}
-  Memory:
-    Type: AWS::BedrockAgentCore::Memory
-    Properties:
-      Name: !Sub '${ResourcePrefix}_memory'
-      EventExpiryDuration: 365
-      Description: Shared short-term conversational memory; actor is Cognito sub/project.
-      Tags:
-        app: agentcore-chat
-        stack: !Ref AWS::StackName
   PolicyEngine:
     Type: AWS::BedrockAgentCore::PolicyEngine
     Properties:
@@ -300,14 +292,11 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:TransactWriteItems, dynamodb:UpdateItem]
-                Resource: !GetAtt Data.Arn
+                Action: [dynamodb:GetItem, dynamodb:BatchGetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:TransactWriteItems, dynamodb:UpdateItem, dynamodb:ConditionCheckItem]
+                Resource: !GetAtt Table.Arn
               - Effect: Allow
                 Action: [dynamodb:Query]
-                Resource: !Sub '${Data.Arn}/index/UsageByTime'
-              - Effect: Allow
-                Action: [bedrock-agentcore:CreateEvent, bedrock-agentcore:GetEvent, bedrock-agentcore:ListEvents, bedrock-agentcore:DeleteEvent]
-                Resource: !Ref Memory
+                Resource: !Sub '${Table.Arn}/index/ByTime'
               - !If
                 - HasGemini
                 - Effect: Allow
@@ -361,19 +350,21 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject]
                 Resource: !Sub '${SharedObjects.Arn}/controller/*'
-              # Pending-object repair checks only an exact users/ key. S3
-              # HeadObject alone returns 403 for a missing key without list.
+              # Listing is limited to users/: pending-object repair checks an
+              # exact key (HeadObject alone answers 403 for a missing one), and
+              # conversation deletion removes every version under its prefix.
               - Effect: Allow
-                Action: [s3:ListBucket]
+                Action: [s3:ListBucket, s3:ListBucketVersions]
                 Resource: !GetAtt SharedObjects.Arn
                 Condition:
                   StringLike:
                     s3:prefix: 'users/*'
               - Effect: Allow
-                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:PutObjectTagging, s3:DeleteObject, s3:DeleteObjectVersion]
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:DeleteObject, s3:DeleteObjectVersion]
                 Resource:
                   - !Sub '${SharedObjects.Arn}/pending/*'
                   - !Sub '${SharedObjects.Arn}/users/*'
+                  - !Sub '${SharedObjects.Arn}/runs/*'
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:DescribeLogGroups, logs:DescribeLogStreams, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
@@ -402,7 +393,7 @@ Resources:
       RequestHeaderConfiguration:
         RequestHeaderAllowlist: [Authorization]
       EnvironmentVariables:
-        TABLE: !Ref Data
+        TABLE: !Ref Table
         POOL: !Ref UserPool
         BOOTSTRAP_ADMIN_EMAIL: !Ref BootstrapAdministratorEmail
         CLIENT: !Ref Client
@@ -410,7 +401,6 @@ Resources:
         BUDGET: !Ref DefaultDailyBudgetMicroUsd
         STORAGE: !Ref DefaultStorageBytes
         BUCKET: !Ref SharedObjects
-        MEMORY: !GetAtt Memory.MemoryId
         SCRIPTED_MODEL: !Ref EnableScriptedModel
         GEMINI_PROVIDER: !If [HasGemini, !Sub '${ResourcePrefix}-gemini', '']
         CODE_INTERPRETER_ID: !GetAtt CodeWorkspace.CodeInterpreterId
@@ -439,9 +429,8 @@ Outputs:
   UserPoolId: {Value: !Ref UserPool}
   ClientId: {Value: !Ref Client}
   CognitoDomain: {Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'}
-  DataTable: {Value: !Ref Data}
+  DataTable: {Value: !Ref Table}
   SharedBucket: {Value: !Ref SharedObjects}
-  MemoryArn: {Value: !Ref Memory}
   GatewayArn: {Value: !GetAtt Gateway.GatewayArn}
   GatewayUrl: {Value: !GetAtt Gateway.GatewayUrl}
   PolicyEngineArn: {Value: !GetAtt PolicyEngine.PolicyEngineArn}

@@ -1,4 +1,4 @@
-// Gemini's wire format stays here; grants and managed-tool execution stay in controller.js.
+// Gemini's wire format stays here; grants and managed-tool execution stay in tools.js.
 export function geminiRequest(model, level, contents, instructions, specs) {
   const body = {
     contents,
@@ -153,5 +153,12 @@ export async function readGeminiStream(body, emit) {
   }
   buffer += decoder.decode();
   if (buffer.trim()) throw Error("Gemini stream ended mid-event");
-  return { parts, finishReason, usage: geminiUsage(meter), visibleText };
+  // A missing or inconsistent usage report is recorded as unknown, not lost.
+  let usage = null;
+  try {
+    usage = geminiUsage(meter);
+  } catch {
+    console.error("Gemini usage report was missing or inconsistent");
+  }
+  return { parts, finishReason, usage, visibleText };
 }

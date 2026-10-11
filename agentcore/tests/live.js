@@ -42,9 +42,26 @@ export async function runLiveStory(
       .locator('button[type="submit"], input[type="submit"]')
       .first()
       .click();
-    await target
-      .locator('[data-app-state="ready"]')
-      .waitFor({ timeout: 60000 });
+    try {
+      await target
+        .locator('[data-app-state="ready"]')
+        .waitFor({ timeout: 60000 });
+    } catch (error) {
+      // Say where sign-in stopped, not just that it timed out.
+      const seen = await target
+        .evaluate(() => ({
+          url: location.href,
+          state: document.querySelector(".page-layout")?.dataset,
+          alerts: [...document.querySelectorAll('[role="alert"]')].map(
+            (alert) => alert.textContent,
+          ),
+          text: document.body.innerText.slice(0, 400),
+        }))
+        .catch((reason) => reason.message);
+      throw new Error(`Sign-in did not finish: ${JSON.stringify(seen)}`, {
+        cause: error,
+      });
+    }
     const auth = await target.evaluate(() => {
       const config = JSON.parse(sessionStorage.getItem("agentcore:deployment"));
       const state = JSON.parse(
@@ -93,7 +110,7 @@ export async function runLiveStory(
     const end = Date.now() + timeout;
     for (;;) {
       const run = await good(rpc, "chat.status", { requestId });
-      if (!["running", "memory_written"].includes(run.status)) return run;
+      if (run.status !== "running") return run;
       if (Date.now() >= end) throw Error("Run did not finish");
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
@@ -221,12 +238,11 @@ export async function runLiveStory(
           const input = {
             projectId: "main",
             agentId: agent.id,
-            sessionId: randomUUID(),
+            conversationId: randomUUID(),
             requestId: randomUUID(),
-            expectedHeadEventId: null,
+            expectedHeadTurnId: null,
             message: scenario.message,
           };
-          fixture.trackChat(agent.id, input.sessionId);
           await good(rpc, "chat.start", input);
           const result = await waitRun(rpc, input.requestId, 180000);
           assert.equal(
@@ -237,7 +253,7 @@ export async function runLiveStory(
           const chat = await good(rpc, "conversations.get", {
             projectId: "main",
             agentId: agent.id,
-            conversationId: input.sessionId,
+            conversationId: input.conversationId,
           });
           assert.match(chat.messages.at(-1).text, scenario.pattern);
           const usage = (await fixture.readUsage()).Items.filter(
@@ -299,8 +315,16 @@ export async function runLiveStory(
       { name: "Denied", kind: "github", secret: "audit-secret" },
       "FORBIDDEN",
     );
+    // A change made directly in Cognito is honoured once the Runtime's
+    // 15-second authorization cache for that person expires.
     await member.setEnabled(false);
-    await denied(member.rpc, "session.get", {}, "SESSION_CHANGED");
+    const revokedBy = Date.now() + 20000;
+    for (;;) {
+      const result = await member.rpc("session.get", {});
+      if (result.error?.code === "SESSION_CHANGED") break;
+      assert.ok(Date.now() < revokedBy, "Disabled user kept access past 15s");
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
     await member.setEnabled(true);
     await good(rpc, "users.setLimits", {
       sub: member.sub,
@@ -378,31 +402,17 @@ export async function runLiveStory(
       rotations.find((result) => !result.ok).error.code,
       "REVISION_CONFLICT",
     );
-    const legacy = {
-      id: randomUUID(),
-      name: "Migrated GitHub",
+    const grantCredential = await good(rpc, "credentials.put", {
+      name: "Granted GitHub",
       kind: "github",
-      apiKey: "pages-legacy-secret",
-      createdAt: new Date().toISOString(),
-    };
-    await fixture.putLegacyConnection(legacy);
-    for (let repeat = 0; repeat < 3; repeat++) {
-      const list = await good(rpc, "connections.list", { projectId: "main" });
-      assert.equal(
-        list.items.find((item) => item.id === legacy.id).credentialId,
-        legacy.id,
-      );
-      assert.equal(JSON.stringify(list).includes("pages-legacy-secret"), false);
-    }
-    const rows = await fixture.readOwnedRecords();
-    assert.equal(
-      rows.find((row) => row.sk.S === "CREDENTIALS").connectionsJson,
-      undefined,
-    );
-    assert.equal(
-      rows.filter((row) => row.sk.S === "CREDENTIAL#" + legacy.id).length,
-      1,
-    );
+      secret: "pages-grant-secret",
+    });
+    const grant = await good(rpc, "connections.put", {
+      projectId: "main",
+      name: "Granted repository",
+      kind: "github",
+      credentialId: grantCredential.id,
+    });
     await good(rpc, "connections.delete", {
       projectId: "main",
       id: first.id,
@@ -421,7 +431,7 @@ export async function runLiveStory(
       revision: credential.revision,
     });
     console.log(
-      "PASS: live roles, protected administrator, foreign denial, revocation, credential reuse/rotation/deletion, repeated migration",
+      "PASS: live roles, protected administrator, foreign denial, revocation, credential reuse/rotation/deletion",
     );
 
     const agent = await good(rpc, "agents.put", {
@@ -430,11 +440,11 @@ export async function runLiveStory(
       modelId: "test.echo",
       systemPrompt: "",
       codeInterpreter: true,
-      connectionIds: [legacy.id],
+      connectionIds: [grant.id],
     });
     assert.deepEqual(
       (await fixture.readAgent(agent.id)).connectionIds.L.map((item) => item.S),
-      [legacy.id],
+      [grant.id],
     );
     await page.goto(new URL(`?agent=${agent.id}`, base).href);
     await page.getByRole("textbox", { name: "Message" }).waitFor();
@@ -454,7 +464,6 @@ export async function runLiveStory(
       input = started.request().postDataJSON().input;
     assert.equal((await started.json()).ok, true);
     assert.ok(Date.now() - before < 8000, "Acceptance waited for inference");
-    fixture.trackChat(agent.id, input.sessionId);
     await good(rpc, "chat.start", input);
     await denied(
       rpc,
@@ -511,7 +520,7 @@ export async function runLiveStory(
       1,
     );
     assert.equal(
-      (await fixture.readChat(agent.id, input.sessionId)).events.length,
+      (await fixture.readTurns(input.conversationId)).length,
       1,
     );
     replacementBrowser = await chromium.launch();
@@ -520,7 +529,7 @@ export async function runLiveStory(
     });
     contexts.push(context);
     const returning = await context.newPage();
-    await login(returning, fixture, `?conversation=${input.sessionId}`);
+    await login(returning, fixture, `?conversation=${input.conversationId}`);
     await returning
       .locator(".message.assistant")
       .getByText("Echo: wait:15000:browser closed", { exact: true })
@@ -531,19 +540,18 @@ export async function runLiveStory(
       requestId: randomUUID(),
       branchId: randomUUID(),
       message: "wait:6000:fork refresh",
-      forkEventId: completed.eventId,
-      sourceBranchId: "main",
+      forkTurnId: completed.turnId,
     };
-    delete fork.expectedHeadEventId;
+    delete fork.expectedHeadTurnId;
     await good(rpc, "chat.start", fork);
     await denied(
       rpc,
       "conversations.delete",
-      { projectId: "main", conversationId: input.sessionId, agentId: agent.id },
+      { projectId: "main", conversationId: input.conversationId, agentId: agent.id },
       "RUN_ACTIVE",
     );
     await returning.goto(
-      new URL(`?conversation=${input.sessionId}&branch=${fork.branchId}`, base)
+      new URL(`?conversation=${input.conversationId}&branch=${fork.branchId}`, base)
         .href,
     );
     await returning
@@ -558,12 +566,12 @@ export async function runLiveStory(
     assert.equal((await waitRun(rpc, fork.requestId)).status, "completed");
     const deleted = await good(rpc, "conversations.delete", {
       projectId: "main",
-      conversationId: input.sessionId,
+      conversationId: input.conversationId,
       agentId: agent.id,
     });
     assert.equal(deleted.deleted, true);
     assert.equal(
-      Number((await fixture.readUserControl()).storageUsedBytes?.N || 0),
+      Number((await fixture.readProfile()).storageUsedBytes?.N || 0),
       0,
     );
     assert.equal(
@@ -576,28 +584,27 @@ export async function runLiveStory(
     );
     const toolInput = {
       ...input,
-      sessionId: randomUUID(),
+      conversationId: randomUUID(),
       requestId: randomUUID(),
       message:
         "run-code:import os, base64; print(os.getenv('GITHUB_TOKEN')); print(base64.b64encode(os.getenv('GITHUB_TOKEN').encode()).decode())",
-      expectedHeadEventId: null,
+      expectedHeadTurnId: null,
     };
-    fixture.trackChat(agent.id, toolInput.sessionId);
     await good(rpc, "chat.start", toolInput);
     assert.equal((await waitRun(rpc, toolInput.requestId)).status, "completed");
     const toolChat = await good(rpc, "conversations.get", {
       projectId: "main",
       agentId: agent.id,
-      conversationId: toolInput.sessionId,
+      conversationId: toolInput.conversationId,
     });
     assert.ok(toolChat.messages.at(-1).text.includes("[redacted]"));
     assert.equal(
-      JSON.stringify(toolChat).includes("pages-legacy-secret"),
+      JSON.stringify(toolChat).includes("pages-grant-secret"),
       false,
     );
     assert.equal(
       JSON.stringify(toolChat).includes(
-        Buffer.from("pages-legacy-secret").toString("base64"),
+        Buffer.from("pages-grant-secret").toString("base64"),
       ),
       false,
     );
@@ -606,12 +613,11 @@ export async function runLiveStory(
     );
     const cancelInput = {
       ...input,
-      sessionId: randomUUID(),
+      conversationId: randomUUID(),
       requestId: randomUUID(),
       message: "wait:6000:cancel me",
-      expectedHeadEventId: null,
+      expectedHeadTurnId: null,
     };
-    fixture.trackChat(agent.id, cancelInput.sessionId);
     await good(rpc, "chat.start", cancelInput);
     await good(rpc, "chat.cancel", { requestId: cancelInput.requestId });
     assert.equal(
@@ -629,11 +635,10 @@ export async function runLiveStory(
     );
     const lost = {
       ...cancelInput,
-      sessionId: randomUUID(),
+      conversationId: randomUUID(),
       requestId: randomUUID(),
       message: "wait:15000:runtime lost",
     };
-    fixture.trackChat(agent.id, lost.sessionId);
     await good(rpc, "chat.start", lost);
     await fixture.stopRuntimeSession(auth.runtimeSessionId);
     await new Promise((resolve) => setTimeout(resolve, 1000));

@@ -48,28 +48,25 @@ export async function runRegression(
         });
         if (!agent.ok) return { agent };
         const agentId = agent.data.id,
-          sessionId = crypto.randomUUID();
+          conversationId = crypto.randomUUID();
         const first = await send({
           agentId,
-          sessionId,
+          conversationId,
           message: "first archive",
-          expectedHeadEventId: null,
+          expectedHeadTurnId: null,
         });
-        if (!first.done) return { agentId, sessionId, agent, first };
+        if (!first.done) return { agentId, conversationId, agent, first };
         const second = await send({
           agentId,
-          sessionId,
+          conversationId,
           message: "history?",
-          expectedHeadEventId: first.done.eventId,
+          expectedHeadTurnId: first.done.turnId,
         });
         const usage = await call("usage.get", {
           range: "30d",
           includeDaily: true,
         });
         const detail = await call("usage.request", {
-          requestId: first.done.requestId,
-        });
-        const reconciled = await call("usage.reconcile", {
           requestId: first.done.requestId,
         });
         const filtered = await call("usage.list", {
@@ -97,13 +94,12 @@ export async function runRegression(
         });
         return {
           agentId,
-          sessionId,
+          conversationId,
           agent,
           first,
           second,
           usage,
           detail,
-          reconciled,
           filtered,
           people,
           connection,
@@ -113,8 +109,6 @@ export async function runRegression(
       },
       { url: fixture.controllerUrl, token: accessToken },
     );
-    if (setup.agentId && setup.sessionId)
-      fixture.trackChat(setup.agentId, setup.sessionId);
     if (
       !setup.first?.done ||
       !setup.second?.done ||
@@ -123,7 +117,6 @@ export async function runRegression(
         .length !== 2 ||
       setup.usage?.data?.daily?.items?.length !== 1 ||
       setup.detail?.data?.steps?.length !== 1 ||
-      setup.reconciled?.data?.status !== "completed" ||
       setup.filtered?.data?.items?.length !== 1 ||
       setup.people?.data?.items?.length !== 1 ||
       !setup.connection?.data?.id ||
@@ -175,7 +168,7 @@ export async function runRegression(
           url,
           token,
           agentId,
-          sessionId,
+          conversationId,
           ownerSub,
           requestId,
           connectionId,
@@ -196,7 +189,7 @@ export async function runRegression(
           return {
             conversation: await call("conversations.get", {
               agentId,
-              conversationId: sessionId,
+              conversationId: conversationId,
             }),
             usage: await call("usage.request", {
               userSub: ownerSub,
@@ -214,7 +207,7 @@ export async function runRegression(
           url: fixture.controllerUrl,
           token: peerToken,
           agentId: setup.agentId,
-          sessionId: setup.sessionId,
+          conversationId: setup.conversationId,
           ownerSub: setup.session.data.user.sub,
           requestId: setup.first.done.requestId,
           connectionId: setup.connection.data.id,
@@ -232,13 +225,8 @@ export async function runRegression(
       await peerContext?.close();
       await peer?.cleanup();
     }
-    const removed = await fixture.deleteChatMemory(
-      setup.agentId,
-      setup.sessionId,
-    );
-    if (removed !== 2) throw new Error("Expected two disposable Memory events");
-    const afterLoss = await page.evaluate(
-      async ({ url, token, agentId, sessionId, headEventId, sub }) => {
+    const continued = await page.evaluate(
+      async ({ url, token, agentId, conversationId, headTurnId, sub }) => {
         const headers = {
           authorization: "Bearer " + token,
           "content-type": "application/json",
@@ -255,7 +243,7 @@ export async function runRegression(
           ).json();
         const reopened = await call("conversations.get", {
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
         });
         const response = await fetch(url, {
           method: "POST",
@@ -265,10 +253,10 @@ export async function runRegression(
             command: "chat.send",
             input: {
               agentId,
-              sessionId,
+              conversationId,
               requestId: crypto.randomUUID(),
               message: "history?",
-              expectedHeadEventId: headEventId,
+              expectedHeadTurnId: headTurnId,
             },
           }),
         });
@@ -282,7 +270,7 @@ export async function runRegression(
         };
         const after = await call("conversations.get", {
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
         });
         const archived = await call("agents.setArchived", {
           id: agentId,
@@ -297,7 +285,7 @@ export async function runRegression(
             command: "chat.send",
             input: {
               agentId,
-              sessionId,
+              conversationId,
               requestId: crypto.randomUUID(),
               message: "blocked",
             },
@@ -318,7 +306,7 @@ export async function runRegression(
             command: "chat.send",
             input: {
               agentId,
-              sessionId: crypto.randomUUID(),
+              conversationId: crypto.randomUUID(),
               requestId: failedRequestId,
               message: "scripted-error",
             },
@@ -342,7 +330,7 @@ export async function runRegression(
             command: "chat.send",
             input: {
               agentId,
-              sessionId: crypto.randomUUID(),
+              conversationId: crypto.randomUUID(),
               requestId: crypto.randomUUID(),
               message: "new",
             },
@@ -361,18 +349,18 @@ export async function runRegression(
         for (let attempt = 0; attempt < 10; attempt++) {
           deleted = await call("conversations.delete", {
             agentId,
-            conversationId: sessionId,
+            conversationId: conversationId,
           });
           if (deleted.data?.deleted) break;
         }
         const afterDelete = await call("session.get", {});
         const missing = await call("conversations.get", {
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
         });
         const duplicateDelete = await call("conversations.delete", {
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
         });
         return {
           reopened,
@@ -398,34 +386,34 @@ export async function runRegression(
         url: fixture.controllerUrl,
         token: accessToken,
         agentId: setup.agentId,
-        sessionId: setup.sessionId,
-        headEventId: setup.second.done.eventId,
+        conversationId: setup.conversationId,
+        headTurnId: setup.second.done.turnId,
         sub: setup.session.data.user.sub,
       },
     );
     if (
-      afterLoss.reopened?.data?.messages?.length !== 4 ||
-      !afterLoss.third?.done ||
-      afterLoss.after?.data?.messages?.length !== 6 ||
-      !afterLoss.archived?.ok ||
-      !afterLoss.restored?.ok ||
-      !afterLoss.denied?.includes("AGENT_ARCHIVED") ||
-      !afterLoss.failed?.includes('"type":"error"') ||
-      afterLoss.failedDetail?.data?.request?.status !== "outcome_unknown" ||
-      afterLoss.failedDetail?.data?.steps?.length !== 1 ||
-      !afterLoss.quota?.includes("STORAGE_EXHAUSTED") ||
-      !afterLoss.limits?.ok ||
-      !afterLoss.reset?.ok ||
-      !afterLoss.summary?.data?.period?.includes("#E1") ||
-      !afterLoss.inherit?.ok ||
-      !afterLoss.deleted?.data?.deleted ||
-      afterLoss.afterDelete?.data?.user?.storageUsedBytes !== 0 ||
-      afterLoss.missing?.error?.code !== "NOT_FOUND" ||
-      !afterLoss.duplicateDelete?.data?.deleted
+      continued.reopened?.data?.messages?.length !== 4 ||
+      !continued.third?.done ||
+      continued.after?.data?.messages?.length !== 6 ||
+      !continued.archived?.ok ||
+      !continued.restored?.ok ||
+      !continued.denied?.includes("AGENT_ARCHIVED") ||
+      !continued.failed?.includes('"type":"error"') ||
+      continued.failedDetail?.data?.request?.status !== "failed" ||
+      continued.failedDetail?.data?.steps?.length !== 1 ||
+      !continued.quota?.includes("STORAGE_EXHAUSTED") ||
+      !continued.limits?.ok ||
+      !continued.reset?.ok ||
+      !continued.summary?.data?.period?.includes("#E1") ||
+      !continued.inherit?.ok ||
+      !continued.deleted?.data?.deleted ||
+      continued.afterDelete?.data?.user?.storageUsedBytes !== 0 ||
+      continued.missing?.error?.code !== "NOT_FOUND" ||
+      !continued.duplicateDelete?.data?.deleted
     )
       throw new Error(
         "Durable reopen/reset/archive failed: " +
-          JSON.stringify(afterLoss).slice(0, 1800),
+          JSON.stringify(continued).slice(0, 1800),
       );
     return;
   }
@@ -489,22 +477,22 @@ export async function runRegression(
         });
         if (!alpha.ok || !beta.ok || !agent.ok) return { alpha, beta, agent };
         const agentId = agent.data.id,
-          sessionId = crypto.randomUUID();
-        const base = { projectId: "alpha", agentId, sessionId };
+          conversationId = crypto.randomUUID();
+        const base = { projectId: "alpha", agentId, conversationId };
         const isolated = await call("agents.list", { projectId: "beta" });
         const first = await send({
           ...base,
           message: "first",
           branchId: "main",
-          expectedHeadEventId: null,
+          expectedHeadTurnId: null,
         });
         if (!first.done)
-          return { alpha, beta, agent, isolated, first, agentId, sessionId };
+          return { alpha, beta, agent, isolated, first, agentId, conversationId };
         const second = await send({
           ...base,
           message: "history?",
           branchId: "main",
-          expectedHeadEventId: first.done.eventId,
+          expectedHeadTurnId: first.done.turnId,
         });
         if (!second.done)
           return {
@@ -515,14 +503,14 @@ export async function runRegression(
             first,
             second,
             agentId,
-            sessionId,
+            conversationId,
           };
         const alternativeId = crypto.randomUUID();
         const alternate = await send({
           ...base,
           message: "edited second",
           branchId: alternativeId,
-          forkEventId: first.done.eventId,
+          forkTurnId: first.done.turnId,
         });
         if (!alternate.done)
           return {
@@ -534,60 +522,58 @@ export async function runRegression(
             second,
             alternate,
             agentId,
-            sessionId,
+            conversationId,
           };
         const nestedId = crypto.randomUUID();
         const nested = await send({
           ...base,
           message: "history?",
           branchId: nestedId,
-          forkEventId: alternate.done.eventId,
+          forkTurnId: alternate.done.turnId,
         });
         const firstEditId = crypto.randomUUID();
         const firstEdit = await send({
           ...base,
           message: "rewritten first",
           branchId: firstEditId,
-          forkEventId: null,
-          sourceBranchId: "main",
+          forkTurnId: null,
         });
-        if (!firstEdit.done) return { firstEdit, agentId, sessionId };
+        if (!firstEdit.done) return { firstEdit, agentId, conversationId };
         const firstEditChildId = crypto.randomUUID();
         const firstEditChild = await send({
           ...base,
           message: "history?",
           branchId: firstEditChildId,
-          forkEventId: firstEdit.done.eventId,
-          sourceBranchId: firstEditId,
+          forkTurnId: firstEdit.done.turnId,
         });
         const firstEditReopened = await call("conversations.get", {
           projectId: "alpha",
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
           branchId: firstEditChildId,
         });
         const reopened = await call("conversations.get", {
           projectId: "alpha",
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
           branchId: nestedId,
         });
         const main = await call("conversations.get", {
           projectId: "alpha",
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
           branchId: "main",
         });
         const denied = await call("conversations.get", {
           projectId: "beta",
           agentId,
-          conversationId: sessionId,
+          conversationId: conversationId,
         });
         const stale = await send({
           ...base,
           message: "stale",
           branchId: alternativeId,
-          expectedHeadEventId: first.done.eventId,
+          expectedHeadTurnId: first.done.turnId,
         });
         const self = await call("session.get", {});
         const archiveUsed = self.data.user.storageUsedBytes;
@@ -620,7 +606,7 @@ export async function runRegression(
             limits,
             begin,
             agentId,
-            sessionId,
+            conversationId,
           };
         const fields = new FormData();
         for (const [name, value] of Object.entries(begin.data.upload.fields))
@@ -669,7 +655,7 @@ export async function runRegression(
           ...base,
           message: "skill-loaded",
           branchId: "main",
-          expectedHeadEventId: second.done.eventId,
+          expectedHeadTurnId: second.done.turnId,
         });
         const deleted = await call("objects.delete", {
           projectId: "alpha",
@@ -718,7 +704,7 @@ export async function runRegression(
           beta,
           agent,
           agentId,
-          sessionId,
+          conversationId,
           isolated,
           first,
           second,
@@ -756,8 +742,6 @@ export async function runRegression(
       },
       { url: fixture.controllerUrl, token: accessToken },
     );
-    if (result.agentId && result.sessionId)
-      fixture.trackChat(result.agentId, result.sessionId, "alpha");
     if (
       !result.alpha?.ok ||
       !result.beta?.ok ||
@@ -824,7 +808,7 @@ export async function runRegression(
         const stickyId = "bench-" + crypto.randomUUID();
         const samples = [];
         let previousEnd = null;
-        const invoke = async (command, sessionId) => {
+        const invoke = async (command, conversationId) => {
           const started = performance.now();
           const gapMs = previousEnd === null ? null : started - previousEnd;
           let headersMs, firstByteMs, status;
@@ -834,7 +818,7 @@ export async function runRegression(
               headers: {
                 authorization: "Bearer " + token,
                 "content-type": "application/json",
-                "x-amzn-bedrock-agentcore-runtime-session-id": sessionId,
+                "x-amzn-bedrock-agentcore-runtime-session-id": conversationId,
               },
               body: JSON.stringify({ v: 1, command, input: {} }),
             });

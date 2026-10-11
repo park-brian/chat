@@ -110,6 +110,8 @@ export async function* scriptedStream(messages) {
         : { text: reply },
     },
   };
+  // A provider stream that dies before reporting usage.
+  if (prompt === "scripted-stream-error") throw Error("Scripted stream failure");
   yield { contentBlockStop: { contentBlockIndex: 0 } };
   yield {
     messageStop: {

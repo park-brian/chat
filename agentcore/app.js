@@ -97,15 +97,13 @@ await mountPage({
     );
     const [branchId, setBranchId] = createSignal("main");
     const [branches, setBranches] = createSignal([
-      { id: "main", name: "Main", headEventId: null },
+      { id: "main", name: "Main", headTurnId: null },
     ]);
-    const [headEventId, setHeadEventId] = createSignal(null);
+    const [headTurnId, setHeadTurnId] = createSignal(null);
     const [forkFrom, setForkFrom] = createSignal(null);
     const [conversations, setConversations] = createSignal([]);
     const [conversationCursor, setConversationCursor] = createSignal(null);
     const [olderCursor, setOlderCursor] = createSignal(null);
-    const [uncertainConversationId, setUncertainConversationId] =
-      createSignal(null);
     const [messages, setMessages] = createSignal([]);
     const [draft, setDraft] = createSignal("");
     const [selectedFiles, setSelectedFiles] = createSignal([]);
@@ -118,11 +116,10 @@ await mountPage({
       setSelectedAgent(agent);
       setConversationId(crypto.randomUUID());
       setBranchId("main");
-      setBranches([{ id: "main", name: "Main", headEventId: null }]);
-      setHeadEventId(null);
+      setBranches([{ id: "main", name: "Main", headTurnId: null }]);
+      setHeadTurnId(null);
       setForkFrom(null);
       setOlderCursor(null);
-      setUncertainConversationId(null);
       setMessages([]);
       setSaveOutputs(false);
       setError("");
@@ -156,7 +153,7 @@ await mountPage({
           const active = page.activeRequests?.find(
             (run) =>
               run.branchId === selectedBranch &&
-              ["running", "memory_written"].includes(run.status),
+              run.status === "running",
           );
           if (active) {
             setActiveRun(active.requestId);
@@ -168,25 +165,14 @@ await mountPage({
           }
           setBranchId(selectedBranch);
           setBranches(page.branches);
-          setHeadEventId(
+          setHeadTurnId(
             page.branches.find((branch) => branch.id === selectedBranch)
-              ?.headEventId ||
-              page.messages.at(-1)?.eventId ||
+              ?.headTurnId ||
+              page.messages.at(-1)?.turnId ||
               null,
           );
           setForkFrom(null);
           setOlderCursor(page.nextCursor);
-          setUncertainConversationId(
-            page.historyExpired || page.archiveIncomplete ? item.id : null,
-          );
-          if (page.historyExpired)
-            setError(
-              "This older development conversation has expired. Start a new chat.",
-            );
-          else if (page.archiveIncomplete)
-            setError(
-              "Part of this saved conversation is unavailable. Continuing is disabled.",
-            );
         }
       } catch (cause) {
         if (request === conversationRequest) setError(cause.message);
@@ -237,14 +223,14 @@ await mountPage({
       if (
         sending() ||
         loadingConversation() ||
-        uncertainConversationId() ||
         (index < 2 && olderCursor())
       )
         return;
       const items = messages();
       const userIndex = retry ? index - 1 : index;
-      const rootEventId = items.slice(0, userIndex).at(-1)?.eventId || null;
-      setForkFrom({ fromIndex: userIndex, rootEventId });
+      // The edited turn's parent: the turn before it, or none for the first.
+      const forkTurnId = items.slice(0, userIndex).at(-1)?.turnId || null;
+      setForkFrom({ fromIndex: userIndex, forkTurnId });
       setDraft(items[userIndex].text);
       if (retry) send();
     }
@@ -369,14 +355,14 @@ await mountPage({
               );
             if (event.type === "message.done") {
               setBranchId(event.branchId);
-              setHeadEventId(event.eventId);
+              setHeadTurnId(event.turnId);
               setForkFrom(null);
               setSelectedFiles([]);
               setSaveOutputs(false);
               setMessages((items) =>
                 items.map((item, i) =>
                   i >= items.length - 2
-                    ? { ...item, eventId: event.eventId, status: "complete" }
+                    ? { ...item, turnId: event.turnId, status: "complete" }
                     : item,
                 ),
               );
@@ -448,14 +434,14 @@ await mountPage({
         const accepted = await rpc("chat.start", {
           projectId: projectId(),
           agentId: agent.id,
-          sessionId: conversationId(),
+          conversationId: conversationId(),
           requestId,
           message,
           branchId: targetBranch,
           modelId: model.id,
           ...(fork
-            ? { forkEventId: fork.rootEventId, sourceBranchId: branchId() }
-            : { expectedHeadEventId: headEventId() }),
+            ? { forkTurnId: fork.forkTurnId }
+            : { expectedHeadTurnId: headTurnId() }),
           ...(composerThinking() && { thinkingLevel: composerThinking() }),
           ...(agent.codeInterpreter && {
             fileIds: selectedFiles(),
@@ -564,7 +550,7 @@ await mountPage({
       execute_code: "code workspace",
       execute_command: "command workspace",
     };
-    const agentName = (agent) => agent?.name || agent?.agentName || "Agent";
+    const agentName = (agent) => agent?.name || "Agent";
     const modelName = (id) =>
       models().find((model) => model.id === id)?.name || id;
     const agentTools = (agent) =>
@@ -736,7 +722,8 @@ await mountPage({
                             >${() =>
                               agentName(agents().find((agent) => agent.id === item.agentId)) +
                               " · " +
-                              relativeTime(item.lastActivityAt)}</span
+                              relativeTime(item.lastActivityAt) +
+                              (item.running ? " · working" : "")}</span
                           >
                         </button>`}<//
                     >
@@ -897,7 +884,7 @@ await mountPage({
                       >
                       <${Show}
                         when=${() =>
-                          item.eventId &&
+                          item.turnId &&
                           !sending() &&
                           !loadingConversation() &&
                           (index() >= 2 || !olderCursor())}
@@ -1030,8 +1017,7 @@ await mountPage({
                   !selectedAgent() ||
                   selectedAgent()?.archived ||
                   sending() ||
-                  loadingConversation() ||
-                  uncertainConversationId() === conversationId()}
+                  loadingConversation()}
               ></textarea>
               <${Show}
                 when=${() => selectedAgent()?.browser && !composerModel()?.browserTool}
@@ -1130,8 +1116,7 @@ await mountPage({
                     !modelAllowed(composerModel() || {}, selectedAgent()) ||
                     !draft().trim() ||
                     sending() ||
-                    loadingConversation() ||
-                    uncertainConversationId() === conversationId()}
+                    loadingConversation()}
                 >
                   ${() => (sending() ? "Working…" : "Send ↑")}
                 </button>

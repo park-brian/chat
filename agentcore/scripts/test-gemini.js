@@ -167,9 +167,12 @@ assert.deepEqual(
   geminiStepCalls({ parts: [], finishReason: "MAX_TOKENS" }),
   [],
 );
-await assert.rejects(
-  readGeminiStream(Readable.from([Buffer.from("data: {}\n\n")]), () => {}),
-  /did not report/,
+// A stream without usage is still a billed step: it reports null so the turn
+// records it as unknown instead of dropping it.
+assert.equal(
+  (await readGeminiStream(Readable.from([Buffer.from("data: {}\n\n")]), () => {}))
+    .usage,
+  null,
 );
 await assert.rejects(
   readGeminiStream(Readable.from([Buffer.from("data: {}")]), () => {}),

@@ -115,7 +115,7 @@ try {
           contentType: "text/event-stream",
           body: [
             { type: "message.delta", sequence: 1, text: "Done" },
-            { type: "message.done", sequence: 2, eventId: "3#c", branchId: "main" },
+            { type: "message.done", sequence: 2, turnId: "3#c", branchId: "main" },
             { type: "run.status", status: "completed", sequence: 2, branchId: "main" },
           ]
             .map((event) => `data: ${JSON.stringify(event)}\n\n`)
@@ -154,7 +154,7 @@ try {
         revision: 0,
         systemPrompt: "Research carefully.",
       };
-      if (command === "session.get") data = { apiVersion: 2, user, defaults };
+      if (command === "session.get") data = { apiVersion: 3, user, defaults };
       else if (command === "users.list")
         data = { items: [user, second], defaults, cursor: null };
       else if (command === "users.get")
@@ -173,11 +173,11 @@ try {
       else if (command === "conversations.get")
         data = {
           messages: [
-            { role: "user", text: "Summarise the Q3 numbers", eventId: "1#a" },
+            { role: "user", text: "Summarise the Q3 numbers", turnId: "1#a" },
             {
               role: "assistant",
               text: "Revenue grew 12% quarter on quarter.\n\n```\nq3 = 1.12 * q2\n```\nSources: https://example.com/q3",
-              eventId: "2#b",
+              turnId: "2#b",
               tools: [
                 { name: "web_search", isError: false },
                 { name: "execute_code", isError: true },
@@ -185,8 +185,8 @@ try {
             },
           ],
           branches: [
-            { id: "main", name: "Main", headEventId: "2#b" },
-            { id: other, name: "Edit 1", headEventId: null },
+            { id: "main", name: "Main", headTurnId: "2#b" },
+            { id: other, name: "Edit 1", headTurnId: null },
           ],
           nextCursor: null,
         };

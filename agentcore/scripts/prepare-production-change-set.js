@@ -15,6 +15,13 @@ const stackName = "agentcore-chat-prod",
 const filename = process.argv[2];
 if (!/^controller-[a-f0-9]{20}\.zip$/.test(filename || ""))
   throw Error("Pass the exact validated ZIP filename");
+// A release that intentionally removes or adds resources names them; anything
+// else must be an in-place update. Example: --remove Data,Memory --add Table
+const listed = (flag) => {
+  const at = process.argv.indexOf(flag);
+  return at < 0 ? [] : process.argv[at + 1].split(",").filter(Boolean).sort();
+};
+const allowed = { remove: listed("--remove"), add: listed("--add") };
 const cf = new CloudFormationClient({ region });
 const stack = (
   await cf.send(new DescribeStacksCommand({ StackName: stackName }))
@@ -44,8 +51,7 @@ const created = await cf.send(
   new CreateChangeSetCommand({
     StackName: stackName,
     ChangeSetName: name,
-    Description:
-      "Independent AgentCore pages, reusable private credentials, and browser-independent runs",
+    Description: "AgentCore release " + codeKey,
     TemplateBody: await readFile(
       new URL("../template.yaml", import.meta.url),
       "utf8",
@@ -80,6 +86,7 @@ await writeFile(
       codeKey,
       changeSetId: created.Id,
       changes,
+      allowed,
       executed: false,
     },
     null,
@@ -100,4 +107,16 @@ if (
 )
   throw Error(
     "Review required: possible resource replacement; change set was not executed",
+  );
+const actual = (action) =>
+  changes
+    .filter((change) => change.action === action)
+    .map((change) => change.id)
+    .sort();
+if (
+  JSON.stringify(actual("Remove")) !== JSON.stringify(allowed.remove) ||
+  JSON.stringify(actual("Add")) !== JSON.stringify(allowed.add)
+)
+  throw Error(
+    "Review required: removals/additions differ from --remove/--add; change set was not executed",
   );

@@ -293,7 +293,18 @@ export function createSession() {
       }
     },
     runtimeSessionId: () => state?.runtimeSessionId,
-    resetRuntimeSession: () => { state.runtimeSessionId = crypto.randomUUID(); save(); },
+    resetRuntimeSession: () => {
+      state.runtimeSessionId = crypto.randomUUID();
+      state.runtimeStarted = false;
+      save();
+    },
+    // A new Runtime session ID has no microVM until its first call completes.
+    runtimeStarted: () => state?.runtimeStarted === true,
+    markRuntimeStarted: () => {
+      if (!state || state.runtimeStarted) return;
+      state.runtimeStarted = true;
+      save();
+    },
     dispose: () => channel?.close(),
   };
 }

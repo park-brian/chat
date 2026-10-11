@@ -351,12 +351,11 @@ try {
     const input = {
       projectId: "main",
       agentId: agent.id,
-      sessionId: randomUUID(),
+      conversationId: randomUUID(),
       requestId: randomUUID(),
-      expectedHeadEventId: null,
+      expectedHeadTurnId: null,
       message: "What is 19 + 23? Reply with the number only.",
     };
-    fixture.trackChat(agent.id, input.sessionId);
     await rpc("chat.start", input);
     await rpc("chat.start", input);
     await page.goto(new URL("usage/", base).href);
@@ -365,7 +364,7 @@ try {
     const deadline = Date.now() + 120000;
     do {
       run = await rpc("chat.status", { requestId: input.requestId });
-      if (!["running", "memory_written"].includes(run.status)) break;
+      if (run.status !== "running") break;
       assert.ok(Date.now() < deadline, "Production turn timed out");
       await new Promise((resolve) => setTimeout(resolve, 1000));
     } while (true);
@@ -373,11 +372,11 @@ try {
     const chat = await rpc("conversations.get", {
       projectId: "main",
       agentId: agent.id,
-      conversationId: input.sessionId,
+      conversationId: input.conversationId,
     });
     assert.match(chat.messages.at(-1).text, /42/);
     assert.equal(
-      (await fixture.readChat(agent.id, input.sessionId)).events.length,
+      (await fixture.readTurns(input.conversationId)).length,
       1,
     );
     assert.equal(
@@ -387,7 +386,7 @@ try {
       ).length,
       1,
     );
-    await page.goto(new URL(`?conversation=${input.sessionId}`, base).href);
+    await page.goto(new URL(`?conversation=${input.conversationId}`, base).href);
     await page.locator(".message.assistant").getByText(/42/).waitFor();
     await page.waitForFunction(() => !document.querySelector(".topbar[data-busy]"));
     await page.screenshot({ path: shotPath("chat-conversation-mobile.png") });

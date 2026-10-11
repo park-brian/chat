@@ -33,13 +33,19 @@ const changes = review.Changes.map(({ ResourceChange: change }) => ({
   action: change.Action,
   replacement: change.Replacement,
 }));
+// Only reviewed in-place updates, plus exactly the removals and additions
+// named when the change set was prepared.
+const allowed = record.allowed || { remove: [], add: [] };
 if (
   JSON.stringify(changes) !== JSON.stringify(record.changes) ||
   changes.some(
-    (change) => change.action !== "Modify" || change.replacement !== "False",
+    (change) =>
+      !(change.action === "Modify" && change.replacement === "False") &&
+      !(change.action === "Remove" && allowed.remove.includes(change.id)) &&
+      !(change.action === "Add" && allowed.add.includes(change.id)),
   )
 )
-  throw Error("Change set differs from the reviewed in-place updates");
+  throw Error("Change set differs from the reviewed release");
 if (
   !review.Parameters.some(
     (p) =>
@@ -104,9 +110,12 @@ for (;;) {
   await new Promise((resolve) => setTimeout(resolve, 5000));
 }
 const after = await resources();
+const kept = Object.keys(before).filter((key) => !allowed.remove.includes(key));
 if (
-  Object.keys(before).length !== Object.keys(after).length ||
-  Object.entries(before).some(([key, value]) => after[key] !== value)
+  kept.some((key) => after[key] !== before[key]) ||
+  allowed.remove.some((key) => key in after) ||
+  allowed.add.some((key) => !(key in after)) ||
+  Object.keys(after).length !== kept.length + allowed.add.length
 )
   throw Error("Production resource identities changed");
 record.executionCompletedAt = new Date().toISOString();

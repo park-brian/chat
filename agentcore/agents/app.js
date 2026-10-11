@@ -472,7 +472,7 @@ mountPage({
                           >${(agent) =>
                             html` <div class="item">
                               <strong
-                                >${agent.name || agent.agentName || agent.id}</strong
+                                >${agent.name}</strong
                               >
                               <small
                                 >${agent.modelId}${agent.archived ? " · Archived" : ""}</small

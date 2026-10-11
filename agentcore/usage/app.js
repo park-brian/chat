@@ -2,7 +2,7 @@ import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
 import { updateQuery } from "../shared/navigation.js";
-import { createFeedback, confirmAction, dollars, gb, Skeleton } from "../shared/ui.js";
+import { createFeedback, dollars, gb, Skeleton } from "../shared/ui.js";
 mountPage({
   key: "usage",
   title: "Usage",
@@ -202,7 +202,7 @@ mountPage({
                     ${() => (usageScope() === "all" ? "My period cost" : "Period cost")}
                   </dt>
                   <dd>
-                    ${() => (view()?.quality === "unmetered" ? "Not yet metered" : "$" + dollars(view()?.costMicroUsd))}
+                    $${() => dollars(view()?.costMicroUsd)}
                   </dd>
                 </div>
                 <div class="kv">
@@ -213,6 +213,15 @@ mountPage({
                   <dt>Unpriced tool calls</dt>
                   <dd>${() => view()?.unpricedToolCalls || 0}</dd>
                 </div>
+                <${Show} when=${() => view()?.unknownModelCalls}>
+                  <div class="kv">
+                    <dt>Estimated from text</dt>
+                    <dd>
+                      ${() => view()?.unknownModelCalls} model steps the
+                      provider did not report; their tokens are estimated
+                    </dd>
+                  </div>
+                <//>
                 <div class="kv">
                   <dt>
                     ${() => (usageRange() === "90d" ? "Last 90 days" : "Last 30 days")}
@@ -401,11 +410,8 @@ mountPage({
                         <option value="">Any</option>
                         <option value="completed">Completed</option>
                         <option value="cancelled">Cancelled</option>
+                        <option value="failed">Failed</option>
                         <option value="outcome_unknown">Unknown outcome</option>
-                        <option value="memory_failed">Memory failed</option>
-                        <option value="navigation_failed">
-                          Navigation failed
-                        </option>
                         <option value="running">Running</option>
                       </select>
                     </div>
@@ -508,30 +514,6 @@ mountPage({
                   </button>
                 </div><//
               >`}
-          <${Show} when=${usageDetail}
-            ><div class="actions">
-              <button
-                onClick=${async () => {
-                  if (
-                    await confirmAction(
-                      "Reconcile this request using its saved receipts?",
-                    )
-                  )
-                    await feedback.perform(async () => {
-                      const request = usageDetail().request;
-                      await rpc("usage.reconcile", {
-                        requestId: request.requestId,
-                        ...(request.userSub && { userSub: request.userSub }),
-                      });
-                      await inspectUsage(request);
-                      await loadView();
-                    }, "Reconciliation checked.");
-                }}
-              >
-                Reconcile request
-              </button>
-            </div><//
-          >
         <//>
       </section>`;
   },

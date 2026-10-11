@@ -79,7 +79,7 @@ try {
     const { command } = route.request().postDataJSON();
     if (command === "session.get") {
       validated++;
-      const apiVersion = oldWorker ? 1 : 2; oldWorker = false;
+      const apiVersion = oldWorker ? 1 : 3; oldWorker = false;
       return route.fulfill({
         json: changed
           ? { ok: false, error: { code: "SESSION_CHANGED" } }

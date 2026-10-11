@@ -31,7 +31,28 @@ export function createApi(auth) {
   window.addEventListener("pagehide", () => {
     for (const controller of observers) controller.abort();
   });
+  // AgentCore answers 409 "Session operation in progress" to any call that
+  // overlaps creation of a session's microVM. On a session that has not started,
+  // the first call goes alone and the rest wait for it; started sessions keep
+  // full concurrency.
+  let starting = null;
   async function request(command, input = {}, signal) {
+    if (!auth.runtimeStarted()) {
+      if (starting) await starting.catch(() => {});
+      else {
+        starting = send(command, input, signal);
+        try {
+          const response = await starting;
+          if (response.status !== 409) auth.markRuntimeStarted();
+          return response;
+        } finally {
+          starting = null;
+        }
+      }
+    }
+    return send(command, input, signal);
+  }
+  async function send(command, input, signal) {
     const requestId = crypto.randomUUID();
     for (let attempt = 0; ; attempt++) {
       const token = await auth.accessToken(),
@@ -50,10 +71,8 @@ export function createApi(auth) {
           body: JSON.stringify({ v: 1, command, requestId, input }),
         },
       );
-      // AgentCore answers 409 "Session operation in progress" to calls that
-      // arrive while it is still creating this session's microVM, such as a
-      // page's first reads overlapping session.get after sign-in. Nothing ran;
-      // the controller's own failures never reach the browser as 409.
+      // A session that expired while idle restarts too. Nothing ran on a 409,
+      // and the controller's own failures never reach the browser as 409.
       if (response.status !== 409 || attempt >= 20) return response;
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -137,7 +156,7 @@ export function createApi(auth) {
               onEvent(event);
               if (
                 event.type === "run.status" &&
-                !["running", "memory_written"].includes(event.status)
+                event.status !== "running"
               )
                 terminal = true;
             }
