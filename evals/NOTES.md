@@ -1312,3 +1312,16 @@ answer-hard 0.89 (0.89), research 0.98 (0.96), swe 0.97 (0.96), answer 0.98, inn
   keep each source's URL with what it established.
 - **Cost per run rose** on swe (about 51-60k to 52-72k token-equivalents) and the long report (419k to 541k):
   summaries break the cache prefix, and plan files add writes. Accepted: the budget is a product requirement.
+
+## Round 3b: sources kept through summaries; the intent tier's baseline
+
+Round 3b (SUMMARY_PROMPT and the plan reminder keep each source's URL): answer-hard 0.88, research 0.98. The long
+report came out without links in 1 of 3 runs (2 of 3 in round 3): better, not solved. pass^k: answer-hard 2/7
+tasks pass every repeat, research 5/7.
+
+**intent (new, simulated user with a hidden goal): 0.84, pass^k 1/6.** The one task that always passes is the
+fully specified control. In the others, Haiku builds before saying what it assumed: a habit's frequency and the
+theme (habits), whether the signature must stay (cleanup, 3 of 3), the date to rename by and the language
+(photos). The trip plan takes 5-6 user turns because each constraint comes out as a correction after a draft; the
+cover letter adds achievements the user never gave. This is the hypothesis loop the director's Understand phase
+targets (docs/specs/2026-10-12-director.md): state the goal, the assumptions and what done means before building.
