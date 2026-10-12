@@ -1,8 +1,10 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { access, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright";
 import { createCoverageReport } from "./coverage.js";
+import { testTabs } from "./tabs.test.js";
+import { startProxy } from "./proxy.js";
 import { startServer } from "./server.js";
 
 function isCoverageEntryForTarget(entry, pageUrl) {
@@ -42,10 +44,18 @@ function options(argv) {
     else if (flags[i] === "--story") result.story = flags[++i];
     else if (flags[i] === "--viewports")
       result.viewports = flags[++i]?.split(",") ?? [];
-    else if (flags[i] === "--live-stack") result.liveStack = flags[++i];
+    else if (flags[i] === "--live-stack") {
+      result.liveStack = flags[++i];
+      if (!result.liveStack || result.liveStack.startsWith("--"))
+        throw new Error("--live-stack needs a stack name");
+    }
     else if (flags[i] === "--published") result.published = true;
-    else if (flags[i] === "--profile") result.profile = flags[++i];
-    else if (flags[i] === "--region") result.region = flags[++i];
+    else if (flags[i] === "--profile" || flags[i] === "--region") {
+      const value = flags[++i];
+      if (!value || value.startsWith("--"))
+        throw new Error(flags[i - 1] + " needs a " + flags[i - 1].slice(2) + " name");
+      result[flags[i - 1].slice(2)] = value;
+    }
     else throw new Error("Unknown test option: " + flags[i]);
   }
   const sizes = {
@@ -74,6 +84,7 @@ async function run(config = options(process.argv.slice(2))) {
   const runId = new Date().toISOString().replaceAll(/[:.]/g, "-");
   let browser;
   let server;
+  let proxy;
   let fixture;
 
   try {
@@ -90,7 +101,8 @@ async function run(config = options(process.argv.slice(2))) {
         region: config.region,
       });
     const liveUrl = fixture?.entryUrl
-      ? new URL(config.published ? fixture.publicEntryUrl : fixture.entryUrl) : null;
+      ? new URL(config.published ? fixture.publicEntryUrl : fixture.entryUrl)
+      : null;
     const port = liveUrl ? Number(liveUrl.port) : 0;
     if (!config.published) {
       try {
@@ -99,11 +111,15 @@ async function run(config = options(process.argv.slice(2))) {
         if (!liveUrl || error.code !== "EADDRINUSE") throw error;
         const probe = await fetch(liveUrl.origin + liveUrl.pathname);
         if (!probe.ok || !(await probe.text()).includes("AgentCore Chat"))
-          throw new Error("Existing local server does not serve the target app");
+          throw new Error(
+            "Existing local server does not serve the target app",
+          );
         console.log("Using existing local server at " + liveUrl.origin);
       }
     }
     const activePort = server?.address().port || port;
+    // A local run gets its own CORS proxy and TCP relay, so in-file tests can reach real sites and services.
+    if (!liveUrl) proxy = await startProxy(0);
     const route = relativeTarget
       .split(path.sep)
       .map(encodeURIComponent)
@@ -120,20 +136,37 @@ async function run(config = options(process.argv.slice(2))) {
       // Each viewport is an independent live story. Reusing one identity leaks
       // prior mutations into the next layout's assertions and cleanup.
       if (hooks && !fixture)
-        fixture = await hooks.createLiveFixture({ stackName: config.liveStack,
-          profile: config.profile, region: config.region });
+        fixture = await hooks.createLiveFixture({
+          stackName: config.liveStack,
+          profile: config.profile,
+          region: config.region,
+        });
       const context = await browser.newContext({
         viewport: config.sizes[viewport],
         deviceScaleFactor: 1,
         reducedMotion: "reduce",
       });
       const page = await context.newPage();
+      if (proxy)
+        // The page only: its frames share its storage, and a sandboxed one has none to write.
+        await page.addInitScript(
+          (config) =>
+            window !== top ||
+            localStorage.getItem("proxy-config") ||
+            localStorage.setItem("proxy-config", config),
+          JSON.stringify({
+            endpoint: "http://localhost:" + proxy.address().port,
+          }),
+        );
       const errors = [];
       page.on("console", (message) => {
         console.log(message.text());
-        if (message.type() === "error") errors.push(message.text());
+        // A test's deliberately unreachable host logs its 502 like any failed load; it isn't a page error.
+        const where = message.location().url;
+        if (message.type() === "error" && !where?.includes(".invalid/")) errors.push(message.text() + (where ? ` (${where})` : ""));
       });
-      page.on("pageerror", (error) => errors.push(error.message));
+      // A page a test runs in the workspace throws on purpose; its report is what the test checks.
+      page.on("pageerror", (error) => { if (!error.stack?.includes("/__ws/")) errors.push(error.message); });
       page.on("requestfailed", (request) => {
         if (["script", "stylesheet"].includes(request.resourceType()))
           errors.push("Failed asset: " + request.url());
@@ -165,21 +198,23 @@ async function run(config = options(process.argv.slice(2))) {
               animations: "disabled",
               mask: [page.locator("[data-sensitive]")],
             };
+            let image;
             if (request.targetId) {
               const element = page.locator(
                 '[data-screenshot-target="' + request.targetId + '"]',
               );
               if ((await element.count()) !== 1)
                 throw new Error("Screenshot target is missing or ambiguous");
-              await element.screenshot(capture);
+              image = await element.screenshot(capture);
             } else {
-              await page.screenshot({
+              image = await page.screenshot({
                 ...capture,
                 fullPage: request.fullPage === true,
               });
             }
             console.log("Screenshot: " + file);
-            return file;
+            // The in-page harness asks for the pixels so it can hand them to the model.
+            return request.base64 === true ? image.toString("base64") : file;
           },
         );
       }
@@ -199,7 +234,7 @@ async function run(config = options(process.argv.slice(2))) {
           );
           continue;
         }
-        await page.waitForFunction(() => window.TESTS_DONE, { timeout: 30000 });
+        await page.waitForFunction(() => window.TESTS_DONE, null, { timeout: 120000 });
         const result = await page.evaluate(() => window.TESTS_DONE);
         if (
           typeof result !== "object" ||
@@ -243,6 +278,21 @@ async function run(config = options(process.argv.slice(2))) {
           },
         );
         console.log(report);
+        // The engine a page imports, and the prompts it imports, are covered by the same tests.
+        for (const module of ["engine.js", "prompts.js"]) {
+          const moduleEntry = coverage.find((item) =>
+            isCoverageEntryForTarget(item, new URL(module, pageUrl)),
+          );
+          if (moduleEntry)
+            console.log(
+              createCoverageReport(
+                path.posix.join(path.dirname(relativeTarget).split(path.sep).join("/"), module),
+                await readFile(path.join(path.dirname(absoluteTarget), module), "utf8"),
+                moduleEntry,
+                { width: process.stdout.columns || 120 },
+              ).report,
+            );
+        }
       } finally {
         await context.close();
         if (hooks) {
@@ -251,8 +301,19 @@ async function run(config = options(process.argv.slice(2))) {
         }
       }
     }
+    // An app with an engine serves every tab from it; these check what that promises across tabs.
+    const engine = path.join(path.dirname(absoluteTarget), "engine.js");
+    if (!liveUrl && !config.story && (await access(engine).then(() => true, () => false))) {
+      const url = new URL(pageUrl);
+      url.search = "";
+      const results = await testTabs(browser, url.href);
+      console.log(results.join("\n"));
+      const failed = results.filter((line) => line.startsWith("FAIL"));
+      if (failed.length) throw new Error("Tab stories failed: " + failed.map((line) => line.split("\n")[0]).join("; "));
+    }
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
+    if (proxy) await new Promise((resolve) => proxy.close(resolve));
     await browser?.close();
     await fixture?.cleanup();
   }
