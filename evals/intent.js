@@ -22,7 +22,7 @@ const reached = (run, within) => [
 
 // Judge criteria, one per goal element: asked or stated before building on it, never a silent guess. The judge sees
 // "[wrote: path]" where each file was written.
-const askedFirst = what => `Across the whole conversation: before the assistant built on ${what} (wrote the file, marked "[wrote: …]", or gave the finished answer), it asked the user about it or stated the assumption it was making. Pass also if the user corrected a stated assumption and the assistant followed the correction. Fail if the assistant picked silently and the user had to bring it up.`;
+const askedFirst = what => `Before building on ${what} (writing the file, marked "[wrote: …]", or giving the finished answer), the assistant asked the user or stated its assumption. A stated assumption the user corrected passes; a silent choice fails.`;
 
 // JavaScript from the work, run in a fresh context with expr evaluated after it. Module syntax is dropped.
 function runJs(code, expr) {
