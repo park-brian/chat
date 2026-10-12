@@ -4,8 +4,9 @@
 
 // #region 1. IMPORTS & DEFINITIONS
 import {
-  DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FORK_BRIEF, FRONTEND_SKILL, GENERAL_PROMPT, HARNESS_DOCUMENTATION,
-  NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SUMMARY_PROMPT, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
+  DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FETCH_DIRECT, FETCH_PROXIED, FORK_BRIEF, FRONTEND_SKILL,
+  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SUMMARY_PROMPT,
+  TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
 
 // A SharedWorker's console is its own; what the engine logs, and what it throws, goes to the tabs' consoles too. The
@@ -58,7 +59,8 @@ function systemPrompt(persona, { tools = [], memories = null } = {}) {
   const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && HARNESS_DOCUMENTATION;
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
-  return [persona, memories, ENVIRONMENT, WORKING, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
+  const environment = fill(ENVIRONMENT, { fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT });
+  return [persona, memories, environment, WORKING, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
 }
 
 // /memories/ as the conversation found it. Taken once per thread: the prompt stays byte-stable for the cache,
@@ -164,7 +166,7 @@ const TOOLS = [
             source: { type: "string", description: "The code to execute (ignored if filename provided)" },
             filename: { type: "string", description: "Path to a workspace or editor file to run instead of source" },
             language: { type: "string", description: "Language (js/html). Auto-detected from filename extension.", default: "javascript" },
-            timeout: { type: "number", description: "Seconds before it is stopped, up to 60.", default: 5 },
+            timeout: { type: "number", description: "Seconds before it is stopped, up to 60. Default 5, or 30 when the source uses fetch, import or web." },
           },
         },
       },
@@ -1439,12 +1441,19 @@ function isLocalHost(hostname) {
 // The proxy also relays TCP over WebSocket at the same address (the tcpipe protocol).
 const relayUrl = () => getProxyConfig()?.endpoint?.replace(/^http/, "ws").replace(/\/+$/, "") ?? null;
 
+// Without a proxy, a site that sends no CORS headers fails as "Failed to fetch", which names neither the cause nor
+// the fix. The code sandbox's fetch says the same.
+const CORS_BLOCKED = "blocked by CORS: no local proxy. Use a CORS-open source, or run `npm run start:proxy`.";
+const crossOrigin = target => /^https?:$/.test(target.protocol) && target.origin !== location.origin && !isLocalHost(target.hostname);
+
 // A tool's fetch, through the proxy unless the URL is this machine's. It gives up after a minute, or when the run stops.
 const FETCH_TIMEOUT_MS = 60_000;
 async function proxyFetch(url, { signal, ...options } = {}) {
   const proxy = getProxyConfig();
   const target = new URL(url, location.origin);
   const timed = AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), ...(signal ? [signal] : [])]);
+  if (!proxy?.endpoint && crossOrigin(target))
+    return fetch(url, { ...options, signal: timed }).catch(e => { throw e?.name === "TypeError" ? new TypeError(`Failed to fetch ${target.href}: ${CORS_BLOCKED}`) : e; });
   if (!proxy?.endpoint || isLocalHost(target.hostname)) return fetch(url, { ...options, signal: timed });
   const headers = new Headers(options.headers || {});
   if (proxy.headerName && proxy.headerValue) headers.set(proxy.headerName, proxy.headerValue);
@@ -1455,8 +1464,8 @@ async function proxyFetch(url, { signal, ...options } = {}) {
 // CORS headers, so the call goes through the proxy.
 const BRAVE_SEARCH = "https://api.search.brave.com/res/v1/web/search";
 const hasBraveKey = () => !!storedJSON("brave-config")?.apiKey;
-// Tools every agent and sub-agent gets for the web; search only with a key.
-const webToolNames = () => ["read_url", ...(hasBraveKey() ? ["web_search"] : [])];
+// Tools every agent and sub-agent gets for the web; search only when it can work: a key, and a proxy to reach Brave.
+const webToolNames = () => ["read_url", ...(hasBraveKey() && getProxyConfig()?.endpoint ? ["web_search"] : [])];
 const plainText = s => String(s ?? "").replace(/<[^>]+>/g, "").replace(/&(#x[\da-f]+|#\d+|quot|amp|lt|gt|apos|nbsp);/gi, (_, e) =>
   e[0] === "#" ? String.fromCodePoint(e[1].toLowerCase() === "x" ? parseInt(e.slice(2), 16) : +e.slice(1)) : { quot: '"', amp: "&", lt: "<", gt: ">", apos: "'", nbsp: " " }[e.toLowerCase()]);
 // The description is often an extra snippet cut down with "...": a snippet whose every piece is in a longer one goes.
@@ -1585,7 +1594,9 @@ async function readUrl({ url, from = 0, render = false, screenshot = false } = {
     let target;
     try { target = new URL(url); } catch { return { error: `${url} is not a URL. Give it whole, with https://.` }; }
     if (!/^https?:$/.test(target.protocol)) return { error: `read_url reads http and https; ${target.protocol} is not one.` };
-    const response = await proxyFetch(target.href, { headers: NAVIGATE, signal });
+    // Sent directly, Upgrade-Insecure-Requests would need a CORS preflight, which a CORS-open host may not answer.
+    const headers = getProxyConfig()?.endpoint ? NAVIGATE : { Accept: NAVIGATE.Accept };
+    const response = await proxyFetch(target.href, { headers, signal });
     const finalUrl = response.headers.get("x-final-url") || target.href;
     const contentType = response.headers.get("content-type") || "";
     const type = contentType.split(";")[0].trim().toLowerCase();
@@ -3687,8 +3698,8 @@ if (inSharedWorker) {
 // #endregion
 
 export {
-  CAPTURE_CHOICE_KEY, CDN, DB_VERSION, DEFAULT_MODEL, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL, PROXY_CONFIG_KEY,
-  TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, countLines, countRepeats,
+  CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
+  PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, countLines, countRepeats,
   createWorkspace, editFile, editor, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
   getConverseClient, getConverseCommand, getProxyConfig, getToolResults, initDB, inspectArgs, isHtml, isLocalHost,
   isRenderable, isScratch, listHistory, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
@@ -3697,5 +3708,5 @@ export {
   runAgentWithBranching, runApp, runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent,
   siblingFiles, silentReply, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, systemPrompt,
   task, think, timeAgo, toDocument, toError, toResultValue, unadoptedVariants, unmuteScripts, untestedChange,
-  viewFile, watchedSend, webSearch, writeFile,
+  viewFile, watchedSend, webSearch, webToolNames, writeFile,
 };

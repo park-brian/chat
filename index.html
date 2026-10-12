@@ -254,12 +254,12 @@
       import DOMPurify from "dompurify";
       import { Marked } from "marked";
       import {
-        CAPTURE_CHOICE_KEY, CDN, DB_VERSION, DEFAULT_MODEL, LOCAL_PROXY, MODELS, PROTOCOL, PROXY_CONFIG_KEY, VIEWPORTS,
+        CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, LOCAL_PROXY, MODELS, PROTOCOL, PROXY_CONFIG_KEY, VIEWPORTS,
         WORKSPACE_TOOL_NAMES, countLines, countRepeats, createWorkspace, ensureDefaultAgent, escapeHtml, extendPath,
         getPathToMessage, getProxyConfig, getSiblings, initDB, inspectArgs, isHtml, isLocalHost, isRenderable, isScratch,
         modelInfo, parseJSON, parsePatch, plainError, proxyRewrite, readUrl, reasoningLevel, sameView, sandboxFiles,
         sandboxResources, serve, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, timeAgo,
-        toError, toResultValue, unmuteScripts,
+        toError, toResultValue, unmuteScripts, webSearch, webToolNames,
       } from "./engine.js";
       const REASONING_KEY = "harness.reasoning"; // localStorage: the reasoning level last chosen
       const PANEL_WIDTH_KEY = "harness.panelWidth"; // localStorage: the artifact panel's width in px, once dragged
@@ -2362,8 +2362,25 @@
       // What only a tab can run for the engine: code in a frame, and the app runner's frames.
       // =============================================================================
 
+      // `web` in code: read_url's and web_search's own functions, run here for the frame, their errors thrown there.
+      async function webCall(method, args = {}, { signal } = {}) {
+        let result;
+        if (method === "read") result = await readUrl({ url: args.url, from: args.from, render: args.render }, { signal });
+        else if (method === "search") {
+          if (!webToolNames().includes("web_search")) throw new Error(storedJSON("brave-config")?.apiKey
+            ? `web.search can't reach Brave Search, which sends no CORS headers: ${CORS_BLOCKED}`
+            : "web.search needs a Brave Search key: add one in Settings (the gear button).");
+          result = await webSearch({ query: args.query, count: args.count, freshness: args.freshness }, { signal });
+        } else throw new Error(`web.${method} is not a function.`);
+        if (typeof result === "string") return result;
+        throw new Error(result?.error ?? `${args.url} is not text: look at it with read_url.`);
+      }
+
+      // Network work takes longer than computing: code that fetches, imports or reads the web gets 30 s by default.
+      const usesNetwork = source => /\bfetch\s*\(|\bimport\b|\bweb\s*\.\s*(read|search)\b/.test(source || "");
+
       // context.signal: the run it serves stopped, and the frame goes with it.
-      async function code({ language, source, filename, timeout = 5 }, context = {}) {
+      async function code({ language, source, filename, timeout }, context = {}) {
         // A filename runs that file, from the workspace or the editor's files.
         if (filename) {
           try { source = await sandboxFiles("read", { path: filename }, context); }
@@ -2387,10 +2404,10 @@
             const d = e.data || {};
             if (d.type === "log") logs.push(String(d.msg));
             if (d.type === "done") cleanup();
-            if (d.type === "resources") {
-              const { id, command, args } = d;
+            if (d.type === "resources" || d.type === "web") {
+              const { id, command, method, args } = d;
               try {
-                const result = await sandboxFiles(command, args, context);
+                const result = d.type === "web" ? await webCall(method, args, { signal: context.signal }) : await sandboxFiles(command, args, context);
                 frame.contentWindow?.postMessage({ type: "resources_result", id, result }, "*");
               } catch (e) {
                 frame.contentWindow?.postMessage({ type: "resources_result", id, error: e.message }, "*");
@@ -2432,9 +2449,13 @@
         const _fetch = fetch;
         const proxyConfig = ${proxyConfigJson};
         const parentOrigin = ${parentOrigin};
+        const corsBlocked = ${JSON.stringify(CORS_BLOCKED)};
         window.fetch = async (url, opts = {}) => {
           try {
             const u = new URL(url, parentOrigin);
+            // No proxy: a site without CORS headers rejects with only "Failed to fetch"; this names the cause and the fix.
+            if (!proxyConfig?.endpoint && /^https?:$/.test(u.protocol) && u.origin !== parentOrigin && !isLocalHost(u.hostname))
+              return await _fetch(url, opts).catch(e => { throw e?.name === "TypeError" ? Object.assign(new TypeError("Failed to fetch " + u.href + ": " + corsBlocked), { proxied: true }) : Object.assign(e, { proxied: true }); });
             if (!proxyConfig?.endpoint || isLocalHost(u.hostname)) return _fetch(url, opts);
 
             const proxyUrl = proxyConfig.endpoint.replace(/\\/+$/, "") + "/" + u.href;
@@ -2459,6 +2480,16 @@
           parent.postMessage({ type: "resources", id, command, args }, "*");
         });
         window.resources = (${sandboxResources})(_resCall);
+        // read_url and web_search, run by the tab, answered on the same channel.
+        const _webCall = (method, args) => new Promise((resolve, reject) => {
+          const id = ++_resId;
+          _resPending.set(id, { resolve, reject });
+          parent.postMessage({ type: "web", id, method, args }, "*");
+        });
+        window.web = {
+          read: (url, { from = 0, render = false } = {}) => _webCall("read", { url: String(url), from, render }),
+          search: (query, { count, freshness } = {}) => _webCall("search", { query: String(query), count, freshness }),
+        };
         addEventListener("message", e => {
           if (e.data?.type === "resources_result") {
             const { id, result, error } = e.data;
@@ -2474,7 +2505,7 @@
           const jsDoc = `<!doctype html><meta charset=utf-8><scr` + `ipt>${bridge}</scr` + `ipt><scr` + `ipt>{const s=document.createElement("script");s.type="module";s.textContent=${module};document.head.append(s)}</scr` + `ipt>`;
           const htmlDoc = `<!doctype html><meta charset=utf-8><scr` + `ipt>${bridge}</scr` + `ipt>${source || ""}<scr` + `ipt async>addEventListener("load",()=>parent.postMessage({type:"done"},"*"));</scr` + `ipt>`;
 
-          const seconds = Math.min(Math.max(+timeout || 5, 0.05), 60);
+          const seconds = Math.min(Math.max(+timeout || (usesNetwork(source) ? 30 : 5), 0.05), 60);
           const kill = setTimeout(() => cleanup(true), seconds * 1000);
           frame.srcdoc = !language || ["js", "javascript"].includes(language) ? jsDoc : htmlDoc;
         });
@@ -3300,7 +3331,7 @@
           overlap, ownedTools, polishedTake, preflight, prepareMessages, processStreamChunk, providerOf, proxyFetch,
           reasoningFields, relayUrl, restoreVersion, runAgentWithBranching, runApp, runningSubagents, setSubagent,
           siblingFiles, silentReply, systemPrompt, task, think, toDocument, unadoptedVariants, untestedChange, viewFile,
-          watchedSend, webSearch, writeFile,
+          watchedSend, writeFile,
         } = await import("./engine.js");
         const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
         // Tests that reach third-party sites run only when asked (npm test -- --net adds net=1).
@@ -3846,6 +3877,104 @@
           if (!getProxyConfig()?.endpoint) return; // the rejection comes from the proxy
           const result = await code({ source: "try { await fetch('https://no-such-host.invalid/x.json'); console.log('resolved') } catch (e) { console.log(e.name + ': ' + e.message) }", timeout: 15 });
           assert(/^TypeError: Failed to fetch https:\/\/no-such-host\.invalid\/x\.json: \S/.test(result.logs?.[0]), "an unreachable host rejects with the reason: " + JSON.stringify(result.logs));
+        }
+
+        // Swaps the tab's proxy setting and fetch for a test, and puts both back. proxy: false is no proxy at all.
+        async function withNetwork({ proxy, brave, fetch: stub }, fn) {
+          const realFetch = globalThis.fetch, saved = localStorage.getItem(PROXY_CONFIG_KEY), key = localStorage.getItem("brave-config");
+          try {
+            if (proxy === false) localStorage.removeItem(PROXY_CONFIG_KEY);
+            else if (proxy) localStorage.setItem(PROXY_CONFIG_KEY, JSON.stringify({ endpoint: proxy }));
+            if (brave === false) localStorage.removeItem("brave-config");
+            else if (brave) localStorage.setItem("brave-config", JSON.stringify({ apiKey: brave }));
+            if (stub) globalThis.fetch = stub;
+            return await fn();
+          } finally {
+            globalThis.fetch = realFetch;
+            saved == null ? localStorage.removeItem(PROXY_CONFIG_KEY) : localStorage.setItem(PROXY_CONFIG_KEY, saved);
+            key == null ? localStorage.removeItem("brave-config") : localStorage.setItem("brave-config", key);
+          }
+        }
+
+        // Why: reading a page and computing from it took a read_url call, then a code call with the page pasted in
+        async function testCodeWeb() {
+          const asked = [];
+          const stub = async (url, options = {}) => {
+            asked.push(String(url));
+            if (/api\.search\.brave\.com/.test(url)) return new Response(JSON.stringify({ web: { results: [{ title: "Moon", url: "https://en.wikipedia.org/wiki/Moon", description: "Earth's satellite" }] } }), { headers: { "content-type": "application/json" } });
+            if (/missing/.test(url)) return new Response("gone", { status: 404, statusText: "Not Found", headers: { "content-type": "text/plain" } });
+            return new Response("radius 1737 km\nmass 7.35e22 kg", { headers: { "content-type": "text/plain" } });
+          };
+          const result = await withNetwork({ proxy: "http://localhost:1", brave: "k", fetch: stub }, () => code({ source: `
+            console.log(typeof web.read, typeof web.search);
+            const page = await web.read("https://example.com/moon.txt");
+            console.log(Number(page.match(/radius (\\d+) km/)[1]) * 2);
+            console.log(await web.search("moon", { count: 1 }));
+            try { await web.read("https://example.com/missing"); } catch (e) { console.log("threw " + e.message); }
+          ` }));
+          const logs = result.logs ?? [];
+          assert(logs[0] === "function function", `web.read and web.search are there: ${JSON.stringify(result)}`);
+          assert(logs[1] === "3474", `web.read returns read_url's text, and code computes from it: ${JSON.stringify(logs)}`);
+          assert(logs[2]?.startsWith("1. Moon\n   https://en.wikipedia.org/wiki/Moon"), `web.search returns web_search's text: ${JSON.stringify(logs)}`);
+          assert(logs[3] === "threw https://example.com/missing answered 404 Not Found.", `a failed read throws read_url's error: ${JSON.stringify(logs)}`);
+          assert(asked.some(u => u.endsWith("/https://example.com/moon.txt")) && asked.some(u => u.includes("api.search.brave.com")), `the tab did the reading: ${asked}`);
+
+          const keyless = await withNetwork({ brave: false, fetch: stub }, () => code({ source: `try { await web.search("x") } catch (e) { console.log(e.message) }` }));
+          assert(keyless.logs?.[0] === "web.search needs a Brave Search key: add one in Settings (the gear button).", `without a key, web.search says what it needs: ${JSON.stringify(keyless)}`);
+          const unproxied = await withNetwork({ proxy: false, brave: "k", fetch: stub }, () => getProxyConfig()?.endpoint ? null : code({ source: `try { await web.search("x") } catch (e) { console.log(e.message) }` }));
+          assert(!unproxied || unproxied.logs?.[0] === "web.search can't reach Brave Search, which sends no CORS headers: " + CORS_BLOCKED, `without a proxy, web.search says why: ${JSON.stringify(unproxied)}`);
+          assert(usesNetwork("await fetch(u)") && usesNetwork("const m = await import(u)") && usesNetwork("await web.read(u)") && !usesNetwork("console.log(1 + 1)"), "network code is told from computing");
+        }
+
+        // Why: without a proxy, every fetch to a site without CORS headers failed as "Failed to fetch", naming no cause
+        async function testCorsBlocked() {
+          const sent = [];
+          const refuse = async (url, options = {}) => { sent.push(new Headers(options.headers)); throw new TypeError("Failed to fetch"); };
+          await withNetwork({ proxy: false, brave: "k", fetch: refuse }, async () => {
+            if (getProxyConfig()?.endpoint) return console.log("SKIP: testCorsBlocked (a proxy was detected at " + LOCAL_PROXY + ")");
+            const read = await readUrl({ url: "https://example.com/x" });
+            assert(read.error === "Failed to fetch https://example.com/x: " + CORS_BLOCKED, `read_url names the cause and the fix: ${JSON.stringify(read)}`);
+            assert(CORS_BLOCKED === "blocked by CORS: no local proxy. Use a CORS-open source, or run `npm run start:proxy`.", CORS_BLOCKED);
+            assert(sent[0].get("accept") && !sent[0].has("upgrade-insecure-requests"), "sent directly, it asks nothing that needs a preflight");
+            const search = await webSearch({ query: "x" });
+            assert(search.error === "Failed to fetch " + "https://api.search.brave.com/res/v1/web/search?q=x&count=10&extra_snippets=true: " + CORS_BLOCKED, `web_search names it too: ${JSON.stringify(search)}`);
+            const local = await proxyFetch("http://localhost:1/x").then(() => "resolved", e => e.message);
+            assert(local === "Failed to fetch", `this machine is not a CORS failure: ${local}`);
+            const frame = await code({ source: "try { await fetch('https://no-such-host.invalid/x.json'); console.log('resolved') } catch (e) { console.log(e.name + ': ' + e.message) }", timeout: 15 });
+            assert(frame.logs?.[0] === "TypeError: Failed to fetch https://no-such-host.invalid/x.json: " + CORS_BLOCKED, `code's fetch names it: ${JSON.stringify(frame)}`);
+          });
+        }
+
+        // Why: the prompt said "fetch() works (proxied for CORS)" on the published site, where it mostly didn't
+        async function testNetworkWording() {
+          await withNetwork({ proxy: "http://localhost:8001" }, async () => {
+            const prompt = systemPrompt("P", { tools: ["code"] });
+            assert(prompt.includes("- fetch() reaches any URL: requests to other sites go through the local CORS proxy") && !prompt.includes("blocked by CORS"), "with a proxy, any URL");
+            assert(prompt.includes("## Network") && !prompt.includes("{fetch}") && !prompt.includes("proxied for CORS"), "the relay is documented, and the line filled");
+          });
+          await withNetwork({ proxy: false }, async () => {
+            if (getProxyConfig()?.endpoint) return console.log("SKIP: testNetworkWording without a proxy (one was detected at " + LOCAL_PROXY + ")");
+            const prompt = systemPrompt("P", { tools: ["code"] });
+            assert(!prompt.includes("reaches any URL") && !prompt.includes("## Network"), "without a proxy, neither any URL nor the relay");
+            for (const host of ["cdn.jsdelivr.net", "data.jsdelivr.com", "raw.githubusercontent.com", "api.github.com", "registry.npmjs.org", "api.npmjs.org", "origin=*", "npm run start:proxy", '"blocked by CORS"'])
+              assert(prompt.includes(host), `without a proxy, the prompt names ${host}`);
+          });
+        }
+
+        // Why: web_search was offered with a key but no proxy, where every search failed on CORS
+        async function testWebToolNames() {
+          await withNetwork({ proxy: "http://localhost:8001", brave: false }, async () => {
+            assert(eq(webToolNames(), ["read_url"]), `no key, no search: ${webToolNames()}`);
+          });
+          await withNetwork({ proxy: "http://localhost:8001", brave: "k" }, async () => {
+            assert(eq(webToolNames(), ["read_url", "web_search"]), `a key and a proxy: ${webToolNames()}`);
+            assert(systemPrompt("P", { tools: ["code", ...webToolNames()] }).includes("In code, await web.search(query"), "web.search is documented with web_search");
+          });
+          await withNetwork({ proxy: false, brave: "k" }, async () => {
+            if (getProxyConfig()?.endpoint) return;
+            assert(eq(webToolNames(), ["read_url"]), `a key but no proxy: Brave can't be reached: ${webToolNames()}`);
+            assert(!systemPrompt("P", { tools: ["code", ...webToolNames()] }).includes("web.search"), "no web.search docs without web_search");
+          });
         }
 
         async function testCodeHTML() {
@@ -5892,6 +6021,10 @@ if (window.__HARNESS__?.test) (async () => {
           testCodeConsoleCapture,
           testCodeScriptTagInString,
           testCodeUnreachableHost,
+          testCodeWeb,
+          testCorsBlocked,
+          testNetworkWording,
+          testWebToolNames,
           testCodeHTML,
           testCodeTimeout,
 

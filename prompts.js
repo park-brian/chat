@@ -12,6 +12,13 @@ Execute JavaScript or HTML. Supports top-level await for async operations.
 - Run HTML: { "source": "<h1>Hello</h1>", "language": "html" }
 
 console.log prints any value as devtools shows it: objects, arrays, Maps, Sets, Errors with their stacks.
+A run stops after 5 seconds, or 30 when the source uses fetch, import or web; timeout sets it, up to 60.
+
+\`web\` gives code what read_url returns, so one call can fetch, read and compute. It throws on failure, with the reason.
+- await web.read(url, { from }) - the page, PDF or document as markdown text, in parts of 40000 characters; from starts a later part
+- Example: const { tags } = await (await fetch("https://data.jsdelivr.com/v1/packages/npm/marked")).json();
+  const readme = await web.read(\`https://cdn.jsdelivr.net/npm/marked@\${tags.latest}/README.md\`);
+  console.log(tags.latest, readme.split("\\n").filter(line => line.startsWith("#")).length, "headings");
 
 \`resources\` reads and writes files: the workspace's (read-only here; change them with edit_file) and the editor's.
 Every call throws on failure, with the reason and the files that do exist.
@@ -24,6 +31,7 @@ Every call throws on failure, with the reason and the files that do exist.
 ### web_search
 Search the web. Each result has its URL, its age, and snippets from the page, often enough to answer: cite the URL.
 Search for what you don't know or what may have changed since you learned it: versions, releases, docs, news.
+In code, await web.search(query, { count, freshness }) returns the same text.
 
 ### read_url
 A URL as markdown: a page's main text with its links, a PDF's text page by page, a Word document, JSON or text as
@@ -231,7 +239,7 @@ build step: the web platform is the machine.
 Code runs in a browser sandbox (the code tool, and every artifact):
 - CDN imports: import { x } from 'https://cdn.jsdelivr.net/npm/pkg@version/+esm'
 - Top-level await supported
-- fetch() works (proxied for CORS)
+{fetch}
 - resources.read/list/write/replace/delete/rename for files, the workspace's included
 
 Secrets: Store at path, read as plain text (keeps values out of visible code):
@@ -254,6 +262,15 @@ Pin the version you read. "Not a function", "not a constructor", "is not defined
 means the draft was wrong: read the source, don't guess again. In code, Object.keys(await import(url)) lists what
 a module really exports.
 `;
+
+// ENVIRONMENT's {fetch} line: what fetch() and read_url reach, with the local CORS proxy and without it.
+export const FETCH_PROXIED = `- fetch() reaches any URL: requests to other sites go through the local CORS proxy, as read_url's do`;
+// Each host listed answered with Access-Control-Allow-Origin: * (checked 2026-10-12).
+export const FETCH_DIRECT = `- fetch() reaches only sites that allow cross-origin requests, because no local CORS proxy is running. These
+  do: cdn.jsdelivr.net, data.jsdelivr.com, raw.githubusercontent.com, api.github.com, registry.npmjs.org,
+  api.npmjs.org, and Wikipedia's API (https://en.wikipedia.org/w/api.php with origin=*, and /api/rest_v1/).
+  read_url has the same limit. Other sites fail with "blocked by CORS"; the user can run \`npm run start:proxy\` to
+  reach them`;
 
 export const WORKING = `
 ## Working
@@ -377,7 +394,6 @@ part does, what it exposes, and what the contract lacks that you needed.`;
 // The proxy's relay, for an agent whose fetch goes through one.
 export const NETWORK = `
 ## Network
-fetch() in code and artifacts goes through a CORS proxy, so any URL is readable. Use it to read documentation and APIs before guessing.
 TCP services are reachable through the relay at {relay} with tcpipe clients (redis, postgres, mysql, mongodb, ssh, smtp, pop3, dns, telnet):
   const { RedisClient } = await import("{tcpipe}/clients/redis.js");
   const redis = new RedisClient("{relay}"); await redis.connect(6379, "localhost");
