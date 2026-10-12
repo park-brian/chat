@@ -1299,3 +1299,16 @@ with the proxy, so the no-proxy half of this isn't measured here; it is the publ
   pass when the tool output shows the count; regraded, research round 2 is about 0.99.
 - No regressions elsewhere. Accepted for the product side; the code-tool helper needs a reason to be used (long
   pages read in code to keep context small), which the context round gives it.
+
+## Round 3 (3a0f703): context budget (256k default, Haiku 100k) and a plan-file reminder
+
+answer-hard 0.89 (0.89), research 0.98 (0.96), swe 0.97 (0.96), answer 0.98, inner 1.00. Haiku 5.5 ×3.
+
+- **The plan file took.** hard-ssg-report wrote PLAN.md in 3 of 3 (0 of 3 before), after the reminder at the 8th call.
+- **Context stays bounded.** The long report's requests stay at 30-60k and drop when a summary runs (one run peaked
+  at 121k when a batch of parallel page reads landed before the next summary). Before: 280k and growing.
+- **Summaries lost the sources.** Two of three reports came out with no links at all: the summary dropped the
+  URLs with the tool results, and neither SUMMARY_PROMPT nor the reminder says to keep them. Next: both say to
+  keep each source's URL with what it established.
+- **Cost per run rose** on swe (about 51-60k to 52-72k token-equivalents) and the long report (419k to 541k):
+  summaries break the cache prefix, and plan files add writes. Accepted: the budget is a product requirement.

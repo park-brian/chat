@@ -887,7 +887,7 @@ function unplannedTask(messages, start, files, shown = null) {
   if (calls < PLAN_AFTER) return null;
   const folder = shown?.includes("/") ? shown.slice(0, shown.lastIndexOf("/") + 1) : "";
   if (files.some(p => PLAN_FILES.some(name => p === name || p === folder + name))) return null;
-  return "This task is long. Write PLAN.md now with write_file (SPEC.md if you are building an app): the goal in the user's words, the steps with the check for each, what is done, what you learned. Then continue.";
+  return "This task is long. Write PLAN.md now with write_file (SPEC.md if you are building an app): the goal in the user's words, the steps with the check for each, what is done, and what you learned with the URL or file it came from. Then continue.";
 }
 
 // The note for a reply that ended in thought alone, with no text and no call, or null.

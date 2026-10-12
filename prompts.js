@@ -352,7 +352,7 @@ artifact, a rewrite, a change many steps long), send it to a review sub-agent wi
 what it finds that matters. One review per piece of work: check your fixes yourself, with tests.
 `;
 
-export const SUMMARY_PROMPT = `Older messages are about to be dropped from your context. Write the summary you will continue from: the user's goals and preferences in their words, decisions and why, what is done, what is in progress, what is next, with file paths and versions. Keep exact names, numbers, and error text, and every correction the user made. An earlier <summary> is part of what you are summarizing: keep what is still true. Skip file contents; the workspace block carries them. Reply with the summary only, under 400 words, no tools.`;
+export const SUMMARY_PROMPT = `Older messages are about to be dropped from your context. Write the summary you will continue from: the user's goals and preferences in their words, decisions and why, what is done, what is in progress, what is next, with file paths and versions. Keep exact names, numbers, and error text, every correction the user made, and the URL of each source with what it established. An earlier <summary> is part of what you are summarizing: keep what is still true. Skip file contents; the workspace block carries them. Reply with the summary only, under 400 words, no tools.`;
 
 // A fork is the caller, continued, to answer one question.
 export const FORK_BRIEF = `You are a fork: this conversation, continued, to answer one question while the caller waits. You have seen
