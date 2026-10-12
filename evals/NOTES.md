@@ -1248,3 +1248,15 @@ These separate. Every miss below is one the prompt doesn't address today:
 - **Length**: the false-premise correction came with a code walkthrough in 3 of 3.
 
 Runs: research 2026-10-12 (×3, 21 jobs), answer-hard (×3, 21 jobs), prompt as of 0efcae4.
+
+## Hard tiers, baseline B (2026-10-12): swe 0.95, research 0.88, answer-hard 0.86 (Haiku 5.5 ×3)
+
+Same prompt as the first harder-tier baseline (0efcae4); the judge now sees each tool call's result. This is the
+baseline the prompt rounds compare against.
+
+- **swe: every bug fixed.** Hidden tests pass in all 21 runs. Points go to plain writing (5 runs), test counts
+  claimed without a report showing them (3: "17 passed", "21 passed", "16 passed"), and klona fixes over the diff
+  budget (20 and 22 lines against 12).
+- **research and answer-hard** fail as in the first baseline: sources not named, no plan file before the long
+  report, values computed in the head (arxiv 0.64), questions instead of stated assumptions (graphql 0.74),
+  headings and undefined terms for a non-engineer audience, added facts in the decision record.

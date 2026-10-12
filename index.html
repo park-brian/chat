@@ -5287,7 +5287,7 @@ if (window.__HARNESS__?.test) (async () => {
           assert(!plain.includes("## Artifacts"), "no artifact docs without artifact tools");
           const seeded = (await db.get("agents", 1)).systemPrompt;
           assert(!seeded.includes("### code") && !seeded.includes("## Code Environment"), "the seeded prompt no longer carries tool docs");
-          assert(seeded.includes("surgical economy") && seeded.includes("## Memory Protocol"), "the persona is intact");
+          assert(seeded.includes("Answer the person directly.") && seeded.includes("## Memory Protocol"), "the persona is intact");
         }
 
         // Why: memories arrive in the prompt, so the agent reads them when it needs them instead of before every conversation
