@@ -65,7 +65,8 @@ export async function startServer(port = 8000, directory = process.cwd()) {
     const segments = pathname.split(/[\\/]+/).filter(Boolean);
     if (
       segments.some(
-        (segment) => segment.startsWith(".") || segment === "node_modules",
+        (segment) =>
+          segment.startsWith(".") || segment.toLowerCase() === "node_modules",
       )
     ) {
       sendText(response, 404, "Not Found\n");
@@ -127,7 +128,7 @@ export async function startServer(port = 8000, directory = process.cwd()) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const port = process.argv[2] ? Number(process.argv[2]) : 8000;
+  const port = Number(process.argv[2] || process.env.PORT || 8000);
   if (!Number.isInteger(port) || port < 0 || port > 65535)
     throw new Error("Invalid port");
   const server = await startServer(port);
