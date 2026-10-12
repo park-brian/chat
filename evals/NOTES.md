@@ -1260,3 +1260,28 @@ baseline the prompt rounds compare against.
 - **research and answer-hard** fail as in the first baseline: sources not named, no plan file before the long
   report, values computed in the head (arxiv 0.64), questions instead of stated assumptions (graphql 0.74),
   headings and undefined terms for a non-engineer audience, added facts in the decision record.
+
+## Prompt round 1 (5d81348): research 0.98 (0.88), answer-hard 0.89 (0.86), swe 0.96 (0.95), answer 0.98 (0.97), inner 1.00 (0.97)
+
+The persona and WORKING rewritten literally (docs/specs/2026-10-12-prompt-round-1.md): lead with the answer at the
+length asked for, name sources, compute with code, verify and cite, report only test results a tool returned,
+plan files for long tasks, state assumptions and continue, write for the reader named, use only given facts.
+Haiku 5.5 ×3 on each hard tier and the answer set, inner ×1, against baseline B.
+
+- **Computing with code took.** research-arxiv-llama2 0.64 → 0.97 and research-lodash-functions 0.85 → 1.00: both
+  now run code for the count and the interval. preact-files and seattle-rain went to 1.00 with sources named.
+- **Assumptions over questions, partly.** hard-graphql-plan 0.74 → 0.85; "states its assumptions" still fails in
+  all three runs, which now ask fewer questions but still don't say what they assume.
+- **Writing for the reader, partly.** hard-explain-caching 0.81 → 0.93; two runs still used headings.
+- **The plan file did not take.** hard-ssg-report wrote no PLAN.md in 3 of 3. Its reasoning names the task as long
+  research, then it starts 4 parallel lookups and writes only report.md, 30-36 calls later. One rule in a long
+  WORKING section isn't enough; the harness should prompt for it (next: a reminder after ~8 calls with no plan
+  file, like the existing silent/failing/untested reminders).
+- **Decision record 0.89 → 0.78 is mostly the rubric.** All three chose PostgreSQL for the right reasons. Following
+  "say what is missing", two marked the record "Proposed, confirm before filing", which fails "makes one decision";
+  all three added general facts (read replicas and their lag), which fails "no fact beyond the list". The one
+  invented number is a computed launch date. The rubric should allow standard engineering consequences and
+  separate "decides" from "asks to confirm" before the next round.
+- **swe** fixes all bugs again; the misses moved to diff size (klona 16-40 lines against 12, mitt 14 against 8)
+  and two claimed test counts not in a report.
+- Single-turn answers are unchanged (0.97 → 0.98); inner builds didn't regress (1.00).
