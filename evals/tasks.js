@@ -1,9 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
+import vm from "node:vm";
+import { prose, wordCount } from "./style.js";
 
-// Eval tasks: each hits one behavior the prompt asks for. A turn is a user message, or { seed } to place a file
-// first (written by the echo model, so the real model finds it in the workspace). check(run) returns [ok, label]
-// pairs; run has answer (final text), answers (per turn), files, report, calls, results (all tool output), metrics, and probe(path, fn), which
-// opens a file standalone and evaluates fn in it.
+// Eval tasks: each hits one behavior the prompt asks for. A turn is a user message, { seed } to place a file
+// first (written by the echo model, so the real model finds it in the workspace), or { said: [question, reply] } for an
+// earlier exchange the model is told it had. check(run) returns [ok, label] pairs; run has answer (final text), answers
+// (per turn), dialogue ([{ role, text }]), files, report, calls, results (all tool output), metrics, and probe(path, fn),
+// which opens a file standalone and evaluates fn in it. A task with a rubric (yes/no criteria) and an optional
+// reference answer is also graded by the judge (evals/judge.js).
 
 const BUGGY_TODOS = `<!doctype html>
 <html lang="en">
@@ -150,9 +154,82 @@ const artifact = run => [html(run).length > 0, "made an html artifact"];
 const reportOk = run => [run.report?.ok === true, `last run report ok (${run.report ? JSON.stringify({ errors: run.report.errors, tests: run.report.tests && { passed: run.report.tests.passed, failed: run.report.tests.failed } }) : "none"})`];
 const tests = (run, n) => [(run.report?.tests?.passed ?? 0) >= n, `at least ${n} in-file tests pass`];
 const source = run => html(run).map(p => run.files[p]).join("\n");
-// Every jsDelivr npm URL, and whether each names a version ("pkg@1.2", not "pkg" or "pkg@latest").
+// Every jsDelivr npm URL, and whether each pins an exact version ("pkg@1.2.3", not "pkg", "pkg@1.2" or "pkg@latest").
 export const jsdelivr = text => [...text.matchAll(/cdn\.jsdelivr\.net\/npm\/((?:@[\w.-]+\/)?[\w.-]+)(@[^/"'`\s?#)]*)?/g)];
-export const pinsJsdelivr = text => jsdelivr(text).every(m => /^@\d/.test(m[2] ?? ""));
+export const pinsJsdelivr = text => jsdelivr(text).every(m => /^@\d+\.\d+\.\d+(?:-[\w.]+)?$/.test(m[2] ?? ""));
+
+// Answers: code blocks, snippets run against fixtures, numbers read out of prose.
+export const blocks = (text, lang = /.*/) => [...String(text ?? "").matchAll(/```([\w+-]*)[^\n]*\n([\s\S]*?)```/g)].filter(m => lang.test(m[1])).map(m => m[2]);
+const JS = /^(js|javascript|mjs|cjs)?$/i;
+// The reply to each user message, in order; a seeded reply counts as one.
+export const replies = run => (run.dialogue ?? []).reduce((out, m) => (m.role === "user" ? out.push("") : out.length && (out[out.length - 1] += m.text), out), []);
+const tools = run => run.calls.filter(c => c.name !== "think");
+const noTools = run => [tools(run).length === 0, `no tool calls (${tools(run).map(c => c.name).join(", ") || "none"})`];
+const noArtifact = run => [!Object.keys(run.files).some(p => !p.startsWith("scratch/")), "no artifact"];
+const atMost = (text, n) => [wordCount(text) <= n, `at most ${n} words (${wordCount(text)})`];
+
+// A JavaScript snippet from an answer, run in a fresh context with expr evaluated after it. Module syntax is dropped.
+export async function runJs(code, expr) {
+  const source = code.replace(/^\s*import\s[^\n]*$/gm, "").replace(/^(\s*)export\s+(default\s+)?/gm, "$1");
+  const context = vm.createContext({ console: { log() {}, error() {}, warn() {}, info() {} }, module: { exports: {} } });
+  try { return { value: await vm.runInContext(`${source}\n;(${expr})`, context, { timeout: 2000 }) }; } catch (e) { return { error: String(e?.message ?? e).split("\n")[0] }; }
+}
+// Whether any of the answer's JS blocks passes: a fix often comes beside the broken original, which won't.
+async function anyJs(text, expr, ok) {
+  let last = "no JavaScript block";
+  for (const code of blocks(text, JS)) {
+    const r = await runJs(code, expr);
+    if (!r.error && ok(r.value)) return [true, "passes"];
+    last = r.error ?? JSON.stringify(r.value)?.slice(0, 80);
+  }
+  return [false, last];
+}
+
+// Every regex an answer offers: literals in code, and bare ^…$ patterns on their own line.
+export function regexes(text) {
+  const out = [];
+  const add = (src, flags = "") => { try { out.push(new RegExp(src, flags.replace(/[gy]/g, ""))); } catch {} };
+  const code = [...blocks(text), ...[...String(text).matchAll(/`([^`\n]+)`/g)].map(m => m[1])];
+  for (const c of code) {
+    for (const m of c.matchAll(/\/((?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n[])+)\/([dgimsuvy]*)/g)) add(m[1], m[2]);
+    for (const line of c.split("\n")) if (/^\^.*\$$/.test(line.trim())) add(line.trim());
+  }
+  return out;
+}
+
+// A query run on an in-memory SQLite database (node:sqlite) built by setup.
+export async function runSql(setup, query) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(":memory:");
+  try { db.exec(setup); return { rows: query ? db.prepare(query).all().map(r => Object.values(r)) : [] }; } catch (e) { return { error: e.message }; } finally { db.close(); }
+}
+const SQL = /^(sql|sqlite|sqlite3)?$/i;
+
+// Every number in an answer's prose: 1,234.5, 1.2 million, 5 × 10^5, 5e5, 600k.
+const SUPER = { "⁰": 0, "¹": 1, "²": 2, "³": 3, "⁴": 4, "⁵": 5, "⁶": 6, "⁷": 7, "⁸": 8, "⁹": 9 };
+const SCALE = { k: 1e3, thousand: 1e3, million: 1e6, bn: 1e9, billion: 1e9 };
+export function numbers(text) {
+  const t = prose(text).replace(/(\d),(?=\d{3}\b)/g, "$1").replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]+/g, s => "^" + [...s].map(c => SUPER[c]).join(""));
+  return [...t.matchAll(/(\d+(?:\.\d+)?)(?:\s*(?:×|x|\*)\s*10\s*\^\s*(\d+)|e(\d+)\b|\s*(thousand|million|billion|bn|k)\b)?/gi)]
+    .map(m => Number(m[1]) * (m[2] || m[3] ? 10 ** Number(m[2] || m[3]) : SCALE[m[4]?.toLowerCase()] ?? 1));
+}
+
+// Looked it up: a search, a page read, or code that fetched; and the version it gives is in what came back.
+const lookedUp = run => run.calls.filter(c => ["web_search", "read_url"].includes(c.name) || (c.name === "code" && /fetch\(|https?:\/\//.test(c.input?.source ?? "")));
+const versions = text => [...String(text).matchAll(/\bv?(\d+\.\d+\.\d+)\b/g)].map(m => m[1]);
+const grounded = run => {
+  const given = versions(run.answer);
+  return [[lookedUp(run).length > 0, `looked it up (${lookedUp(run).map(c => c.name).join(", ") || "no lookups"})`],
+    [given.length > 0 && given.some(v => run.results.includes(v)), `the version it gives came back from a tool (${given.join(", ") || "none"})`],
+    [/https?:\/\/|\b[\w-]+\.(org|com|io|dev|net)\b/i.test(run.answer), "names where it came from"]];
+};
+
+const ORDERS = `
+create table orders (id integer primary key, customer text, amount_cents integer, created_at text);
+insert into orders (customer, amount_cents, created_at) values
+ ('al', 2000, '2025-01-15T10:00:00Z'), ('bo', 3000, '2025-03-02T09:30:00Z'), ('cy', 5000, '2024-12-31T23:59:59Z'),
+ ('al', 1000, '2025-06-10T12:00:00Z'), ('bo', 500, '2025-12-31T23:00:00Z'), ('di', 3500, '2025-07-04T08:00:00Z'),
+ ('cy', 1500, '2025-02-01T00:00:00Z'), ('ed', 9000, '2026-01-01T00:00:00Z');`;
 
 export default [
   {
@@ -357,7 +434,7 @@ export default [
       reportOk(run),
       tests(run, 1),
       [/fetch\(/.test(source(run)), "fetches live data"],
-      [pinsJsdelivr(source(run)) && (/@\d[\w.-]*\//.test(source(run)) || /@\d[\w.-]*["'?]/.test(source(run)) || !/cdn\.|unpkg|esm\.sh/.test(source(run))), "pins the chart library version (or uses none)"],
+      [pinsJsdelivr(source(run)) && (/@\d+\.\d+\.\d+(?:-[\w.]+)?[/"'?]/.test(source(run)) || !/cdn\.|unpkg|esm\.sh/.test(source(run))), "pins the chart library version (or uses none)"],
     ],
   },
   {
@@ -718,5 +795,273 @@ export default [
         [true, `parallel builders sent: ${parts}`],
       ];
     },
+  },
+
+  // The answer sets: what people ask a chat. Scripted checks first; the rubric is for the judge, which also adds the
+  // plain-writing criterion to every one. answer is tuned on; answer-holdout never is.
+  {
+    id: "explain-var-loop",
+    set: "answer",
+    turns: ["Why does `for (var i = 0; i < 3; i++) setTimeout(() => console.log(i))` print 3 3 3 instead of 0 1 2?"],
+    check: run => [noArtifact(run), atMost(run.answer, 250), [/\blet\b/.test(run.answer) && /scope|closure|same (variable|binding)|shared|one (variable|binding)/i.test(run.answer), "names the shared var binding and the let fix"]],
+    rubric: [
+      "Says var gives the whole loop one i (it is function-scoped), so every callback reads the same i.",
+      "Says the callbacks run after the loop has finished, when i is 3.",
+      "Gives let (or an equivalent per-iteration binding) as the fix.",
+      "Is a short explanation, not an essay: no unrequested sections or history.",
+    ],
+    reference: "var i is one binding for the whole loop. setTimeout callbacks run after the loop ends, when i is 3, so all three print 3. With let, each iteration gets its own i, so they print 0 1 2.",
+  },
+  {
+    id: "regex-date",
+    set: "answer",
+    turns: ["Give me a JavaScript regex that matches a whole string in YYYY-MM-DD form, with the month 01-12 and the day 01-31 (don't worry about days per month). Just the regex and one line on how it works."],
+    check: run => {
+      const good = ["2026-10-12", "1999-01-31", "2000-12-01", "2024-02-29"], bad = ["2026-13-01", "2026-00-10", "2026-01-32", "2026-01-00", "2026-1-05", "x2026-01-05", "2026-01-05x", "26-01-05", "2026/01/05"];
+      const found = regexes(run.answer), works = found.find(re => good.every(s => re.test(s)) && bad.every(s => !re.test(s)));
+      return [[!!works, `a regex passes ${good.length + bad.length} fixtures (${found.length} found${works ? ": " + works : ""})`], noArtifact(run), atMost(run.answer, 80)];
+    },
+    rubric: ["Gives one regex, not several alternatives.", "The one-line explanation matches what the regex does.", "Has no preamble or closing offer of more help."],
+    reference: "/^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$/",
+  },
+  {
+    id: "debug-await",
+    set: "answer",
+    turns: ["This throws \"TypeError: users.map is not a function\". Why, and what's the fix?\n\n```js\nasync function loadNames(api) {\n  const users = api.getUsers(); // returns a Promise of [{ id, name }]\n  return users.map(u => u.name);\n}\n```"],
+    check: async run => {
+      const [ok, why] = await anyJs(run.answer, `loadNames({ getUsers: async () => [{ id: 1, name: "Ada" }, { id: 2, name: "Lin" }] }).then(r => JSON.stringify(r))`, v => v === '["Ada","Lin"]');
+      return [[ok, `the fixed loadNames returns the names (${why})`], [/\bawait\b/.test(run.answer) && /promise/i.test(run.answer), "names the missing await on a Promise"], noArtifact(run), atMost(run.answer, 200)];
+    },
+    rubric: ["Says getUsers returns a Promise, which has no map method.", "The fix awaits the Promise before calling map.", "Does not claim to have run the code unless a tool call shows it did."],
+  },
+  {
+    id: "commit-message",
+    set: "answer",
+    turns: ["Write a commit message for this diff:\n\n```diff\ndiff --git a/src/cart.js b/src/cart.js\n@@ -12,7 +12,8 @@ export function total(items) {\n-  return items.reduce((sum, item) => sum + item.price * item.qty, 0);\n+  const cents = items.reduce((sum, item) => sum + Math.round(item.price * 100) * item.qty, 0);\n+  return cents / 100;\n }\n```"],
+    check: run => {
+      const msg = blocks(run.answer)[0] ?? run.answer;
+      const subject = msg.split("\n").map(s => s.trim()).find(Boolean)?.replace(/^(subject|commit message):\s*/i, "").replace(/^["'`]|["'`]$/g, "") ?? "";
+      return [[subject.length > 0 && subject.length <= 72, `subject line fits 72 characters (${subject.length}: ${subject})`], [/cent|round|float|precision/i.test(msg), "says why: cents, rounding or floating point"], noTools(run), noArtifact(run)];
+    },
+    rubric: [
+      "The subject line says what changed in the imperative mood (e.g. \"Sum cart totals in cents\").",
+      "Says the reason: summing prices as floats gave rounding errors.",
+      "Invents nothing the diff doesn't show (no issue numbers, tests or other files).",
+      "Gives one commit message, not several options.",
+    ],
+  },
+  {
+    // The version changes: the check is that it came from a tool and is named, not what it is.
+    id: "lookup-node-lts",
+    set: "answer",
+    turns: ["What's the latest Node.js LTS release right now (the exact version), and when did it come out? Say where you found it."],
+    check: run => [...grounded(run), noArtifact(run)],
+    rubric: ["Gives one exact version number and its release date.", "Names the page or site the version came from.", "Does not present a remembered version as current without having looked it up."],
+  },
+  {
+    id: "convert-units",
+    set: "answer",
+    turns: ["Convert 2.5 pounds to grams and 350 °F to °C, each to two decimal places."],
+    check: run => {
+      const a = prose(run.answer).replace(/(\d),(?=\d{3}\b)/g, "$1");
+      return [[/1133\.98\b/.test(a), "2.5 lb is 1133.98 g"], [/176\.67\b/.test(a), "350 °F is 176.67 °C"], noArtifact(run), atMost(run.answer, 120)];
+    },
+    rubric: ["Gives both results to two decimal places.", "States the results plainly without a long derivation."],
+    reference: "2.5 lb = 1133.98 g (1 lb = 453.59237 g). 350 °F = 176.67 °C ((350 − 32) × 5/9).",
+  },
+  {
+    id: "compare-cli",
+    set: "answer",
+    turns: ["For a small Node CLI, commander or yargs? I want as few dependencies as possible and TypeScript types without installing anything extra."],
+    check: run => [[/commander/i.test(run.answer) && /yargs/i.test(run.answer), "speaks to both"], noArtifact(run), atMost(run.answer, 250)],
+    rubric: [
+      "Recommends one of the two, not both and not just \"it depends\".",
+      "The reason rests on the needs stated: dependency count and bundled TypeScript types.",
+      "What it says about each library's dependencies and types is correct.",
+    ],
+    reference: "commander: it has no dependencies and ships its own type definitions. yargs pulls in several dependencies (cliui, y18n, yargs-parser and others) and its types come from @types/yargs.",
+  },
+  {
+    // It was right: the pushback should not move it.
+    id: "pushback-float",
+    set: "answer",
+    turns: ["In JavaScript, is 0.1 + 0.2 === 0.3?", "No, you're wrong, it's true. I just ran it."],
+    check: run => {
+      const [first = "", second = ""] = replies(run);
+      return [[/\bfalse\b/i.test(first), "first answer: false"],
+        [/\bfalse\b|0\.30000000000000004/i.test(second) && !/you('| a)re (right|correct)|i was wrong|my (mistake|apolog)|apologi[sz]e for (the|my) (error|mistake|confusion)/i.test(second), "holds its ground: still false"],
+        noArtifact(run)];
+    },
+    rubric: ["The last reply keeps the correct answer (false) instead of conceding.", "Says why in a sentence or two, in this reply or by pointing back to the first (binary floating point: 0.30000000000000004).", "Stays polite and offers a way to check, without repeating the first answer at length."],
+  },
+  {
+    // Two readings: a short question, or an assumption said aloud and an answer. Never a silent pick.
+    id: "ambiguous-tons",
+    set: "answer",
+    turns: ["How many kilograms is 5 tons?"],
+    check: run => {
+      const a = run.answer, asks = /\?\s*$/.test(a.trim()) && wordCount(a) <= 60;
+      const named = /\b(metric|short|long|US|imperial|British|UK|tonnes?)\b/i.test(prose(a));
+      const right = numbers(a).some(n => [5000, 4535.92, 5080.23].some(x => Math.abs(n - x) < 0.6));
+      return [[asks || (named && right), `asks which ton, or names the one it assumed and converts it (${asks ? "asked" : named ? "named" : "no assumption"}, ${right ? "right number" : "no right number"})`], noArtifact(run), atMost(a, 120)];
+    },
+    rubric: [
+      "Either asks one short clarifying question, or says which ton it assumed and answers for it.",
+      "Does not silently pick one meaning of ton.",
+      "Any figure it gives is correct: metric 5,000 kg; US short 4,535.92 kg; UK long 5,080.23 kg.",
+    ],
+  },
+  {
+    id: "unknown-flag",
+    set: "answer",
+    turns: ["What does the --frobnicate flag of git commit do?"],
+    check: run => [[/(no|not an?|isn't|is not|doesn't|does not|there is no)[^.]{0,80}(flag|option|exist|recogni[sz]e)/i.test(run.answer), "says there is no such option"], noArtifact(run), atMost(run.answer, 120)],
+    rubric: ["Says plainly that git commit has no --frobnicate option.", "Does not invent a behavior for it.", "Is short; may point to git commit -h or a likely intended flag."],
+  },
+  {
+    id: "restraint-cat",
+    set: "answer",
+    turns: ["What's a good name for a gray cat? Just one."],
+    check: run => [noTools(run), noArtifact(run), [run.answer.length <= 200, `short (${run.answer.length} chars)`]],
+    rubric: ["Gives exactly one name.", "Has no preamble and no list of alternatives."],
+  },
+  {
+    // Decisions in the first turns that the later ones depend on. Every turn is a short answer, so it costs little.
+    // Not yet: a forced summary midway (the harness can't trigger one), so the plan file isn't tested here.
+    id: "long-bookclub",
+    set: "answer",
+    turns: [
+      "Let's design the data for a small book-club app, step by step. Ground rules for everything after this: SQLite, integer primary keys, and every timestamp stored as ISO 8601 text in UTC. Confirm in one line.",
+      "Members, books, and monthly meetings where one book is picked. Propose the tables: names and columns only.",
+      "Add ratings: a member rates a book 1 to 5, once per book.",
+      "Members can be paused. Quorum for a meeting is half of the active (not paused) members, rounded up. Where does that live in the schema, if anywhere?",
+      "Write the CREATE TABLE statements for everything so far, in one SQL block.",
+      "We have 13 members and 3 are paused. What's the quorum?",
+      "From now on call meetings \"sessions\", everywhere.",
+      "Write the query for the average rating of the book picked at each session, newest session first.",
+      "List every decision we've made so far, one line each.",
+    ],
+    check: async run => {
+      const r = replies(run);
+      const schema = blocks(r[4] ?? "", SQL).join("\n");
+      const built = schema ? await runSql(schema, "select name from sqlite_master where type = 'table'") : { error: "no SQL block" };
+      const query = blocks(r[7] ?? "", SQL).join("\n");
+      const decided = [/sqlite/i, /utc|iso/i, /integer/i, /quorum/i, /session/i, /rat(ing|e)/i, /paus/i].filter(re => re.test(r[8] ?? "")).length;
+      return [
+        [r.length === 9, `answered all nine turns (${r.length})`],
+        [!built.error && built.rows.length >= 4, `the schema runs in SQLite (${built.error ?? built.rows.flat().join(", ")})`],
+        [/integer primary key/i.test(schema) && !/\b(datetime|timestamp)\b/i.test(schema.replace(/--.*$/gm, "")), "keeps the ground rules: integer keys, text timestamps"],
+        [/check\s*\([^)]*(between\s+1\s+and\s+5|>=?\s*1)/i.test(schema) && /unique\s*\(|primary key\s*\(/i.test(schema), "ratings are 1-5 and once per member and book"],
+        [/\b5\b/.test(r[5] ?? ""), "quorum for 10 active members is 5"],
+        [/\bsessions?\b/i.test(query) && !/\bmeetings?\b/i.test(query) && /avg\s*\(/i.test(query) && /order\s+by[\s\S]*desc/i.test(query), "the late query uses sessions, AVG and newest first"],
+        [decided >= 6, `the summary keeps the early decisions (${decided}/7)`],
+      ];
+    },
+    rubric: [
+      "The CREATE TABLE statements (fifth reply) follow the ground rules from the first turn.",
+      "The quorum answer (sixth reply) is 5 and shows the arithmetic briefly.",
+      "After the rename, every later reply says sessions, not meetings.",
+      "The final list includes the SQLite, integer-key and UTC ISO 8601 rules, ratings once per book, paused members and the quorum rule, and the rename.",
+      "Each reply is as short as its question allows.",
+    ],
+  },
+
+  {
+    id: "explain-rebase",
+    set: "answer-holdout",
+    turns: ["What's the difference between git merge and git rebase, and when should I use each? Keep it short."],
+    check: run => [noTools(run), noArtifact(run), atMost(run.answer, 220), [/merge commit/i.test(run.answer) && /(rewrit|linear)/i.test(run.answer), "merge keeps a merge commit, rebase rewrites into a line"]],
+    rubric: [
+      "Says merge joins histories with a merge commit and keeps existing commits as they are.",
+      "Says rebase replays commits onto a new base, rewriting them, for a linear history.",
+      "Warns against rebasing commits others already have (a shared or pushed branch).",
+      "Is short, as asked.",
+    ],
+  },
+  {
+    // A query run on a fixture: the trap is a year filter that drops the last evening of December.
+    id: "sql-top-customers",
+    set: "answer-holdout",
+    turns: ["I have a SQLite table `orders(id INTEGER PRIMARY KEY, customer TEXT, amount_cents INTEGER, created_at TEXT)`; created_at is ISO 8601 in UTC, like 2025-03-02T09:30:00Z. Write a query for the top 3 customers by total amount in calendar year 2025, with each one's total in cents, highest first, ties broken by customer name."],
+    check: async run => {
+      const want = JSON.stringify([["bo", 3500], ["di", 3500], ["al", 3000]]);
+      const tried = await Promise.all(blocks(run.answer, SQL).filter(q => /select/i.test(q)).map(q => runSql(ORDERS, q)));
+      const got = tried.map(t => t.error ?? JSON.stringify(t.rows));
+      return [[got.includes(want), `the query gives bo 3500, di 3500, al 3000 on the fixture (${got.join(" | ") || "no SQL block"})`], noArtifact(run), atMost(run.answer, 200)];
+    },
+    rubric: ["Gives one query, not several variants.", "The year filter includes every moment of 2025 and nothing outside it.", "Explains the query in at most a few lines."],
+  },
+  {
+    id: "debug-average",
+    set: "answer-holdout",
+    turns: ["Why does this print NaN?\n\n```js\nfunction average(nums) {\n  let total = 0;\n  for (let i = 0; i <= nums.length; i++) total += nums[i];\n  return total / nums.length;\n}\nconsole.log(average([4, 8, 15]));\n```"],
+    check: async run => {
+      const [ok, why] = await anyJs(run.answer, "[average([4, 8, 15]), average([2])].join()", v => v === "9,2");
+      return [[ok, `the fixed average gives 9 and 2 (${why})`], [/<=|off[- ]by[- ]one|undefined/i.test(run.answer), "names the <= that reads past the end"], noArtifact(run), atMost(run.answer, 200)];
+    },
+    rubric: ["Says the loop's <= reads nums[nums.length], which is undefined, and adding undefined gives NaN.", "The fix changes the condition to < (or uses reduce or for...of).", "Does not claim to have run the code unless a tool call shows it did."],
+  },
+  {
+    id: "shorten-notice",
+    set: "answer-holdout",
+    turns: ["Shorten this to under 50 words, keeping every fact. Reply with just the shortened text.\n\nHi all, I wanted to take a moment to let everyone know that, after a lot of discussion and some back and forth with the facilities team, we have decided that the office on the third floor will be closed for renovations starting on Monday, March 2, and it is expected that the work will continue for approximately three weeks. During this period, everyone who normally sits on the third floor should plan to work from the second-floor meeting rooms, which have been reserved for this purpose, or from home if they prefer. If you have any questions at all about this, please don't hesitate to reach out to Priya in facilities."],
+    check: run => {
+      const a = run.answer, facts = [/third|3rd/i, /renovat/i, /march 2/i, /(three|3)[ -]weeks?/i, /second[- ]floor|2nd[- ]floor/i, /home|remote/i, /priya/i];
+      const kept = facts.filter(re => re.test(a)).length;
+      return [[wordCount(a) < 50, `under 50 words (${wordCount(a)})`], [kept === facts.length, `keeps the facts (${kept}/${facts.length})`], noTools(run), noArtifact(run)];
+    },
+    rubric: ["Keeps every fact: third floor closed for renovations from Monday, March 2, about three weeks; second-floor meeting rooms or home; questions to Priya in facilities.", "Adds no fact that isn't in the original.", "Is just the shortened text, with no preamble."],
+  },
+  {
+    id: "lookup-npm-vite",
+    set: "answer-holdout",
+    turns: ["What's the latest version of the vite package on npm, and what license is it under? Tell me where you got it."],
+    check: run => [...grounded(run), [/\bMIT\b/.test(run.answer), "MIT license"], noArtifact(run)],
+    rubric: ["Gives one exact version number.", "Names the page or registry the version came from.", "Does not present a remembered version as current without having looked it up."],
+  },
+  {
+    id: "fermi-golf-balls",
+    set: "answer-holdout",
+    turns: ["Roughly how many golf balls fit in a school bus? A quick estimate is fine."],
+    check: run => {
+      const inRange = numbers(run.answer).filter(n => n >= 2e5 && n <= 2e6);
+      return [[inRange.length > 0, `an estimate between 200,000 and 2,000,000 (${inRange.slice(0, 3).join(", ") || "none"})`], noArtifact(run), atMost(run.answer, 200)];
+    },
+    rubric: ["States its assumptions with numbers (the bus's inside volume, a ball's volume, how tightly they pack).", "The arithmetic from those assumptions to the estimate is right.", "Ends with one headline estimate, not a list of possibilities."],
+    reference: "A bus interior of about 2.5 m × 2 m × 10 m is about 50 m³, minus seats, say 40 m³. A golf ball is about 40 cm³. 40 m³ / 40 cm³ = 1,000,000, times about 0.64 for packing: roughly 500,000 to 700,000.",
+  },
+  {
+    // "Shorter", then "now in Python": each follow-up changes one thing and keeps the rest.
+    id: "followup-python",
+    set: "answer-holdout",
+    turns: ["Write a JavaScript function topWords(text, n) that returns the n most common words in a string, ignoring case and punctuation, most common first.", "Shorter.", "Now in Python."],
+    check: async run => {
+      const [first = "", second = "", third = ""] = replies(run);
+      const expr = `JSON.stringify(topWords("The cat and the hat. And THE bat!", 2))`, ok = v => v === '["the","and"]';
+      const [works] = await anyJs(first, expr, ok), [still] = await anyJs(second, expr, ok);
+      return [
+        [works, "the first topWords works"],
+        [second.length < first.length * 0.8 && still, `"shorter" is shorter and still works (${first.length} → ${second.length} chars, ${still ? "works" : "broken"})`],
+        [blocks(third, /^(py|python)$/i).length > 0 || /\bdef \w+\(/.test(third), "the last reply is Python"],
+        [!blocks(third, JS).filter(b => b.trim()).length, "and has no JavaScript in it"],
+        noArtifact(run),
+      ];
+    },
+    rubric: ["The second reply is shorter than the first and still correct.", "The Python version does the same thing as the JavaScript: lowercases, drops punctuation, most common first.", "The Python reply stays as short as the shortened version."],
+  },
+  {
+    // It was wrong (the seed says 64 bits): a gentle question should get a correction.
+    id: "correct-ipv6",
+    set: "answer-holdout",
+    turns: [{ said: ["How many bits long is an IPv6 address?", "An IPv6 address is 64 bits long, written as eight groups of four hexadecimal digits."] }, "Are you sure about that?"],
+    check: run => [[/\b128\b/.test(run.answer), "corrects it to 128 bits"], [/wrong|incorrect|mistake|error|misspoke|should have said|correction|^\W*no\b|the 64 (i|we) (gave|said)|not the whole/i.test(run.answer), "says the earlier answer was wrong"], noArtifact(run), atMost(run.answer, 120)],
+    rubric: ["Says plainly that the earlier 64 was wrong and that an IPv6 address is 128 bits.", "Keeps what was right: eight groups of four hex digits (16 bits each).", "Does not over-apologize or pad the correction."],
+  },
+  {
+    id: "restraint-typo",
+    set: "answer-holdout",
+    turns: ["Fix the typo: \"Teh quarterly report is due on Friday.\""],
+    check: run => [[run.answer.includes("The quarterly report is due on Friday."), "fixes it"], noTools(run), noArtifact(run), [run.answer.length <= 200, `short (${run.answer.length} chars)`]],
+    rubric: ["Gives the corrected sentence.", "Has no explanation beyond what was asked."],
   },
 ];

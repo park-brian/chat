@@ -1172,3 +1172,38 @@ The one-off probe scripts in the repo root were deleted; what they found is abov
   `thinking: { type: "disabled" }`) is what it settled on.
 - gradecheck.tmp.mjs is now evals/gradecheck.js: `node evals/gradecheck.js <task-id> <folder>` grades a folder of
   files with a task's check, no model involved.
+
+## Answer sets, the judge and the style count (2026-10-12)
+
+Work items 1-3 of docs/specs/2026-10-12-answer-quality-plan.md.
+
+- **Sets.** `--tasks answer` (12, tuned on) and `--tasks answer-holdout` (9, never tuned on): explain, a regex and a
+  SQL query run against fixtures (the query on node:sqlite in memory), debugging a pasted error (the fix is run in
+  node:vm), a commit message, shortening, current lookups, a conversion, a Fermi estimate, compare-and-recommend,
+  follow-ups (shorter, now in Python, pushback when it was right, a seeded wrong answer to correct), ambiguity,
+  an unanswerable question, and restraint. Lookups check that the version given came back from a tool and that a
+  source is named, not the version itself.
+- **`{ said: [question, reply] }`** turn: the echo model says the reply, then the saved user message is rewritten
+  to the question, so the model meets an earlier exchange it never had (correct-ipv6 seeds a wrong 64 bits).
+- **Judge** (evals/judge.js): Sonnet 5.5 on Converse grades each task's `rubric` plus the plain-writing criterion,
+  from the conversation, the tool calls, and an optional `reference`; no model name. Criteria join the checks as
+  `judge: …`, with the reason in the transcript; `judgeInputTokens`/`judgeOutputTokens` in metrics, `kJudge` in the
+  table. A failed judge call leaves its criteria unjudged: out of the score, listed as `[?]` and `UNJUDGED`.
+  Sonnet 5.5 refuses `temperature` ("deprecated for this model") and a forced `toolChoice`, so the request has
+  neither: the tool is offered with auto, and grades written as JSON text are read too.
+- **Style count** (evals/style.js): `FLOURISHES` per 1000 words of the model's replies, code left out:
+  `flourishes`, `flourishPer1k` in metrics, `flourish` in the table, the hits in result.json. "sits/lives in" can't
+  tell an abstraction from a relative ("my aunt lives in Ohio" counts); read the hits before trusting a small
+  difference.
+- **`--reasoning`** overrides the level for every turn (default high, as before).
+- **Calibration** (evals/calibrate.js, evals/calibration/*.json): eight hand-written seeds, including a mannered and
+  a plain version of the same explanation. First run 89.3% on 28 criteria: two misses were rubric wording the judge
+  read more strictly than meant (fixed in the rubric), so 96.4% after. The remaining miss: the judge failed
+  "states things literally" on a fabricated answer, mixing truth with plainness. **Still to do: hand-grade 30 real
+  answers from the Haiku baseline** and check agreement is at least 90% before trusting judge scores.
+- **Not yet:** the long-horizon task (long-bookclub, 9 turns) has no forced summary midway, since the harness can't
+  trigger one, so it tests carrying decisions through context, not the plan file.
+
+Smoke (2026-10-12T19-15-30-682s, haiku, correct-ipv6 and debug-await ×1): 0.94. correct-ipv6 missed "says the
+earlier answer was wrong" on "No. … The 64 I gave is …", which the judge passed; the regex now takes that form.
+Each run used about 13.5k model input tokens and 1.2k judge tokens.
