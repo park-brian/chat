@@ -19,7 +19,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node proxy.test.js && node evals/eval.test.js && node test.js index.html",
+    "test": "node proxy.test.js && node evals/eval.test.js && node evals/user.test.js && node test.js index.html",
     "start:proxy": "node proxy.js",
     "eval": "node eval.js"
   },

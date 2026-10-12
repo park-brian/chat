@@ -1,7 +1,7 @@
 // eval.js's pure helpers and the graders' CDN check, without a browser or a model.
 import assert from "node:assert/strict";
 import path from "node:path";
-import { dialogue, filePath, MAX_UNCONFIRMED, meanLine, options, summarize } from "../eval.js";
+import { dialogue, filePath, MAX_UNCONFIRMED, meanLine, options, passK, summarize } from "../eval.js";
 import TASKS, { numbers, pinsJsdelivr, replies } from "./tasks.js";
 import { criteriaOf, judge, judgedChecks, judgePrompt, JUDGE_MODEL, PLAIN } from "./judge.js";
 import { FLOURISHES, mannered, wordCount } from "./style.js";
@@ -27,7 +27,7 @@ for (const argv of [["--repeat", "0"], ["--repeat", "x"], ["--concurrency", "1.5
 assert.ok(MAX_UNCONFIRMED === 20);
 
 // An unfinished run is a harness failure like a crash: listed, and left out of the mean.
-const runs = [{ passed: 1, total: 2 }, { passed: 2, total: 2 }, { crashed: "boom", passed: 0, total: 0 }, { passed: 0, total: 1, error: "timeout" }];
+const runs = [{ task: "x", passed: 1, total: 2 }, { task: "y", passed: 2, total: 2 }, { crashed: "boom", passed: 0, total: 0 }, { passed: 0, total: 1, error: "timeout" }];
 const s = summarize(runs);
 assert.equal(s.mean, (0.5 + 1) / 2);
 assert.deepEqual([s.scored, s.crashed.length, s.unfinished.length], [2, 1, 1]);
@@ -35,6 +35,17 @@ assert.equal(summarize([]).mean, null);
 assert.equal(meanLine(runs), "mean pass 0.75 over 2 graded runs");
 assert.equal(meanLine(runs, [runs[2]]), "mean pass 0.75 over 2 graded runs (baseline no graded runs)");
 assert.equal(meanLine([runs[3]]), "no graded runs");
+
+// pass^k: per task·model with two or more graded repeats, the share that passed every check; a crash is no repeat.
+const rep = (task, passed, total = 3, more = {}) => ({ task, model: "haiku", passed, total, ...more });
+const k = passK([rep("a", 3), rep("a", 3), rep("a", 3), rep("b", 3), rep("b", 2), rep("b", 3), rep("c", 1), rep("d", 3), rep("d", 0, 0, { crashed: "x" }), rep("e", 2), rep("e", 3, 3, { error: "timeout" }), rep("e", 2)]);
+assert.deepEqual(k.rows.map(r => [r.key, r.repeats, +r.passAll.toFixed(2)]), [["a·haiku", 3, 1], ["b·haiku", 3, 0.67], ["e·haiku", 2, 0]]);
+assert.deepEqual([k.tasks, k.every], [3, 1]);
+// Unjudged criteria are not in total, so a run whose graded checks all passed passes.
+assert.equal(passK([rep("u", 2, 2, { unjudged: [{}] }), rep("u", 2, 2)]).every, 1);
+assert.equal(meanLine([rep("a", 3), rep("a", 3), rep("b", 3), rep("b", 1)]), "mean pass 0.83 over 4 graded runs · pass^k 1/2 tasks pass every repeat");
+assert.equal(meanLine([rep("a", 3), rep("a", 1)], [rep("a", 3), rep("a", 3)]), "mean pass 0.67 over 2 graded runs · pass^k 0/1 tasks pass every repeat (baseline 1.00 · pass^k 1/1 tasks pass every repeat)");
+assert.deepEqual(summarize([rep("a", 3)]).passK, { rows: [], tasks: 0, every: 0 });
 
 // Pinned means an exact x.y.z.
 assert.ok(pinsJsdelivr(`import x from "https://cdn.jsdelivr.net/npm/marked@12.0.1/+esm"`));

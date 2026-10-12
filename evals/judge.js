@@ -1,5 +1,6 @@
 // A fixed, stronger model grades what scripts can't see: each answer task's rubric, one yes/no criterion at a time.
-// It reads the conversation, the tools called and what each returned, the rubric and a reference answer; it never sees which model answered.
+// It reads the conversation, the tools called and what each returned, the rubric and a reference answer, and for a task
+// with judgeFiles (a path regex) the final text of those files; it never sees which model answered.
 
 export const JUDGE_MODEL = "global.anthropic.claude-sonnet-5-5";
 export const PLAIN = "States things literally; no metaphor or flourish where a literal phrase exists.";
@@ -43,6 +44,7 @@ export function judgePrompt(run, criteria) {
   const text = [
     `<conversation>\n${turns}\n</conversation>`,
     `<tool_calls>\n${tools.join("\n") || "none"}\n</tool_calls>`,
+    run.finalFiles?.length && `<final_files>\n${run.finalFiles.map(([p, t]) => `<file path="${p}">\n${clip(t ?? "", 12000)}\n</file>`).join("\n")}\n</final_files>`,
     run.reference && `<reference>\n${run.reference}\n</reference>`,
     `<criteria>\n${criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}\n</criteria>`,
   ].filter(Boolean).join("\n\n");
@@ -57,7 +59,7 @@ export function judgePrompt(run, criteria) {
 }
 
 let client;
-async function bedrock(input) {
+export async function bedrock(input) {
   const { BedrockRuntimeClient, ConverseCommand } = await import("@aws-sdk/client-bedrock-runtime");
   client ??= new BedrockRuntimeClient({ region: process.env.AWS_REGION || "us-east-1" });
   return client.send(new ConverseCommand(input));
@@ -70,7 +72,8 @@ export async function judge(run, task, { send = bedrock, criteria = criteriaOf(t
   if (!criteria.length) return none;
   let response;
   try {
-    response = await send(judgePrompt({ ...run, reference: task.reference }, criteria));
+    const finalFiles = task.judgeFiles ? Object.entries(run.files ?? {}).filter(([p]) => task.judgeFiles.test(p)) : [];
+    response = await send(judgePrompt({ ...run, reference: task.reference, finalFiles }, criteria));
   } catch (e) {
     const error = String(e?.message || e).split("\n")[0];
     return { ...none, unjudged: criteria.map(criterion => ({ criterion, reason: "judge failed: " + error })), error };
