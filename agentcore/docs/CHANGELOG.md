@@ -3,6 +3,25 @@
 Verified releases, newest first. Evidence records and screenshots are written
 under `.artifacts/` by the release scripts.
 
+## 2026-10-12: code review fixes
+
+- Interrupted conversation deletes resume; overlapping deletes never return
+  the same bytes twice. Uploads copy exactly the measured version and check
+  the quota in the activation transaction.
+- Writes to shared rows retry transaction conflicts. A commit whose reply was
+  lost is settled by reading the request, never by deleting a committed body.
+  A cancel that arrives at commit time is honored.
+- Usage estimates count images at a fixed cost instead of their bytes. Bedrock
+  keeps text from every step, keeps answers cut off at the output limit and
+  refuses empty ones. Hitting the tool or step limit still ends in an answer.
+- Skills and connections in use cannot be deleted; role changes repair any
+  group membership; duplicate invites are reported.
+- Pages: reconnect resumes from the last event, any call retries a cold
+  start, a failed token refresh no longer signs out every tab, streaming
+  updates only the changing text, and edits recover from revision conflicts.
+- Live stories, the credential-log check and the production smoke passed;
+  the change set updated only the Runtime and kept all 19 resource identities.
+
 ## 2026-10-11: one schema, exact accounting (API v3)
 
 - The Runtime is rebuilt as modules over one command table, with role rules
