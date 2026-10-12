@@ -1285,3 +1285,17 @@ Haiku 5.5 ×3 on each hard tier and the answer set, inner ×1, against baseline 
 - **swe** fixes all bugs again; the misses moved to diff size (klona 16-40 lines against 12, mitt 14 against 8)
   and two claimed test counts not in a report.
 - Single-turn answers are unchanged (0.97 → 0.98); inner builds didn't regress (1.00).
+
+## Round 2 (39cad47): research 0.96 (0.98), answer-hard 0.89 (0.89), swe 0.96 (0.96), within noise
+
+Network wording that matches what works (proxied, or only CORS-open hosts named), CORS failures that name the cause
+and the fix, `web.read`/`web.search` inside the code tool, and a 30 s code timeout for network code. Evals run
+with the proxy, so the no-proxy half of this isn't measured here; it is the published app's case.
+
+- **web.read was barely used**: 2 of 63 transcripts. Haiku keeps using fetch() in code and read_url.
+- **The lodash drop was the answer key.** lodash.js run as a browser script gives window._ 307 keys, 305 of them
+  functions; loaded as CommonJS it also sets _._ to itself, giving 308 and 306. The key only knew Node's 306, and
+  round 2's three runs all evaluated it as a script and answered 305, correctly, with the method shown. Both now
+  pass when the tool output shows the count; regraded, research round 2 is about 0.99.
+- No regressions elsewhere. Accepted for the product side; the code-tool helper needs a reason to be used (long
+  pages read in code to keep context small), which the context round gives it.

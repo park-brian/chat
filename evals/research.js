@@ -145,22 +145,23 @@ export default [
     reference: "68 authors. v1 was submitted 2023-07-18 14:31:57 UTC and v2 2023-07-19 17:08:59 UTC, 26 hours 37 minutes later. From the arXiv API record https://export.arxiv.org/api/query?id_list=2307.09288v2 (or the abstract page's submission history).",
   },
   {
-    // https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.js loaded in Node: Object.keys(_) has 308 entries, of which
-    // 306 are functions (VERSION and templateSettings are not).
+    // https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.js has two right answers. Run as a browser script it attaches
+    // to window._ with 307 keys, 305 of them functions (VERSION and templateSettings are not). Loaded as CommonJS
+    // (module.exports) it also sets _._ to itself: 308 keys, 306 functions. Either passes if the tool output shows it.
     id: "research-lodash-functions",
     set: "research",
     turns: ["How many functions does lodash 4.17.21 (lodash.js from jsDelivr) put on `_`? Count its own enumerable properties whose value is a function."],
     check: run => {
       const a = run.answer;
       return [
-        [hasNumber(a, 306), "306 functions"],
+        [hasNumber(a, 305) || hasNumber(a, 306), "305 functions (browser script) or 306 (CommonJS)"],
         lookedUp(run),
         computed(run),
-        inResults(run, /\b306\b/, "306"),
+        hasNumber(a, 305) ? inResults(run, /\b305\b/, "305") : inResults(run, /\b306\b/, "306"),
         noArtifact(run),
       ];
     },
     rubric: RUBRIC,
-    reference: "306. Loading https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.js and counting Object.keys(_) whose value is a function gives 306 of 308 keys (VERSION and templateSettings are not functions).",
+    reference: "305 when lodash.js runs as a browser script (window._ has 307 keys; VERSION and templateSettings are not functions), or 306 when it is loaded as CommonJS, which adds _._ itself. Either is right if the answer says how it was loaded.",
   },
 ];

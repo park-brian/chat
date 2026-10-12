@@ -81,7 +81,7 @@ const research = {
   "research-lodash-functions": {
     good: run({ answer: "306. I loaded lodash.js 4.17.21 from jsDelivr and counted Object.keys(_) that are functions (308 keys, 306 functions).", calls: [code("const src = await (await fetch('https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.js')).text();")], results: out({ keys: 308, functions: 306 }) }),
     wrong: { answer: "308 functions, from lodash.js on jsDelivr." },
-    fails: "306 functions",
+    fails: "305 functions (browser script) or 306 (CommonJS)",
   },
 };
 for (const [id, t] of Object.entries(research)) {
