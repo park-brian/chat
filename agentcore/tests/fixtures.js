@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 // A disposable Cognito identity on a live stack. Everything the identity owns
 // lives in its USER#sub partition and under its S3 prefixes, so cleanup removes
 // exactly that, plus the account-owner record if this identity claimed it.
@@ -264,3 +266,64 @@ export async function createLiveFixture({
       createLiveFixture({ stackName, profile, region, role: peerRole }),
   };
 }
+
+// The catalog models every live inference check expects, by display name.
+export const catalogModelNames = [
+  "Claude Haiku 5.5",
+  "Claude Sonnet 5.5",
+  "Claude Opus 5.5",
+  "Claude Fable 5.1",
+  "GPT-6.1 Sol",
+  "GPT-6 Luna",
+  "Gemini 3.8 Flash",
+];
+
+// Fills the Cognito managed sign-in form after the page's Sign in button.
+export async function submitHostedSignIn(page, identity) {
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page
+    .locator('input[type="password"]')
+    .first()
+    .waitFor({ timeout: 30000 });
+  await page
+    .locator('input[type="email"], input[name="username"]')
+    .first()
+    .fill(identity.email);
+  await page.locator('input[type="password"]').first().fill(identity.password);
+  await page
+    .locator('button[type="submit"], input[type="submit"]')
+    .first()
+    .click();
+}
+
+// The signed-in page's tokens and Runtime session id.
+export const readSession = (page) =>
+  page.evaluate(() => {
+    const config = JSON.parse(sessionStorage.getItem("agentcore:deployment"));
+    return {
+      config,
+      ...JSON.parse(
+        sessionStorage.getItem(
+          `agentcore:session:${config.runtime}:${config.client}`,
+        ),
+      ),
+    };
+  });
+
+// One Runtime command from Node as the signed-in identity; returns the envelope.
+export const transport =
+  (identity, auth) =>
+  async (command, input = {}) => {
+    const response = await fetch(identity.controllerUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer " + auth.tokens.access_token,
+        "x-amzn-bedrock-agentcore-runtime-session-id": auth.runtimeSessionId,
+      },
+      body: JSON.stringify({ v: 1, command, requestId: randomUUID(), input }),
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!response.ok) throw Error(command + " HTTP " + response.status);
+    return await response.json();
+  };

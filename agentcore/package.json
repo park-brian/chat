@@ -5,7 +5,6 @@
   "license": "ISC",
   "author": "",
   "type": "module",
-  "main": "index.js",
   "scripts": {
     "build:controller": "node scripts/build-controller.js",
     "csp:sync": "node scripts/sync-csp.js",
@@ -13,18 +12,12 @@
     "test:pages": "node scripts/test-pages.js",
     "test:live-pages": "node scripts/test-live-pages.js",
     "test:visual": "node scripts/sync-csp.js --check && node ../test.js index.html --screenshot --viewports desktop,mobile --story shell",
-    "test:live": "node scripts/sync-csp.js --check && node ../test.js index.html --story login --live-stack",
-    "test:runtime": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime --live-stack",
-    "test:runtime-chat": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-chat --live-stack",
-    "test:runtime-ui": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-ui --live-stack",
-    "test:foundation": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-foundation --live-stack",
-    "test:roadmap": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-roadmap --live-stack",
-    "test:runtime-composer": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-composer --live-stack",
-    "test:runtime-tool": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-tool --live-stack",
-    "test:runtime-web": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-web --live-stack",
-    "test:runtime-connections": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-connections --live-stack",
-    "test:runtime-model": "node scripts/sync-csp.js --check && node ../test.js index.html --story runtime-model --live-stack",
-    "bench:runtime": "node ../test.js index.html --story runtime-benchmark --live-stack"
+    "test:live": "node scripts/sync-csp.js --check && node scripts/test-live-pages.js login",
+    "test:foundation": "node scripts/sync-csp.js --check && node scripts/test-live-pages.js runtime-foundation",
+    "test:roadmap": "node scripts/sync-csp.js --check && node scripts/test-live-pages.js runtime-roadmap",
+    "test:runtime-web": "node scripts/sync-csp.js --check && node scripts/test-live-pages.js runtime-web",
+    "test:runtime-model": "node scripts/sync-csp.js --check && node scripts/test-live-pages.js runtime-model",
+    "bench:runtime": "node scripts/test-live-pages.js runtime-benchmark"
   },
   "devDependencies": {
     "@aws-sdk/client-bedrock-agentcore": "^3.1137.0",

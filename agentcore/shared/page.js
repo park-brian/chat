@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, onCleanup, Show } from "solid-js";
 import { render as renderSolid } from "solid-js/web";
 import html from "solid-js/html";
 import { createSession, parseDeployment } from "./session.js";
@@ -15,11 +15,11 @@ const phaseCopy = {
   updating: ["Deployment updating", "Connecting to the newest Runtime version."],
 };
 const booting = (phase) => phase in phaseCopy;
+const apiVersion = 3;
 const initials = (email) => (email || "?").slice(0, 1).toUpperCase();
 
 export async function mountPage({ key, title, render }) {
-  const auth = createSession(),
-    api = createApi(auth);
+  const auth = createSession();
   const query = new URL(location.href).searchParams;
   const [phase, setPhase] = createSignal(
     query.has("code") || query.has("error")
@@ -28,6 +28,10 @@ export async function mountPage({ key, title, render }) {
         ? "restoring"
         : "signed-out",
   );
+  // Any first call may meet a cold Runtime; api.js retries it and reports here.
+  const api = createApi(auth, {
+    onWarming: () => phase() === "restoring" && setPhase("warming"),
+  });
   const [error, setError] = createSignal(""),
     [menu, setMenu] = createSignal(false),
     [projects, setProjects] = createSignal(null),
@@ -230,7 +234,14 @@ export async function mountPage({ key, title, render }) {
                 when=${() => !page.admin || auth.session()?.user.role === "Administrators"}
                 fallback=${html`<div class="empty">Administrator access is required.</div>`}
               >
-                ${(shown) => render(context)}
+                ${(shown) => {
+                  // Shell slots filled by the page must not outlive it.
+                  onCleanup(() => {
+                    setCrumb(null);
+                    setStatus(null);
+                  });
+                  return render(context);
+                }}
               <//>
             <//>
           <//>
@@ -248,28 +259,14 @@ export async function mountPage({ key, title, render }) {
       setPhase("restoring");
       const claims = auth.claims();
       if (claims?.sub)
-        auth.setSession({ apiVersion: 3, user: claims, provisional: true });
-      let validated,
-        replacedWorker = false;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        try {
-          validated = await api.rpc("session.get");
-          if (validated.apiVersion !== 3) {
-            if (replacedWorker)
-              throw Error("This deployment is updating. Reload in a moment.");
-            setPhase("updating");
-            auth.resetRuntimeSession();
-            replacedWorker = true;
-            continue;
-          }
-          break;
-        } catch (cause) {
-          if (cause.status !== 424 || attempt === 3) throw cause;
-          setPhase("warming");
-          await new Promise((resolve) =>
-            setTimeout(resolve, 500 * 2 ** attempt),
-          );
-        }
+        auth.setSession({ apiVersion, user: claims, provisional: true });
+      let validated = await api.rpc("session.get");
+      if (validated.apiVersion !== apiVersion) {
+        setPhase("updating");
+        auth.resetRuntimeSession();
+        validated = await api.rpc("session.get");
+        if (validated.apiVersion !== apiVersion)
+          throw Error("This deployment is updating. Reload in a moment.");
       }
       auth.setSession(validated);
     }

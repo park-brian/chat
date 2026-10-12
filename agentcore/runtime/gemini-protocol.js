@@ -1,5 +1,7 @@
 // Gemini's wire format stays here; grants and managed-tool execution stay in tools.js.
-export function geminiRequest(model, level, contents, instructions, specs) {
+// On a turn's last step the tools stay declared (earlier calls refer to them)
+// but cannot be called.
+export function geminiRequest(model, level, contents, instructions, specs, final = false) {
   const body = {
     contents,
     ...(instructions && {
@@ -19,6 +21,7 @@ export function geminiRequest(model, level, contents, instructions, specs) {
           })),
         },
       ],
+      ...(final && { toolConfig: { functionCallingConfig: { mode: "NONE" } } }),
     }),
   };
   if (Buffer.byteLength(JSON.stringify(body)) > 15_000_000)

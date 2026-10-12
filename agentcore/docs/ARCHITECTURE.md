@@ -185,18 +185,25 @@ Every model step writes a usage row, the budget-period and day rollups and the
 request total in one transaction, as it happens. Prices are integer
 micro-dollars per million tokens, in `models.json`, applied per step and
 rounded once. Long-context tiers switch every rate when the prompt crosses
-the model's threshold.
+the model's threshold. A model whose prices carry a `pricingExpiresAt` date
+becomes unavailable after that UTC day until its prices are reviewed.
 
 | Quality | Meaning |
 | --- | --- |
 | `estimated` | Provider-reported tokens at the catalog's list price |
-| `unknown` | The provider never reported usage (the stream failed, or its report was inconsistent); tokens are estimated at four characters each, priced, and counted against the budget |
+| `unknown` | The provider never reported usage (the stream failed, or its report was inconsistent); the request is estimated from its own text at four characters a token, plus 1600 tokens per image, then priced and counted against the budget |
 | `unpriced` | A tool call, or a Code Interpreter or Browser session's lifetime: recorded, not priced |
 
 The budget is checked at admission and before every step, so a turn stops
 when it is spent; concurrency is at most three turns per person. Periods are
 UTC days, Monday-start weeks or months. `users.startNewBudgetPeriod` starts a
 new period key without editing recorded usage.
+
+A worker that stops in the middle of a step records nothing for that step,
+and a managed session it held is neither stopped nor metered; everything else
+is metered exactly once. Shared rows (rollups, the profile, the request) are
+written by up to three runs at once, so a write cancelled by a transaction
+conflict is retried with the same token.
 
 Not attributed to people: Runtime compute and memory, DynamoDB, S3, Cognito
 and Gateway requests. Those appear only on the AWS bill.
@@ -237,7 +244,8 @@ against Cognito, caching a success for 15 seconds, so a disabled or regrouped
 person loses access within 15 seconds (immediately on the worker that made the
 change). Every key derives from the verified `sub`. Cursors are re-checked
 against the caller's partition. Commands that touch secrets refuse any attempt
-to name another person.
+to name another person. A skill or connection that an agent still uses cannot
+be deleted (`SKILL_IN_USE`, `CONNECTION_IN_USE`).
 
 Runtime V2 restores workers from a snapshot that includes random state, so
 every transaction carries an explicit token from `db.uuid()` (random UUID,
@@ -262,13 +270,15 @@ Decisions that follow:
 - AgentCore answers 409 "Session operation in progress" to calls that overlap
   a new session's start. The browser sends a new session's first call alone,
   and retries a 409.
+- A cold start answers 424; any call is retried after 0.5, 1 and 2 s with the
+  same request id, and the page shows that the Runtime is waking.
 - WebSockets would save repeated invocation overhead but add reconnection,
   token refresh and correlation work for little gain, so HTTP stays.
 
 ## Browser app
 
 Seven HTML documents share `shared/page.js` (top bar, boot phases, sign-in),
-`shared/api.js` (calls, the session-start gate, 409 retry, event streams) and
+`shared/api.js` (calls, the session-start gate, 409 and 424 retries, event streams) and
 `shared/session.js` (PKCE, tokens, Runtime session id). The static boot markup
 and the CSP, with hashes for the import map and the inline `pagereveal`
 handler, are kept in sync by `npm run csp:sync`. Solid is pinned with SRI.

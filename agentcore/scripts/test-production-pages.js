@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { chromium } from "../../node_modules/playwright/index.mjs";
-import { createLiveFixture } from "../tests/fixtures.js";
+import { fileURLToPath } from "node:url";
+import {
+  catalogModelNames,
+  createLiveFixture,
+  readSession,
+  submitHostedSignIn,
+  transport,
+} from "../tests/fixtures.js";
 import { startServer } from "../../server.js";
 
 process.loadEnvFile(new URL("../../.env", import.meta.url));
@@ -37,7 +44,7 @@ try {
   if (local)
     server = await startServer(
       8000,
-      new URL("../../", import.meta.url).pathname.replace(/^[/](\w:)/, "$1"),
+      fileURLToPath(new URL("../../", import.meta.url)),
     );
   const files = [
     "index.html",
@@ -147,45 +154,15 @@ try {
   for (const [name, value] of new URL(fixture.publicEntryUrl).searchParams)
     login.searchParams.set(name, value);
   await page.goto(login.href);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page
-    .locator('input[type="password"]')
-    .first()
-    .waitFor({ timeout: 30000 });
-  await page
-    .locator('input[type="email"], input[name="username"]')
-    .first()
-    .fill(fixture.email);
-  await page.locator('input[type="password"]').first().fill(fixture.password);
-  await page
-    .locator('button[type="submit"], input[type="submit"]')
-    .first()
-    .click();
+  await submitHostedSignIn(page, fixture);
   await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
   assert.equal(new URL(page.url()).pathname, new URL("users/", base).pathname);
-  const auth = await page.evaluate(() => {
-    const config = JSON.parse(sessionStorage.getItem("agentcore:deployment"));
-    return JSON.parse(
-      sessionStorage.getItem(
-        `agentcore:session:${config.runtime}:${config.client}`,
-      ),
-    );
-  });
+  const auth = await readSession(page);
   fixture.trackRuntimeSession(auth.runtimeSessionId);
   fixture.setRuntimeStopToken(auth.tokens.access_token);
+  const send = transport(fixture, auth);
   const rpc = async (command, input = {}) => {
-    const response = await fetch(fixture.controllerUrl, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer " + auth.tokens.access_token,
-        "x-amzn-bedrock-agentcore-runtime-session-id": auth.runtimeSessionId,
-      },
-      body: JSON.stringify({ v: 1, command, requestId: randomUUID(), input }),
-      signal: AbortSignal.timeout(120000),
-    });
-    assert.equal(response.ok, true, command + " HTTP " + response.status);
-    const result = await response.json();
+    const result = await send(command, input);
     assert.equal(
       result.ok,
       true,
@@ -196,15 +173,7 @@ try {
   assert.equal((await rpc("session.get")).apiVersion, 3);
   assert.equal((await rpc("users.get")).user.sub, fixture.sub);
   const models = (await rpc("models.list")).items;
-  for (const name of [
-    "Claude Haiku 5.5",
-    "Claude Sonnet 5.5",
-    "Claude Opus 5.5",
-    "Claude Fable 5.1",
-    "GPT-6.1 Sol",
-    "GPT-6 Luna",
-    "Gemini 3.8 Flash",
-  ])
+  for (const name of catalogModelNames)
     assert.ok(
       models.some((model) => model.name === name),
       name,
@@ -216,7 +185,7 @@ try {
   );
   await mkdir(screens, { recursive: true });
   const shotPath = (file) =>
-    new URL(file, screens).pathname.replace(/^[/](\w:)/, "$1");
+    fileURLToPath(new URL(file, screens));
   const settled = async (key) => {
     await page.locator('[data-app-state="ready"]').waitFor({ timeout: 90000 });
     await page.waitForFunction(
@@ -277,10 +246,7 @@ try {
     evidence.boot[key] = await timing();
     assert.equal(await page.locator('a[aria-current="page"]').count(), 1);
     await page.screenshot({
-      path: new URL(key + "-desktop.png", screens).pathname.replace(
-        /^\/(\w:)/,
-        "$1",
-      ),
+      path: shotPath(key + "-desktop.png"),
       fullPage: true,
       mask: [page.locator(".account-head")],
     });
@@ -298,10 +264,7 @@ try {
     ),
   );
   await page.screenshot({
-    path: new URL("credentials-mobile.png", screens).pathname.replace(
-      /^\/(\w:)/,
-      "$1",
-    ),
+    path: shotPath("credentials-mobile.png"),
     fullPage: true,
   });
   console.log(

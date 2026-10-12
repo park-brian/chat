@@ -359,7 +359,134 @@ const slow = await data(owner, "chat.start", {
 await data(owner, "chat.cancel", { requestId: slow.requestId });
 await waitFor(async () => (await data(owner, "chat.status", slow)).status !== "running");
 assert.equal((await data(owner, "chat.status", slow)).status, "cancelled");
+const finished = await data(owner, "chat.cancel", { requestId: first.done.requestId });
+assert.equal(finished.status, "completed");
+assert.equal(finished.cancelRequested, false, "A finished run is reported as it is");
 console.log("PASS: run limit, idempotent requests and cancellation");
+
+// Model edge cases: what was paid for is metered, and what was said is kept.
+const newChat = () => ({ ...base, conversationId: randomUUID() });
+const answerOf = async (conversation, turn) =>
+  (await data(owner, "conversations.get", conversation)).messages.find(
+    (message) => message.turnId === turn.done.turnId && message.role === "assistant",
+  )?.text;
+const stepsOf = async (outcome) =>
+  (await data(owner, "usage.request", { requestId: outcome.status.requestId })).steps;
+const malformed = await send(owner, { ...newChat(), message: "scripted-malformed" });
+assert.equal(malformed.error?.code, "MALFORMED_TOOL_CALL");
+assert.deepEqual(
+  (await stepsOf(malformed)).map((step) => step.quality),
+  ["estimated"],
+  "A malformed call is metered with the usage the stream reported",
+);
+const empty = await send(owner, { ...newChat(), message: "scripted-empty" });
+assert.equal(empty.error?.code, "TURN_FAILED", "An empty answer is never saved");
+const cutConversation = newChat();
+const cut = await send(owner, { ...cutConversation, message: "scripted-max-tokens" });
+assert.ok(cut.done, "A reply at the output limit is kept");
+assert.equal(
+  await answerOf(cutConversation, cut),
+  "Partial\n\n[Response truncated at the model output limit.]",
+);
+const coder = await data(owner, "agents.put", {
+  projectId: "alpha",
+  name: "Coder",
+  modelId: "test.echo",
+  codeInterpreter: true,
+});
+const coding = () => ({ ...newChat(), agentId: coder.id });
+const preambleConversation = coding();
+const preamble = await send(owner, { ...preambleConversation, message: "scripted-preamble" });
+assert.equal(
+  await answerOf(preambleConversation, preamble),
+  "Checking. Answer.",
+  "Text streamed before a tool call is saved",
+);
+for (const [perStep, results, modelSteps] of [
+  [3, 9, 4],
+  [1, 7, 8],
+]) {
+  const conversation = coding();
+  const looped = await send(owner, { ...conversation, message: `loop-tools:${perStep}` });
+  assert.ok(looped.done, JSON.stringify(looped.error));
+  assert.equal(await answerOf(conversation, looped), `Done after ${results} tool results.`);
+  assert.equal(looped.done.unpricedToolCalls, Math.min(8, results));
+  const steps = await stepsOf(looped);
+  assert.equal(steps.filter((step) => step.kind === "model").length, modelSteps);
+  assert.equal(steps.filter((step) => step.kind === "tool").length, Math.min(8, results));
+}
+console.log("PASS: malformed calls, empty and truncated answers, preambles, tool and step limits");
+
+// Contention, a commit whose reply is lost, and a cancel that lands at commit.
+const transaction = (test) => (command) =>
+  command.constructor.name === "TransactWriteItemsCommand" &&
+  command.input.TransactItems.some((item) => test(item.Put?.Item?.sk?.S || ""));
+const conflict = (reasons) =>
+  Object.assign(new Error("Transaction cancelled"), {
+    name: "TransactionCanceledException",
+    CancellationReasons: reasons.map((Code) => ({ Code })),
+  });
+dynamo.once(transaction((key) => key.startsWith("USAGE#")), () => {
+  throw conflict(["None", "TransactionConflict", "None", "None"]);
+});
+const progressUpdate = (command) =>
+  command.constructor.name === "UpdateItemCommand" &&
+  /progressChunks/.test(command.input.ExpressionAttributeNames?.["#progressChunks"] || "") &&
+  !command.input.ExpressionAttributeNames["#progressClosed"];
+for (let attempt = 0; attempt < 4; attempt++)
+  dynamo.once(progressUpdate, () => {
+    throw Object.assign(new Error("Conflict"), { name: "TransactionConflictException" });
+  });
+const contended = await send(owner, { ...newChat(), message: "contended" });
+assert.ok(contended.done, "Conflicts are retried, and a missed progress count is not fatal");
+assert.ok(contended.status.progressChunks >= 1, "close() records the chunks written");
+const lostReply = newChat();
+dynamo.once(transaction((key) => key.startsWith("TURN#")), async (apply) => {
+  await apply();
+  throw Object.assign(new Error("Socket timeout"), { name: "TimeoutError" });
+});
+const landed = await send(owner, { ...lostReply, message: "lost reply" });
+assert.ok(landed.done, "A commit that landed is not failed by a lost reply");
+assert.equal(await answerOf(lostReply, landed), "Echo: lost reply");
+const lateCancel = { ...newChat(), requestId: randomUUID() };
+dynamo.once(transaction((key) => key.startsWith("TURN#")), (apply) => {
+  dynamo.items.get(`USER#${owner.sub}|REQUEST#${lateCancel.requestId}`).cancelRequested = {
+    BOOL: true,
+  };
+  return apply();
+});
+const cancelled = await send(owner, { ...lateCancel, message: "cancel at commit" });
+assert.equal(cancelled.error?.code, "CANCELLED", "A cancel before commit is honored");
+assert.equal(cancelled.status.status, "cancelled");
+assert.equal(
+  [...s3.objects.keys()].filter((key) => key.includes(lateCancel.conversationId)).length,
+  0,
+  "The uncommitted body is removed",
+);
+assert.equal(
+  [...dynamo.items.keys()].filter((key) => key.includes(`LOCK#alpha#${lateCancel.conversationId}`))
+    .length,
+  0,
+);
+console.log("PASS: write conflicts, lost commit replies and cancellation at commit");
+
+// A delete interrupted after marking the conversation resumes on the next call.
+const interrupted = { ...base, conversationId: randomUUID() };
+assert.ok((await send(owner, { ...interrupted, message: "to resume" })).done);
+const chatRow = dynamo.items.get(
+  `USER#${owner.sub}|CHAT#alpha#${interrupted.conversationId}`,
+);
+chatRow.status = { S: "DELETING" };
+delete chatRow.gsi1pk;
+delete chatRow.gsi1sk;
+assert.equal(await code(owner, "conversations.get", interrupted), "NOT_FOUND");
+assert.ok((await data(owner, "conversations.delete", interrupted)).deleted);
+assert.equal(
+  [...dynamo.items.keys()].filter((key) => key.includes(interrupted.conversationId)).length,
+  0,
+  "Resuming removes the turns, not just the answer",
+);
+console.log("PASS: interrupted conversation deletes resume");
 
 // Files and skills, counted against storage.
 const before = (await data(owner, "session.get")).user.storageUsedBytes;
@@ -377,6 +504,16 @@ assert.equal(completed.item.status, "ACTIVE");
 const files = await data(owner, "objects.list", { projectId: "alpha" });
 assert.equal(files.items.length, 1);
 assert.equal(files.usedBytes, before + 5);
+for (let count = 0; count < 60; count++)
+  await data(owner, "objects.beginUpload", {
+    projectId: "alpha",
+    name: "abandoned.txt",
+    contentType: "text/plain",
+    sizeBytes: 1,
+  });
+const past = await data(owner, "objects.list", { projectId: "alpha" });
+assert.equal(past.items.length, 1, "Abandoned uploads don't hide files");
+assert.equal(past.nextCursor, null);
 assert.equal((await data(owner, "objects.list", { projectId: "main" })).items.length, 0);
 await data(owner, "agents.put", {
   projectId: "alpha",
@@ -403,6 +540,14 @@ assert.equal(
   "QUOTA_EXCEEDED",
 );
 await data(owner, "users.setLimits", { sub: owner.sub, budgetMicroUsd: null, storageBytes: null });
+assert.equal(await code(owner, "objects.delete", { projectId: "alpha", id: upload.id }), "SKILL_IN_USE");
+await data(owner, "agents.put", {
+  projectId: "alpha",
+  id: agent.id,
+  revision: 1,
+  name: "Echo",
+  modelId: "test.echo",
+});
 await data(owner, "objects.delete", { projectId: "alpha", id: upload.id });
 assert.equal((await data(owner, "objects.list", { projectId: "alpha" })).items.length, 0);
 console.log("PASS: uploads, skills, storage quota and object deletion");
@@ -456,6 +601,33 @@ const rotations = await Promise.all(
 assert.equal(rotations.filter((result) => result.ok).length, 1);
 assert.equal(rotations.find((result) => !result.ok).error.code, "REVISION_CONFLICT");
 assert.equal(await code(owner, "connections.test", { id: connection.id }), "NOT_FOUND");
+assert.equal(
+  await code(member, "connections.put", {
+    id: connection.id,
+    revision: connection.revision,
+    name: "Repo",
+    kind: "jira",
+    credentialId: credential.id,
+  }),
+  "VALIDATION_FAILED",
+  "A connection keeps its kind",
+);
+const user = await data(member, "agents.put", {
+  name: "Coder",
+  modelId: "test.echo",
+  codeInterpreter: true,
+  connectionIds: [connection.id],
+});
+assert.equal(
+  await code(member, "connections.delete", { id: connection.id, revision: connection.revision }),
+  "CONNECTION_IN_USE",
+);
+await data(member, "agents.put", {
+  id: user.id,
+  revision: user.revision,
+  name: "Coder",
+  modelId: "test.echo",
+});
 await data(member, "connections.delete", { id: connection.id, revision: connection.revision });
 current = (await data(member, "credentials.list")).items[0];
 await data(member, "credentials.delete", { id: credential.id, revision: current.revision });
@@ -476,6 +648,18 @@ assert.equal(
   (await data(owner, "defaults.set", { ...defaults, budgetMicroUsd: 1000 })).revision,
   defaults.revision + 1,
 );
+assert.equal(
+  await code(owner, "users.invite", { email: "member@example.com", role: "Members" }),
+  "USER_EXISTS",
+);
+await data(owner, "users.invite", { email: "new@example.com", role: "Members" });
+const invited = [...cognito.users.values()].find((item) => item.email === "new@example.com");
+invited.groups = [];
+await data(owner, "users.setRole", { sub: invited.sub, role: "Members" });
+assert.deepEqual(invited.groups, ["Members"], "A person with no role can be given one");
+invited.groups = ["Members", "Auditors"];
+await data(owner, "users.setRole", { sub: invited.sub, role: "Auditors" });
+assert.deepEqual(invited.groups, ["Auditors"], "A half-finished change is repaired");
 console.log("PASS: administration, protected owner and access changes");
 
 // A character split across request chunks is decoded intact.

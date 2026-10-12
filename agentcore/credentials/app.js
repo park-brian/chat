@@ -1,7 +1,7 @@
 import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import { createFeedback, confirmAction, Field, Empty, Skeleton } from "../shared/ui.js";
+import { canWrite, createFeedback, confirmAction, Field, Skeleton } from "../shared/ui.js";
 
 mountPage({
   key: "credentials",
@@ -10,18 +10,27 @@ mountPage({
     const [items, setItems] = createSignal(null),
       [editing, setEditing] = createSignal(null),
       feedback = createFeedback();
-    const writable = () => session().user.role !== "Auditors";
+    const writable = () => canWrite(session);
     async function load() {
       setItems((await rpc("credentials.list")).items);
     }
     feedback.perform(load, "");
+    // After a conflict the open editor follows the reloaded credential.
+    async function reloadEditing() {
+      await load();
+      setEditing(items().find((item) => item.id === editing()?.id) || null);
+    }
     const mutation = (command, input, form) =>
-      feedback.perform(async () => {
-        await rpc(command, input);
-        form?.reset();
-        setEditing(null);
-        await load();
-      });
+      feedback.perform(
+        async () => {
+          await rpc(command, input);
+          form?.reset();
+          setEditing(null);
+          await load();
+        },
+        undefined,
+        reloadEditing,
+      );
     return html`${feedback.view}
       <p class="help">
         Reusable secrets for your connectors. Saved secret values are never

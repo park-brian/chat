@@ -238,9 +238,19 @@ export function createDynamo() {
       }),
     };
   };
-  return {
+  const interceptors = [];
+  const fake = {
     items,
+    // The next command matching `match` runs as `action(apply)` instead, so a
+    // test can fail it, delay it, or act before or after it lands.
+    once: (match, action) => interceptors.push({ match, action }),
     async send(command) {
+      const at = interceptors.findIndex(({ match }) => match(command));
+      if (at < 0) return fake.apply(command);
+      const [{ action }] = interceptors.splice(at, 1);
+      return action(() => fake.apply(command));
+    },
+    async apply(command) {
       const input = command.input;
       switch (command.constructor.name) {
         case "GetItemCommand":
@@ -309,6 +319,7 @@ export function createDynamo() {
       }
     },
   };
+  return fake;
 }
 
 export function createS3() {
@@ -353,7 +364,11 @@ export function createS3() {
           return { ContentLength: found.Body.length, VersionId: found.VersionId };
         }
         case "CopyObjectCommand": {
-          const source = latest(input.CopySource.split("/").slice(1).join("/"));
+          const [path, version] = input.CopySource.split("?versionId=");
+          const key = path.split("/").slice(1).join("/");
+          const source = version
+            ? objects.get(key)?.find((entry) => entry.VersionId === version)
+            : latest(key);
           if (!source) throw missing();
           return { VersionId: put(input.Key, source.Body, input.ContentType).VersionId };
         }
@@ -434,6 +449,10 @@ export function createCognito() {
             })),
           };
         case "AdminCreateUserCommand": {
+          if ([...users.values()].some((user) => user.email === input.Username))
+            throw Object.assign(new Error("User account already exists"), {
+              name: "UsernameExistsException",
+            });
           const sub = crypto.randomUUID();
           users.set(sub, {
             sub,

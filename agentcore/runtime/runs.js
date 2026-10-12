@@ -19,7 +19,7 @@ import {
   uuid,
 } from "./db.js";
 
-export const maxActiveRuns = 3;
+const maxActiveRuns = 3;
 // "running" until the turn is saved, fails or is cancelled; "outcome_unknown"
 // only when its worker stopped heartbeating.
 export const runStatuses = [
@@ -53,24 +53,30 @@ const chatKey = (sub, run) =>
 
 // The operations that free a run: its branch lock (only if still its own),
 // one off the conversation's run count, and its slot in the owner's set.
-export const releaseOps = (sub, run) => ({
-  lock: {
-    Delete: {
-      Key: lockKey(sub, run),
-      ...expression({
-        condition: "#requestId = :request",
-        values: { ":request": run.requestId },
-      }),
+// The conversation and profile parts are also given as plain changes, for a
+// commit that writes those items anyway.
+export function releaseOps(sub, run) {
+  const slotDrop = { activeRequests: new Set([run.requestId]) };
+  return {
+    lock: {
+      Delete: {
+        Key: lockKey(sub, run),
+        ...expression({
+          condition: "#requestId = :request",
+          values: { ":request": run.requestId },
+        }),
+      },
     },
-  },
-  chatAdd: { activeRuns: -1 },
-  slot: {
-    Update: {
-      Key: userKey(sub, sk.profile),
-      ...expression({ drop: { activeRequests: new Set([run.requestId]) } }),
+    chatAdd: { activeRuns: -1 },
+    slotDrop,
+    slot: {
+      Update: {
+        Key: userKey(sub, sk.profile),
+        ...expression({ drop: slotDrop }),
+      },
     },
-  },
-});
+  };
+}
 
 export function createRuns() {
   // Created on first use: module state is captured in the Runtime snapshot, so
@@ -257,8 +263,9 @@ export function createRuns() {
       progressClosed: false,
     });
 
-  // A lock or slot can outlive its request only if a worker died between
-  // finishing and releasing. Such leftovers are reclaimed when they block.
+  // A lock or slot outlives its request when a worker stops before releasing
+  // it or the release itself fails. Such leftovers are reclaimed when they
+  // block.
   async function reclaim(identity, request, code) {
     const ids =
       code === "BRANCH_BUSY"
@@ -293,6 +300,7 @@ export function createRuns() {
     let pending = [],
       bytes = 0,
       chunk = 0,
+      written = { progressChunks: 0, progressSequence: 0 },
       queue = Promise.resolve(),
       failure = null,
       closed = false;
@@ -308,6 +316,7 @@ export function createRuns() {
       }
       queue = queue
         .then(async () => {
+          if (failure) return;
           await s3.send(
             new PutObjectCommand({
               Bucket: bucket(),
@@ -316,14 +325,14 @@ export function createRuns() {
               ContentType: "application/json",
             }),
           );
-          await update(
-            requestKey(sub, requestId),
-            expression({
-              set: {
-                progressChunks: index + 1,
-                progressSequence: batch.at(-1).sequence,
-              },
-            }),
+          written = {
+            progressChunks: index + 1,
+            progressSequence: batch.at(-1).sequence,
+          };
+          // A missing chunk would break remote watchers, but a missed count
+          // is carried forward by the next flush or by close().
+          await update(requestKey(sub, requestId), expression({ set: written })).catch(
+            (error) => console.error("Could not record progress", error.name),
           );
         })
         .catch((error) => {
@@ -352,13 +361,16 @@ export function createRuns() {
       },
       async close() {
         clearInterval(timer);
-        await flush();
-        await update(
-          requestKey(sub, requestId),
-          expression({ set: { progressClosed: true } }),
-        );
-        closed = true;
-        for (const listener of listeners) listener(null);
+        try {
+          await flush();
+          await update(
+            requestKey(sub, requestId),
+            expression({ set: { ...written, progressClosed: true } }),
+          );
+        } finally {
+          closed = true;
+          for (const listener of listeners) listener(null);
+        }
       },
     };
   }
@@ -404,6 +416,7 @@ export function createRuns() {
             throw error;
           await admit(identity, row, admission);
         }
+        task.request = request;
         task.progress = progress(identity.sub, input.requestId);
         heartbeat = setInterval(
           () =>
@@ -449,21 +462,19 @@ export function createRuns() {
         clearInterval(heartbeat);
         if (task.progress) {
           await task.progress.close().catch(() => {});
-          const row = await get(requestKey(identity.sub, input.requestId));
-          await release(identity.sub, row).catch(() =>
+          await release(identity.sub, task.request).catch(() =>
             console.error("Could not release run"),
           );
         }
         tasks.delete(taskKey);
       }
-    })();
+    })().catch(() => console.error("Run cleanup failed"));
     try {
       return await ready;
     } catch (error) {
+      // The request row exists, so this returns it or refuses a mismatch.
       if (error.code !== "DUPLICATE_REQUEST") throw error;
-      const raced = await existing();
-      if (!raced) fail("BRANCH_BUSY");
-      return raced;
+      return existing();
     }
   }
 
@@ -530,14 +541,25 @@ export function createRuns() {
     response.end();
   }
 
+  // Reports the run as it is: a finished run is not marked.
   async function cancel(identity, input) {
     const current = await state(identity, input.requestId);
-    if (!terminal(current.status))
-      await update(
-        requestKey(identity.sub, input.requestId),
-        expression({ set: { cancelRequested: true } }),
+    if (terminal(current.status)) return current;
+    try {
+      return view(
+        await update(
+          requestKey(identity.sub, input.requestId),
+          expression({
+            set: { cancelRequested: true },
+            condition: "#status = :running",
+            values: { ":running": "running" },
+          }),
+        ),
       );
-    return { ...current, cancelRequested: true };
+    } catch (error) {
+      if (error.name !== "ConditionalCheckFailedException") throw error;
+      return state(identity, input.requestId);
+    }
   }
 
   return { start, state, watch, cancel, busy: () => tasks.size > 0 };

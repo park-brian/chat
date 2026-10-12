@@ -22,7 +22,7 @@ const config = {
 const sub = "11111111-1111-4111-a111-111111111111",
   other = "22222222-2222-4222-a222-222222222222";
 const defaults = {
-  budgetMicroUsd: 5000000,
+  budgetMicroUsd: 5000123,
   storageBytes: 5000000000,
   period: "daily",
   revision: 1,
@@ -46,7 +46,102 @@ const second = {
   email: "member@example.com",
   role: "Members",
   protected: false,
+  // Not a round GB, so a rounded prefill would rewrite it on save.
+  storageBytes: 1234567891,
+  storageInherited: false,
 };
+const agent = {
+  id: "33333333-3333-4333-a333-333333333333",
+  name: "Research",
+  modelId: catalog[0].id,
+  revision: 0,
+  systemPrompt: "Research carefully.",
+};
+// Field names and types each page mutation must send, checked as the UI drives them.
+const shapes = {
+  "agents.put": [
+    {
+      projectId: "string",
+      name: "string",
+      modelId: "string",
+      systemPrompt: "string",
+      codeInterpreter: "boolean",
+      webSearch: "boolean",
+      browser: "boolean",
+      webSearchMaxResults: "integer",
+      browserSessionSeconds: "integer",
+      connectionIds: "strings",
+      skillIds: "strings",
+    },
+    { id: "string", revision: "integer", thinkingLevel: "string" },
+  ],
+  "agents.setArchived": [
+    { projectId: "string", id: "string", revision: "integer", archived: "boolean" },
+  ],
+  "objects.beginUpload": [
+    {
+      projectId: "string",
+      name: "string",
+      sizeBytes: "integer",
+      contentType: "string",
+      kind: "string",
+    },
+  ],
+  "objects.completeUpload": [{ projectId: "string", id: "string" }],
+  "projects.create": [{ id: "string", name: "string" }],
+  "projects.rename": [{ id: "string", revision: "integer", name: "string" }],
+  "projects.setHidden": [{ id: "string", revision: "integer", hidden: "boolean" }],
+  "users.invite": [{ email: "string", role: "string" }],
+  "users.setLimits": [
+    {
+      sub: "string",
+      budgetMicroUsd: "integer?",
+      storageBytes: "integer?",
+      period: "string?",
+    },
+  ],
+  "users.setRole": [{ sub: "string", role: "string" }],
+  "users.setEnabled": [{ sub: "string", enabled: "boolean" }],
+  "users.startNewBudgetPeriod": [{ sub: "string" }],
+  "defaults.set": [
+    {
+      budgetMicroUsd: "integer",
+      storageBytes: "integer",
+      period: "string",
+      revision: "integer",
+    },
+  ],
+  "connections.put": [
+    { name: "string", kind: "string", credentialId: "string" },
+    { id: "string", revision: "integer", jiraUrl: "string", jiraEmail: "string" },
+  ],
+  "connections.test": [{ id: "string" }],
+};
+const typed = {
+  string: (value) => typeof value === "string",
+  boolean: (value) => typeof value === "boolean",
+  integer: Number.isSafeInteger,
+  strings: (value) =>
+    Array.isArray(value) && value.every((item) => typeof item === "string"),
+};
+function shapeErrors(command, input) {
+  const [required, optional = {}] = shapes[command] || [];
+  if (!required) return [];
+  const problems = [];
+  for (const [name, type] of Object.entries({ ...required, ...optional })) {
+    if (!(name in input)) {
+      if (name in required) problems.push("missing " + name);
+      continue;
+    }
+    const nullable = type.endsWith("?");
+    if (!(nullable && input[name] === null) && !typed[type.replace("?", "")](input[name]))
+      problems.push(`${name} is ${JSON.stringify(input[name])}, expected ${type}`);
+  }
+  for (const name of Object.keys(input))
+    if (!(name in required) && !(name in optional))
+      problems.push("unexpected " + name);
+  return problems.map((problem) => `${command}: ${problem}`);
+}
 const snapshots = new URL("../.artifacts/screenshots/pages/", import.meta.url);
 await mkdir(snapshots, { recursive: true });
 try {
@@ -98,10 +193,33 @@ try {
       cold = false,
       starting = false;
     let credentialItems = [],
-      connectionItems = [];
+      connectionItems = [],
+      agentItems = [agent],
+      objectItems = [],
+      projectItems = [{ id: "main", name: "Main project" }],
+      conflictNext = false;
+    const invalid = [];
+    await context.route(
+      "https://pages-test.s3.us-east-1.amazonaws.com/**",
+      (route) =>
+        route.fulfill({
+          status: 204,
+          headers: { "Access-Control-Allow-Origin": "*" },
+        }),
+    );
     await context.route("**/invocations?qualifier=DEFAULT", async (route) => {
       const { command, input } = route.request().postDataJSON();
       calls.push({ command, input });
+      const problems = shapeErrors(command, input);
+      if (problems.length) {
+        invalid.push(...problems);
+        return route.fulfill({
+          json: { ok: false, error: { code: "VALIDATION_FAILED" } },
+        });
+      }
+      // Long enough that a second click lands while the first save is in flight.
+      if (command === "agents.put")
+        await new Promise((resolve) => setTimeout(resolve, 200));
       // session.get is held longer than page reads so overlap is observable.
       if (delay)
         await new Promise((resolve) =>
@@ -138,7 +256,6 @@ try {
         });
       }
       let data, error;
-      const projectItems = [{ id: "main", name: "Main project" }];
       const conversation = {
         id: "44444444-4444-4444-a444-444444444444",
         agentId: "33333333-3333-4333-a333-333333333333",
@@ -147,21 +264,74 @@ try {
         lastActivityAt: new Date().toISOString(),
         activeBranchId: "main",
       };
-      const agent = {
-        id: "33333333-3333-4333-a333-333333333333",
-        name: "Research",
-        modelId: catalog[0].id,
-        revision: 0,
-        systemPrompt: "Research carefully.",
-      };
+      const saved = (items, id) => items.find((item) => item.id === id);
       if (command === "session.get") data = { apiVersion: 3, user, defaults };
       else if (command === "users.list")
         data = { items: [user, second], defaults, cursor: null };
       else if (command === "users.get")
         data = { user: input.userSub === other ? second : user, defaults };
-      else if (command.startsWith("users.") || command === "defaults.set")
-        data = { updated: true };
+      else if (command === "defaults.set")
+        data = { ...defaults, revision: defaults.revision + 1 };
+      else if (command.startsWith("users.")) data = { updated: true };
       else if (command === "projects.list") data = { items: projectItems };
+      else if (command === "projects.create") {
+        data = { id: input.id, name: input.name, revision: 0 };
+        projectItems = [...projectItems, data];
+      } else if (["projects.rename", "projects.setHidden"].includes(command)) {
+        const project = saved(projectItems, input.id);
+        if (project?.revision !== input.revision) error = { code: "REVISION_CONFLICT" };
+        else {
+          data = {
+            ...project,
+            ...(command === "projects.rename"
+              ? { name: input.name }
+              : { hidden: input.hidden }),
+            revision: project.revision + 1,
+          };
+          projectItems = projectItems.map((item) => (item.id === input.id ? data : item));
+        }
+      } else if (command === "agents.put") {
+        const current = input.id && saved(agentItems, input.id);
+        // One edit meets a newer revision saved elsewhere.
+        if (current && conflictNext) {
+          conflictNext = false;
+          agentItems = agentItems.map((item) =>
+            item.id === input.id
+              ? { ...item, name: "Research (edited elsewhere)", revision: item.revision + 1 }
+              : item,
+          );
+          error = { code: "REVISION_CONFLICT" };
+        } else if (current && current.revision !== input.revision)
+          error = { code: "REVISION_CONFLICT" };
+        else {
+          const { projectId, ...fields } = input;
+          data = {
+            ...fields,
+            id: input.id || crypto.randomUUID(),
+            revision: current ? current.revision + 1 : 0,
+          };
+          agentItems = current
+            ? agentItems.map((item) => (item.id === data.id ? data : item))
+            : [...agentItems, data];
+        }
+      } else if (command === "agents.setArchived") {
+        const current = saved(agentItems, input.id);
+        data = { ...current, archived: input.archived, revision: current.revision + 1 };
+        agentItems = agentItems.map((item) => (item.id === data.id ? data : item));
+      } else if (command === "objects.beginUpload")
+        data = {
+          id: "66666666-6666-4666-a666-666666666666",
+          upload: {
+            url: "https://pages-test.s3.us-east-1.amazonaws.com/",
+            fields: { key: "pending/upload" },
+          },
+          pending: input,
+        };
+      else if (command === "objects.completeUpload") {
+        const begun = calls.findLast(({ command }) => command === "objects.beginUpload");
+        data = { id: input.id, ...begun.input, status: "ACTIVE" };
+        objectItems = [...objectItems, data];
+      }
       else if (command === "workspace.get")
         data = {
           session: { user, defaults },
@@ -191,11 +361,23 @@ try {
           nextCursor: null,
         };
       else if (command === "chat.start") data = { requestId: input.requestId };
-      else if (command === "agents.list") data = { items: [agent] };
+      else if (command === "agents.list") data = { items: agentItems };
       else if (command === "models.list")
-        data = { items: catalog.map((model) => ({ ...model, active: true })) };
+        data = {
+          items: [
+            ...catalog.map((model) => ({ ...model, active: true })),
+            // A company outside the familiar ones still gets its own group.
+            {
+              ...catalog[0],
+              id: "pages-test-unlisted",
+              name: "Unlisted model",
+              company: "Example Labs",
+              active: false,
+            },
+          ],
+        };
       else if (command === "objects.list")
-        data = { items: [], limitBytes: defaults.storageBytes, usedBytes: 0 };
+        data = { items: objectItems, limitBytes: defaults.storageBytes, usedBytes: 0 };
       else if (command === "usage.get")
         data = {
           items: [],
@@ -429,6 +611,156 @@ try {
     await cancelEdit.click();
     await page.getByRole("button", { name: "Confirm", exact: true }).click();
     await page.getByRole("dialog").waitFor({ state: "hidden" });
+    if (name === "desktop") {
+      const sent = (command) =>
+        calls.filter((call) => call.command === command).map((call) => call.input);
+      const alert = page.locator('#page-content [role="alert"]');
+      await navigation("agents/");
+      const modelPicker = page.locator("#agent-model");
+      await modelPicker.locator("option").first().waitFor({ state: "attached" });
+      assert.deepEqual(
+        await modelPicker.locator("optgroup").evaluateAll((groups) =>
+          groups.map((group) => group.label),
+        ),
+        [...new Set(catalog.map((model) => model.company)), "Example Labs"],
+        "Model groups follow the catalog's companies",
+      );
+      assert.equal(await modelPicker.inputValue(), catalog[0].id);
+      await page.locator("#agent-name").fill("Writer");
+      await page.getByLabel(/Code repository/).check();
+      await page.getByRole("button", { name: "Create agent" }).click();
+      await alert.getByText("Enable code workspace").waitFor();
+      assert.equal(sent("agents.put").length, 0, "Grant without workspace is refused locally");
+      await page.getByLabel("Enable code workspace").check();
+      await page.getByRole("button", { name: "Create agent" }).dblclick();
+      await page.getByText("Saved.").waitFor();
+      const [created, ...duplicates] = sent("agents.put");
+      assert.equal(duplicates.length, 0, "A double click creates one agent");
+      assert.equal(created.name, "Writer");
+      assert.equal(created.modelId, catalog[0].id);
+      assert.equal(created.codeInterpreter, true);
+      assert.deepEqual(created.connectionIds, [sub]);
+      assert.equal(created.id, undefined);
+      assert.equal(await page.locator("#agent-name").inputValue(), "", "Create resets the form");
+      assert.equal(await page.getByLabel("Enable code workspace").isChecked(), false);
+      const row = (text) => page.locator(".agent-list .item").filter({ hasText: text });
+      await row("Research").getByRole("button", { name: "Edit" }).click();
+      assert.equal(
+        await row("Research").getByRole("button", { name: "Archive" }).isDisabled(),
+        true,
+        "The agent being edited cannot be archived",
+      );
+      await page.locator("#agent-name").fill("Research v2");
+      conflictNext = true;
+      await page.getByRole("button", { name: "Save agent" }).click();
+      await alert.getByText("changed elsewhere").waitFor();
+      assert.equal(
+        await page.locator("#agent-name").inputValue(),
+        "Research (edited elsewhere)",
+        "A conflict reloads the edited agent",
+      );
+      await page.getByRole("button", { name: "Save agent" }).click();
+      await page.getByRole("heading", { name: "New agent" }).waitFor();
+      const edit = sent("agents.put").at(-1);
+      assert.equal(edit.id, agent.id);
+      assert.equal(edit.revision, 1);
+      await row("Writer").getByRole("button", { name: "Archive" }).click();
+      await row("Writer").getByRole("button", { name: "Restore" }).waitFor();
+      assert.equal(sent("agents.setArchived").at(-1).archived, true);
+
+      await page.getByRole("button", { name: "Files & skills" }).click();
+      await page.locator("#object-file").setInputFiles({
+        name: "notes.md",
+        mimeType: "text/markdown",
+        buffer: Buffer.from("# Notes\n"),
+      });
+      await page.locator("#object-kind").selectOption("skill");
+      await page.getByRole("button", { name: "Upload" }).click();
+      await page.getByText("Upload saved.").waitFor();
+      await page.locator(".item").filter({ hasText: "notes.md" }).waitFor();
+      assert.deepEqual(sent("objects.beginUpload").at(-1), {
+        projectId: "main",
+        name: "notes.md",
+        sizeBytes: 8,
+        contentType: "text/markdown",
+        kind: "skill",
+      });
+      assert.equal(await page.locator("#object-file").inputValue(), "");
+
+      await page.getByRole("button", { name: "Projects" }).click();
+      await page.locator("#project-name").fill("Research lab");
+      await page.locator("#project-id").fill("research-lab");
+      await page.getByRole("button", { name: "Create project" }).click();
+      await page.waitForURL(/project=research-lab/);
+      assert.deepEqual(sent("projects.create").at(-1), {
+        id: "research-lab",
+        name: "Research lab",
+      });
+      await navigation("agents/?project=research-lab&section=projects");
+      await page.locator("#project-name-research-lab").fill("Lab");
+      await page.getByRole("button", { name: "Rename" }).click();
+      await page.locator(".item strong", { hasText: /^Lab$/ }).waitFor();
+      await page.getByRole("button", { name: "Hide" }).click();
+      await page.getByText("Lab · Hidden").waitFor();
+      assert.deepEqual(sent("projects.rename").at(-1), {
+        id: "research-lab",
+        revision: 0,
+        name: "Lab",
+      });
+      assert.deepEqual(sent("projects.setHidden").at(-1), {
+        id: "research-lab",
+        revision: 1,
+        hidden: true,
+      });
+
+      await navigation("profile/?user=" + other);
+      await page.locator('input[name="inheritBudget"]').uncheck();
+      await page.locator('input[name="budget"]').fill("0.001234");
+      const request = (command) =>
+        page
+          .waitForRequest(
+            (sent) =>
+              sent.url().includes("/invocations") &&
+              sent.postDataJSON()?.command === command,
+          )
+          .then((sent) => sent.postDataJSON().input);
+      const limits = request("users.setLimits");
+      await page.getByRole("button", { name: "Save limits" }).click();
+      assert.deepEqual(
+        await limits,
+        { sub: other, budgetMicroUsd: 1234, storageBytes: second.storageBytes, period: null },
+        "Sub-cent budgets submit and untouched storage keeps its exact bytes",
+      );
+      await page.getByText("Saved.").waitFor();
+      // Chosen while a notice shows: clearing it must not redraw the form and drop the choice.
+      await page.locator('select[name="role"]').selectOption("Auditors");
+      const role = request("users.setRole");
+      await page.getByRole("button", { name: "Save role" }).click();
+      await page.getByRole("button", { name: "Confirm", exact: true }).click();
+      assert.deepEqual(await role, { sub: other, role: "Auditors" });
+      await page.getByText("Saved.").waitFor();
+
+      await navigation("users/");
+      const saveDefaults = request("defaults.set");
+      await page.getByRole("button", { name: "Save defaults" }).click();
+      assert.deepEqual(
+        await saveDefaults,
+        { ...defaults },
+        "Untouched defaults are sent back exactly",
+      );
+      await page.getByText("Saved.").waitFor();
+      await page.locator('input[name="email"]').fill("new@example.com");
+      await page.locator('select[name="role"]').selectOption("Auditors");
+      await page.getByRole("button", { name: "Send invitation" }).click();
+      await page.getByText("Invitation sent.").waitFor();
+      assert.deepEqual(sent("users.invite").at(-1), {
+        email: "new@example.com",
+        role: "Auditors",
+      });
+      assert.equal(await page.locator('input[name="email"]').inputValue(), "");
+      assert.deepEqual(invalid, [], "Mutation payloads match the Runtime's shapes");
+      console.log("PASS: desktop page mutations send well-formed input and recover from conflicts");
+    }
     if (name === "mobile") {
       await page.getByRole("button", { name: "Toggle navigation" }).click();
       await page.locator(".site-menu.open").waitFor();

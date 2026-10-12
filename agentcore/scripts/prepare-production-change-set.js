@@ -16,7 +16,7 @@ const filename = process.argv[2];
 if (!/^controller-[a-f0-9]{20}\.zip$/.test(filename || ""))
   throw Error("Pass the exact validated ZIP filename");
 // A release that intentionally removes or adds resources names them; anything
-// else must be an in-place update. Example: --remove Data,Memory --add Table
+// else must be an in-place update. Example: --remove OldTable --add NewTable
 const listed = (flag) => {
   const at = process.argv.indexOf(flag);
   return at < 0 ? [] : process.argv[at + 1].split(",").filter(Boolean).sort();

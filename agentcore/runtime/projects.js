@@ -8,7 +8,10 @@ import {
   pack,
   patterns,
   put,
+  nameOf,
   query,
+  revised,
+  revisionOf,
   sk,
   update,
   userKey,
@@ -23,11 +26,6 @@ const view = ({ id, name, hidden, revision, createdAt }) => ({
   revision,
   createdAt,
 });
-const nameOf = (name) => {
-  if (typeof name !== "string" || !name.trim() || name.length > 80)
-    fail("VALIDATION_FAILED");
-  return name.trim();
-};
 
 // Resolves a request's project id, defaulting to main, and proves it exists.
 export async function projectOf(identity, input) {
@@ -46,11 +44,6 @@ export async function listProjects(identity) {
   return [main, ...page.items.map(view)];
 }
 
-const revisionOf = (revision) => {
-  if (!Number.isSafeInteger(revision) || revision < 0)
-    fail("VALIDATION_FAILED");
-  return revision;
-};
 const existingId = (id) => {
   if (!patterns.project.test(id || "") || id === "main")
     fail("VALIDATION_FAILED");
@@ -59,8 +52,8 @@ const existingId = (id) => {
 async function change(identity, input, set) {
   const id = existingId(input.id);
   const revision = revisionOf(input.revision);
-  try {
-    const saved = await update(
+  const saved = await revised(
+    update(
       userKey(identity.sub, sk.project(id)),
       expression({
         set,
@@ -68,13 +61,9 @@ async function change(identity, input, set) {
         condition: "attribute_exists(pk) AND #revision = :revision",
         values: { ":revision": revision },
       }),
-    );
-    return view(saved);
-  } catch (error) {
-    if (error.name === "ConditionalCheckFailedException")
-      fail("REVISION_CONFLICT");
-    throw error;
-  }
+    ),
+  );
+  return view(saved);
 }
 export const projectCommands = {
   "projects.list": {

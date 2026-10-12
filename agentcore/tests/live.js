@@ -2,12 +2,31 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chromium } from "../../node_modules/playwright/index.mjs";
 import { mkdir } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import {
+  catalogModelNames,
+  readSession,
+  submitHostedSignIn,
+  transport,
+} from "./fixtures.js";
+
+const stories = [
+  "pages",
+  "login",
+  "runtime-foundation",
+  "runtime-roadmap",
+  "runtime-benchmark",
+  "runtime-model",
+  "runtime-web",
+];
 
 export async function runLiveStory(
   page,
   fixture,
   { story = "pages", screenshot = false } = {},
 ) {
+  story ??= "pages";
+  if (!stories.includes(story)) throw Error("Unknown live story: " + story);
   const peers = [],
     contexts = [];
   let replacementBrowser;
@@ -25,23 +44,7 @@ export async function runLiveStory(
     const descriptor = new URL(identity.entryUrl).searchParams;
     for (const [name, value] of descriptor) url.searchParams.set(name, value);
     await target.goto(url.href);
-    await target.getByRole("button", { name: "Sign in", exact: true }).click();
-    await target
-      .locator('input[type="password"]')
-      .first()
-      .waitFor({ timeout: 30000 });
-    await target
-      .locator('input[type="email"], input[name="username"]')
-      .first()
-      .fill(identity.email);
-    await target
-      .locator('input[type="password"]')
-      .first()
-      .fill(identity.password);
-    await target
-      .locator('button[type="submit"], input[type="submit"]')
-      .first()
-      .click();
+    await submitHostedSignIn(target, identity);
     try {
       await target
         .locator('[data-app-state="ready"]')
@@ -62,36 +65,11 @@ export async function runLiveStory(
         cause: error,
       });
     }
-    const auth = await target.evaluate(() => {
-      const config = JSON.parse(sessionStorage.getItem("agentcore:deployment"));
-      const state = JSON.parse(
-        sessionStorage.getItem(
-          `agentcore:session:${config.runtime}:${config.client}`,
-        ),
-      );
-      return { config, ...state };
-    });
+    const auth = await readSession(target);
     identity.trackRuntimeSession(auth.runtimeSessionId);
     identity.setRuntimeStopToken(auth.tokens.access_token);
     return auth;
   };
-  const transport =
-    (identity, auth) =>
-    async (command, input = {}) => {
-      const response = await fetch(identity.controllerUrl, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: "Bearer " + auth.tokens.access_token,
-          "x-amzn-bedrock-agentcore-runtime-session-id": auth.runtimeSessionId,
-        },
-        body: JSON.stringify({ v: 1, command, requestId: randomUUID(), input }),
-        signal: AbortSignal.timeout(120000),
-      });
-      if (!response.ok) throw Error("Runtime HTTP " + response.status);
-      const result = await response.json();
-      return result;
-    };
   const good = async (rpc, command, input) => {
     const result = await rpc(command, input);
     assert.equal(
@@ -123,7 +101,7 @@ export async function runLiveStory(
     );
     await mkdir(dir, { recursive: true });
     await target.screenshot({
-      path: new URL(name + ".png", dir).pathname.replace(/^\/([A-Z]:)/, "$1"),
+      path: fileURLToPath(new URL(name + ".png", dir)),
       fullPage: true,
     });
   };
@@ -189,19 +167,11 @@ export async function runLiveStory(
           : models.filter((model) =>
               selected
                 ? model.id === selected
-                : [
-                    "Claude Haiku 5.5",
-                    "Claude Sonnet 5.5",
-                    "Claude Opus 5.5",
-                    "Claude Fable 5.1",
-                    "GPT-6.1 Sol",
-                    "GPT-6 Luna",
-                    "Gemini 3.8 Flash",
-                  ].includes(model.name),
+                : catalogModelNames.includes(model.name),
             );
       assert.equal(
         candidates.length,
-        story === "runtime-web" || selected ? 1 : 7,
+        story === "runtime-web" || selected ? 1 : catalogModelNames.length,
       );
       for (const model of candidates) {
         const agent = await good(rpc, "agents.put", {
@@ -642,14 +612,7 @@ export async function runLiveStory(
     await good(rpc, "chat.start", lost);
     await fixture.stopRuntimeSession(auth.runtimeSessionId);
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    const lostAuth = await returning.evaluate(() => {
-      const config = JSON.parse(sessionStorage.getItem("agentcore:deployment"));
-      return JSON.parse(
-        sessionStorage.getItem(
-          `agentcore:session:${config.runtime}:${config.client}`,
-        ),
-      );
-    });
+    const lostAuth = await readSession(returning);
     const later = transport(fixture, lostAuth);
     assert.equal(
       (await waitRun(later, lost.requestId, 150000)).status,

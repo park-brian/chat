@@ -1,26 +1,33 @@
 import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import { createFeedback, confirmAction, Field, Skeleton } from "../shared/ui.js";
+import { canWrite, createFeedback, confirmAction, Field, Skeleton } from "../shared/ui.js";
 
 mountPage({
   key: "connectors",
   title: "Connectors",
-  render: ({ rpc, session, projectId, pageUrl }) => {
+  render: ({ rpc, session, pageUrl }) => {
     const [items, setItems] = createSignal(null),
       [credentials, setCredentials] = createSignal([]),
       [editing, setEditing] = createSignal(null);
     const [kind, setKind] = createSignal("github"),
       [checks, setChecks] = createSignal({}),
       feedback = createFeedback();
-    const writable = () => session().user.role !== "Auditors";
+    const writable = () => canWrite(session);
     async function load() {
       const [connections, saved] = await Promise.all([
-        rpc("connections.list", { projectId: projectId() }),
+        rpc("connections.list"),
         rpc("credentials.list"),
       ]);
       setItems(connections.items);
       setCredentials(saved.items);
+    }
+    // After a conflict the editor follows the reloaded connector.
+    async function reloadEditing() {
+      await load();
+      const fresh = items().find((item) => item.id === editing()?.id) || null;
+      setEditing(fresh);
+      setKind(fresh?.kind || "github");
     }
     feedback.perform(load, "");
     return html`${feedback.view}
@@ -38,18 +45,21 @@ mountPage({
               const form = event.currentTarget,
                 fields = Object.fromEntries(new FormData(form)),
                 item = editing();
-              feedback.perform(async () => {
-                await rpc("connections.put", {
-                  ...fields,
-                  projectId: projectId(),
-                  ...(item && { id: item.id, revision: item.revision }),
-                });
-                form.reset();
-                setEditing(null);
-                setKind("github");
-                setChecks({});
-                await load();
-              });
+              feedback.perform(
+                async () => {
+                  await rpc("connections.put", {
+                    ...fields,
+                    ...(item && { id: item.id, revision: item.revision }),
+                  });
+                  form.reset();
+                  setEditing(null);
+                  setKind("github");
+                  setChecks({});
+                  await load();
+                },
+                undefined,
+                reloadEditing,
+              );
             }}
           >
             <div class="inline-fields">
@@ -155,10 +165,7 @@ mountPage({
                         }));
                         const result = await feedback.perform(
                           () =>
-                            rpc("connections.test", {
-                              projectId: projectId(),
-                              id: item.id,
-                            }),
+                            rpc("connections.test", { id: item.id }),
                           "",
                         );
                         setChecks((current) => ({
@@ -176,14 +183,17 @@ mountPage({
                             `Delete ${item.name}? Agents using this connector will need a new grant.`,
                           )
                         )
-                          await feedback.perform(async () => {
-                            await rpc("connections.delete", {
-                              projectId: projectId(),
-                              id: item.id,
-                              revision: item.revision,
-                            });
-                            await load();
-                          });
+                          await feedback.perform(
+                            async () => {
+                              await rpc("connections.delete", {
+                                id: item.id,
+                                revision: item.revision,
+                              });
+                              await load();
+                            },
+                            undefined,
+                            reloadEditing,
+                          );
                       }}
                     >
                       Delete

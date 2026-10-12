@@ -140,9 +140,12 @@ export function createSession() {
       validateAccess(state.tokens.access_token, config);
       return state.tokens.access_token;
     }
+    // Only a rejected refresh token signs the person out everywhere; an offline
+    // tab or a Cognito outage keeps the tokens for the next attempt.
+    const expired = () =>
+      Object.assign(Error("Session expired. Sign in again."), { signOut: true });
     refreshing ||= (async () => {
-      if (!state.tokens.refresh_token)
-        throw Error("Session expired. Sign in again.");
+      if (!state.tokens.refresh_token) throw expired();
       const response = await fetch(new URL("/oauth2/token", config.domain), {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -152,15 +155,23 @@ export function createSession() {
           refresh_token: state.tokens.refresh_token,
         }),
       });
-      if (!response.ok) throw Error("Session expired. Sign in again.");
+      if ([400, 401].includes(response.status)) throw expired();
+      if (!response.ok)
+        throw Error("Could not refresh your sign-in. Try again in a moment.");
       const next = await response.json();
-      validateAccess(next.access_token, config);
+      // Another tab may have signed out while the refresh was in flight.
+      if (!state) throw Error("Sign in to continue.");
+      try {
+        validateAccess(next.access_token, config);
+      } catch (error) {
+        throw Object.assign(error, { signOut: true });
+      }
       state.tokens = { ...state.tokens, ...next };
       save();
       return state.tokens.access_token;
     })()
       .catch((error) => {
-        clear();
+        if (error.signOut) clear();
         throw error;
       })
       .finally(() => {
@@ -305,6 +316,5 @@ export function createSession() {
       state.runtimeStarted = true;
       save();
     },
-    dispose: () => channel?.close(),
   };
 }

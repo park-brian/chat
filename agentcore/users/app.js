@@ -1,15 +1,28 @@
 import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import { createFeedback, dollars, gb, Badge, Empty, Skeleton } from "../shared/ui.js";
+import {
+  bytesPerGb,
+  createFeedback,
+  createPager,
+  exactAmount,
+  fromAmount,
+  microUsd,
+  Badge,
+  Empty,
+  LoadMore,
+  Skeleton,
+} from "../shared/ui.js";
 
 mountPage({
   key: "users",
   title: "Users",
   render: ({ rpc, pageUrl }) => {
     const [data, setData] = createSignal(null),
-      feedback = createFeedback();
+      feedback = createFeedback(),
+      pager = createPager(feedback.report);
     async function load() {
+      pager.reset();
       setData(await rpc("users.list"));
     }
     feedback.perform(load, "");
@@ -40,19 +53,21 @@ mountPage({
                 >`}<//
             >
           </div>
-          <${Show} when=${() => data()?.cursor}
-            ><button
-              onClick=${() =>
-                feedback.perform(async () => {
-                  const next = await rpc("users.list", {
-                    cursor: data().cursor,
-                  });
-                  setData({ ...next, items: [...data().items, ...next.items] });
-                }, "")}
-            >
-              Load more people
-            </button><//
-          >
+          <${LoadMore}
+            when=${() => data()?.cursor}
+            pager=${pager}
+            label="Load more people"
+            onMore=${() =>
+              pager.more(
+                () => rpc("users.list", { cursor: data().cursor }),
+                (next) =>
+                  setData((current) => ({
+                    ...next,
+                    defaults: current.defaults,
+                    items: [...current.items, ...next.items],
+                  })),
+              )}
+          />
           <${Show} when=${() => !data()?.items?.length}
             ><${Empty} text="No users found."
           /><//>
@@ -93,9 +108,9 @@ mountPage({
           </button>
         </form>
       </section>
-      <${Show} when=${() => data()?.defaults}
-        >${() => {
-          const defaults = data().defaults;
+      <${Show} when=${() => data()?.defaults} keyed=${true}
+        >${(defaults) => {
+          // Keyed: redrawn for each loaded copy, not when notices change.
           return html`<section class="panel">
             <h2>Account defaults</h2>
             <p class="help">Inherited by users without a personal override.</p>
@@ -106,17 +121,21 @@ mountPage({
                 const fields = new FormData(event.currentTarget);
                 feedback.perform(async () => {
                   await rpc("defaults.set", {
-                    budgetMicroUsd: Math.round(
-                      Number(fields.get("budget")) * 1000000,
+                    budgetMicroUsd: fromAmount(
+                      fields.get("budget"),
+                      microUsd,
+                      defaults.budgetMicroUsd,
                     ),
-                    storageBytes: Math.round(
-                      Number(fields.get("storage")) * 1000000000,
+                    storageBytes: fromAmount(
+                      fields.get("storage"),
+                      bytesPerGb,
+                      defaults.storageBytes,
                     ),
                     period: fields.get("period"),
                     revision: defaults.revision,
                   });
                   await load();
-                });
+                }, undefined, load);
               }}
             >
               <div class="inline-fields">
@@ -125,18 +144,18 @@ mountPage({
                     name="budget"
                     type="number"
                     min="0"
-                    step="0.01"
+                    step="any"
                     required
-                    value=${dollars(defaults.budgetMicroUsd)}
+                    value=${exactAmount(defaults.budgetMicroUsd, microUsd)}
                 /></label>
                 <label
                   >Storage (GB)<input
                     name="storage"
                     type="number"
                     min="0"
-                    step="0.01"
+                    step="any"
                     required
-                    value=${gb(defaults.storageBytes)}
+                    value=${exactAmount(defaults.storageBytes, bytesPerGb)}
                 /></label>
                 <label
                   >Reset cadence<select name="period" value=${defaults.period}>

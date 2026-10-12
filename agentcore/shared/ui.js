@@ -7,6 +7,58 @@ export const dollars = (micro) => {
   return value > 0 && value < 0.01 ? value.toFixed(4) : value.toFixed(2);
 };
 export const gb = (bytes) => (Number(bytes || 0) / 1000000000).toFixed(2);
+export const microUsd = 1000000,
+  bytesPerGb = 1000000000;
+// Limit inputs show stored integers exactly; an untouched field sends its stored value back.
+export const exactAmount = (value, scale) => String(Number(value || 0) / scale);
+export const fromAmount = (text, scale, stored) =>
+  stored !== undefined && text === exactAmount(stored, scale)
+    ? stored
+    : Math.round(Number(text) * scale);
+export const canWrite = (session) => session()?.user?.role !== "Auditors";
+export const isAdmin = (session) =>
+  session()?.user?.role === "Administrators";
+export const revisionConflict = (cause) => cause?.code === "REVISION_CONFLICT";
+// "Load more": one page in flight, errors reported, pages from a replaced view dropped.
+export function createPager(report) {
+  const [loading, setLoading] = createSignal(false);
+  let generation = 0;
+  return {
+    loading,
+    reset: () => {
+      generation++;
+      setLoading(false);
+    },
+    async more(fetchPage, append) {
+      if (loading()) return;
+      const current = generation;
+      setLoading(true);
+      report("");
+      try {
+        const page = await fetchPage();
+        if (current === generation) append(page);
+      } catch (cause) {
+        if (current === generation) report(cause.message);
+      } finally {
+        if (current === generation) setLoading(false);
+      }
+    },
+  };
+}
+export const LoadMore = (props) =>
+  html`<${Show} when=${() => props.when}
+    ><div class="actions">
+      <button
+        class="secondary"
+        type="button"
+        disabled=${() => props.pager.loading()}
+        aria-busy=${() => (props.pager.loading() ? "true" : undefined)}
+        onClick=${() => props.onMore()}
+      >
+        ${() => (props.pager.loading() ? "Loading…" : props.label || "Load more")}
+      </button>
+    </div><//
+  >`;
 export const Notice = (props) =>
   html`<${Show} when=${() => props.text}
     ><div
@@ -103,7 +155,9 @@ export function createFeedback() {
     dirty = true;
     setNotice("");
   };
-  async function perform(work, message = "Saved.") {
+  // reload, when given, refreshes the page after a revision conflict so the
+  // next save starts from the latest version.
+  async function perform(work, message = "Saved.", reload) {
     setError("");
     setNotice("");
     setSaving(true);
@@ -113,7 +167,17 @@ export function createFeedback() {
       setNotice(message);
       return result;
     } catch (cause) {
-      setError(cause.message);
+      if (reload && revisionConflict(cause)) {
+        try {
+          await reload();
+          dirty = false;
+          setError(
+            "This item changed elsewhere. The latest version is shown; make your change again.",
+          );
+        } catch (failure) {
+          setError(failure.message);
+        }
+      } else setError(cause.message);
       return undefined;
     } finally {
       setSaving(false);

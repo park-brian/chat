@@ -22,12 +22,14 @@ import {
   conditionFailed,
   expression,
   fail,
+  Failure,
   get,
   pack,
   patterns,
   sk,
   transact,
   turnId as newTurnId,
+  update,
   userKey,
 } from "./db.js";
 import {
@@ -36,7 +38,7 @@ import {
   geminiStepCalls,
   readGeminiStream,
 } from "./gemini-protocol.js";
-import { createMeter, emptyUsage, estimateUsage } from "./meter.js";
+import { createMeter, emptyUsage, estimateUsage, promptTokens } from "./meter.js";
 import { approvedModel, thinkingLevelFor } from "./models.js";
 import { skillTexts, turnFiles } from "./objects.js";
 import { projectOf } from "./projects.js";
@@ -59,20 +61,34 @@ const failureMessages = {
   MODEL_BUSY: "The model is busy. Please try again.",
 };
 
+// A reply cut off at the output limit is kept, marked as such.
+function truncated(text, emit) {
+  const notice = text
+    ? "\n\n[Response truncated at the model output limit.]"
+    : "The model reached its output limit before producing a visible reply.";
+  emit({ type: "message.delta", text: notice });
+  return text + notice;
+}
+const lastStepNote =
+  "Tools are no longer available in this turn. Answer now with the results you have.";
+
 // Bedrock Converse, and the scripted test model that speaks its stream shape.
+// Text from every step is kept, as it was streamed.
 function bedrockProvider({ config, model, level, messages, tools, emit }) {
   const toolConfig = tools.specs.length
     ? { tools: tools.specs.map((toolSpec) => ({ toolSpec })) }
     : undefined;
-  const system =
-    config.systemPrompt || toolConfig
-      ? [{ text: instructions(config) }]
-      : undefined;
+  const prompt = instructions(config);
+  let text = "";
   return {
-    async step(progress) {
+    promptTokens: () => promptTokens([prompt, toolConfig, messages]),
+    // Bedrock requires toolConfig while the history holds tool blocks, so a
+    // last step keeps the tools and is told not to use them.
+    async step(progress, final) {
+      const system = [{ text: final && toolConfig ? `${prompt}\n\n${lastStepNote}` : prompt }];
       const stream =
         model.transport === "scripted"
-          ? scriptedStream(messages)
+          ? scriptedStream(messages, system)
           : (
               await bedrock.send(
                 new ConverseStreamCommand({
@@ -98,7 +114,8 @@ function bedrockProvider({ config, model, level, messages, tools, emit }) {
       progress.started = true;
       const content = [];
       let stopReason,
-        usage = null;
+        usage = null,
+        malformed = false;
       for await (const event of stream) {
         if (event.contentBlockStart?.start?.toolUse) {
           const { contentBlockIndex, start } = event.contentBlockStart;
@@ -136,26 +153,27 @@ function bedrockProvider({ config, model, level, messages, tools, emit }) {
         if (event.contentBlockStop) {
           const part = content[event.contentBlockStop.contentBlockIndex];
           if (part?.toolUse) {
+            // Read on to the usage report, which comes last.
             try {
               part.toolUse.input = JSON.parse(part.toolUse.input || "{}");
             } catch {
-              fail("MALFORMED_TOOL_CALL");
+              malformed = true;
             }
           }
         }
         if (event.messageStop) stopReason = event.messageStop.stopReason;
         if (event.metadata?.usage) usage = { ...emptyUsage(), ...event.metadata.usage };
       }
+      if (malformed) return { usage, error: new Failure("MALFORMED_TOOL_CALL") };
       const calls = content.filter((part) => part?.toolUse).map((part) => part.toolUse);
+      text += content.map((part) => part?.text || "").join("");
       if (stopReason === "tool_use" && toolConfig && calls.length)
-        return { usage, calls, content };
-      if (stopReason !== "end_turn")
+        return { usage, calls, content, text };
+      if (stopReason === "max_tokens") text = truncated(text, emit);
+      else if (stopReason !== "end_turn")
         return { usage, error: Error(`Unsupported model stop reason ${stopReason}`) };
-      return {
-        usage,
-        calls: [],
-        text: content.map((part) => part?.text || "").join(""),
-      };
+      if (!text) return { usage, error: Error("Model returned no visible response") };
+      return { usage, calls: [], text };
     },
     addResults(step, results) {
       messages.push({ role: "assistant", content: step.content });
@@ -180,10 +198,12 @@ function geminiProvider({ config, model, level, messages, tools, emit, workloadT
     role: role === "assistant" ? "model" : "user",
     parts: content.map(({ text }) => ({ text })),
   }));
+  const prompt = instructions(config);
   let apiKey,
     text = "";
   return {
-    async step(progress) {
+    promptTokens: () => promptTokens([prompt, tools.specs, contents]),
+    async step(progress, final) {
       if (!workloadToken) throw Error("Missing runtime workload token");
       apiKey ||= (
         await agentcore.send(
@@ -199,7 +219,14 @@ function geminiProvider({ config, model, level, messages, tools, emit, workloadT
           method: "POST",
           headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
           body: JSON.stringify(
-            geminiRequest(model, level, contents, instructions(config), tools.specs),
+            geminiRequest(
+              model,
+              level,
+              contents,
+              final && tools.specs.length ? `${prompt}\n\n${lastStepNote}` : prompt,
+              tools.specs,
+              final,
+            ),
           ),
           signal: AbortSignal.timeout(300000),
         },
@@ -217,19 +244,13 @@ function geminiProvider({ config, model, level, messages, tools, emit, workloadT
         return {
           usage: step.usage,
           error: /MALFORMED_FUNCTION_CALL|Malformed/.test(error.message)
-            ? Object.assign(error, { code: "MALFORMED_TOOL_CALL" })
+            ? new Failure("MALFORMED_TOOL_CALL")
             : error,
         };
       }
       text += step.visibleText;
-      if (calls.length) return { usage: step.usage, calls, parts: step.parts };
-      if (step.finishReason === "MAX_TOKENS") {
-        const notice = text
-          ? "\n\n[Response truncated at the model output limit.]"
-          : "The model reached its output limit before producing a visible reply.";
-        emit({ type: "message.delta", text: notice });
-        text += notice;
-      }
+      if (calls.length) return { usage: step.usage, calls, parts: step.parts, text };
+      if (step.finishReason === "MAX_TOKENS") text = truncated(text, emit);
       if (!text) return { usage: step.usage, error: Error("Gemini returned no visible response") };
       return { usage: step.usage, calls: [], text };
     },
@@ -246,33 +267,42 @@ function geminiProvider({ config, model, level, messages, tools, emit, workloadT
   };
 }
 
-// The model loop shared by every provider: guard, step, meter, run tools.
-async function agentLoop(provider, { run, meter, tools, promptText }) {
+// The model loop shared by every provider: guard, step, meter, run tools. The
+// last step, and any step after the tool limit, offers no tools, so work
+// already paid for ends in an answer.
+async function agentLoop(provider, { run, meter, tools }) {
   for (let step = 0; step < maxSteps; step++) {
     await run.guard();
     await meter.checkBudget();
+    const final = step === maxSteps - 1 || tools.exhausted();
     const progress = { started: false, text: "" };
     let result;
     try {
-      result = await provider.step(progress);
+      result = await provider.step(progress, final);
     } catch (error) {
       // Tokens were consumed once a stream started; record an estimate.
       if (progress.started)
-        await meter.model(estimateUsage(promptText(), progress.text), "unknown");
+        await meter.model(estimateUsage(provider.promptTokens(), progress.text), "unknown");
       throw error;
     }
     await meter.model(
-      result.usage || estimateUsage(promptText(), progress.text),
+      result.usage || estimateUsage(provider.promptTokens(), progress.text),
       result.usage ? "estimated" : "unknown",
     );
     if (result.error) throw result.error;
     if (!result.calls.length) return result.text;
+    if (final) {
+      // The model asked for tools anyway: keep what it said.
+      if (!result.text) throw Error("Agent turn limit reached");
+      const notice = "\n\n[Stopped at this turn's tool and step limits.]";
+      run.emit({ type: "message.delta", text: notice });
+      return result.text + notice;
+    }
     const results = [];
     for (const call of provider.callsOf(result))
       results.push(await tools.execute(call.name, call.input));
     provider.addResults(result, results);
   }
-  throw Error("Agent turn limit reached");
 }
 
 function validTurnInput(input) {
@@ -436,12 +466,7 @@ export async function chat(input, identity, run, workloadToken) {
   try {
     let answer;
     try {
-      answer = await agentLoop(provider, {
-        run,
-        meter,
-        tools,
-        promptText: () => JSON.stringify(messages),
-      });
+      answer = await agentLoop(provider, { run, meter, tools });
     } finally {
       await tools.close();
     }
@@ -466,13 +491,15 @@ export async function chat(input, identity, run, workloadToken) {
       },
     });
   } catch (error) {
+    // Only the app's own codes are shown; a socket or DOM error's code is not one.
     const code =
-      error.code ||
-      (error.name === "AccessDeniedException"
-        ? "MODEL_ACCESS_DENIED"
-        : error.name === "ThrottlingException"
-          ? "MODEL_BUSY"
-          : "TURN_FAILED");
+      error instanceof Failure
+        ? error.code
+        : error.name === "AccessDeniedException"
+          ? "MODEL_ACCESS_DENIED"
+          : error.name === "ThrottlingException"
+            ? "MODEL_BUSY"
+            : "TURN_FAILED";
     console.error("Turn failed", code, error.name, error.$metadata?.httpStatusCode || "");
     await markFailed(sub, requestId, code).catch(() =>
       console.error("Could not record failed turn"),
@@ -498,28 +525,25 @@ export async function chat(input, identity, run, workloadToken) {
 }
 
 async function markFailed(sub, requestId, code) {
-  await transact([
-    {
-      Update: {
-        Key: userKey(sub, sk.request(requestId)),
-        ...expression({
-          set: {
-            status: code === "CANCELLED" ? "cancelled" : "failed",
-            failureCode: code,
-            failedAt: new Date().toISOString(),
-          },
-          condition: "#status = :running",
-          values: { ":running": "running" },
-        }),
+  await update(
+    userKey(sub, sk.request(requestId)),
+    expression({
+      set: {
+        status: code === "CANCELLED" ? "cancelled" : "failed",
+        failureCode: code,
+        failedAt: new Date().toISOString(),
       },
-    },
-  ]).catch((error) => {
+      condition: "#status = :running",
+      values: { ":running": "running" },
+    }),
+  ).catch((error) => {
     if (!conditionFailed(error)) throw error;
   });
 }
 
-// Body first, then everything else in one transaction. If the branch moved,
-// nothing commits and the orphaned body is removed.
+// Body first, then everything else in one transaction. If the branch moved or
+// the request ended or was cancelled, nothing commits and the orphaned body is
+// removed.
 async function commit({
   sub,
   projectId,
@@ -618,7 +642,7 @@ async function commit({
             Key: userKey(sub, sk.request(requestId)),
             ...expression({
               set: { status: "completed", turnId: id, completedAt: now },
-              condition: "#status = :running",
+              condition: "#status = :running AND attribute_not_exists(#cancelRequested)",
               values: { ":running": "running" },
             }),
           },
@@ -628,15 +652,23 @@ async function commit({
             Key: userKey(sub, sk.profile),
             ...expression({
               add: { storageUsedBytes: body.length },
-              drop: { activeRequests: new Set([requestId]) },
+              drop: release.slotDrop,
             }),
           },
         },
         release.lock,
       ],
-      requestId,
     );
   } catch (error) {
+    const request = () => get(userKey(sub, sk.request(requestId)));
+    // Any other error (a timeout, say) leaves the outcome open; the request row
+    // settles it. An uncommitted body is then left for the conversation's
+    // deletion rather than risk removing a committed one.
+    if (error.name !== "TransactionCanceledException") {
+      const row = await request();
+      if (row?.status === "completed" && row.turnId === id) return id;
+      throw error;
+    }
     await s3
       .send(
         new DeleteObjectCommand({
@@ -646,17 +678,13 @@ async function commit({
         }),
       )
       .catch(() => console.error("Could not remove uncommitted turn body"));
-    if (error.name !== "TransactionCanceledException") throw error;
     const [, branchMoved, , requestEnded] = (error.CancellationReasons || []).map(
       (reason) => reason.Code === "ConditionalCheckFailed",
     );
     if (branchMoved) fail("BRANCH_CONFLICT");
-    if (requestEnded)
-      fail(
-        (await get(userKey(sub, sk.request(requestId))))?.cancelRequested
-          ? "CANCELLED"
-          : "OUTCOME_UNKNOWN",
-      );
+    // The request was cancelled, or is no longer running because its run was
+    // declared lost after missed heartbeats.
+    if (requestEnded) fail((await request())?.cancelRequested ? "CANCELLED" : "OUTCOME_UNKNOWN");
     throw error;
   }
   return id;

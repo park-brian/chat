@@ -1,3 +1,5 @@
+import { submitHostedSignIn } from "./fixtures.js";
+
 // Protocol regressions retained from the pre-pages live stories.
 export async function runRegression(
   page,
@@ -75,7 +77,16 @@ export async function runRegression(
           quality: "estimated",
           status: "completed",
         });
-        const people = await call("users.list", {});
+        let people = { ok: true, data: { items: [] } };
+        for (let cursor; ; ) {
+          const listed = await call("users.list", cursor ? { cursor } : {});
+          if (!listed.ok) {
+            people = listed;
+            break;
+          }
+          people.data.items.push(...listed.data.items);
+          if (!(cursor = listed.data.cursor)) break;
+        }
         const credential = await call("credentials.put", {
           name: "Private smoke credential",
           kind: "github",
@@ -118,7 +129,9 @@ export async function runRegression(
       setup.usage?.data?.daily?.items?.length !== 1 ||
       setup.detail?.data?.steps?.length !== 1 ||
       setup.filtered?.data?.items?.length !== 1 ||
-      setup.people?.data?.items?.length !== 1 ||
+      !setup.people?.data?.items?.some(
+        (user) => user.sub === setup.session?.data?.user?.sub,
+      ) ||
       !setup.connection?.data?.id ||
       setup.protectedRole?.error?.code !== "PROTECTED_ADMIN"
     )
@@ -142,22 +155,7 @@ export async function runRegression(
           if (id) peer.trackRuntimeSession(id);
         }
       });
-      await peerPage
-        .getByRole("button", { name: "Sign in", exact: true })
-        .click();
-      await peerPage.locator('input[type="password"]').waitFor();
-      await peerPage
-        .locator('input[type="email"], input[name="username"]')
-        .first()
-        .fill(peer.email);
-      await peerPage
-        .locator('input[type="password"]')
-        .first()
-        .fill(peer.password);
-      await peerPage
-        .locator('button[type="submit"], input[type="submit"]')
-        .first()
-        .click();
+      await submitHostedSignIn(peerPage, peer);
       await peerPage
         .locator('[data-app-state="ready"]')
         .waitFor({ timeout: 45000 });
@@ -778,7 +776,10 @@ export async function runRegression(
       result.zeroSession?.data?.user?.storageBytes !== 0 ||
       result.zeroDenied?.error?.code !== "QUOTA_EXCEEDED" ||
       !result.inheritLimit?.ok ||
-      result.inheritedSession?.data?.user?.storageBytes !== 5000000000 ||
+      !Number.isSafeInteger(result.inheritedSession?.data?.defaults?.storageBytes) ||
+      result.inheritedSession.data.user.storageBytes !==
+        result.inheritedSession.data.defaults.storageBytes ||
+      !result.inheritedSession.data.user.storageInherited ||
       !result.hidden?.ok ||
       !result.hiddenAgents?.data?.items?.length ||
       !result.projects?.data?.items?.find((item) => item.id === "alpha")?.hidden

@@ -1,7 +1,19 @@
 import { createSignal, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
-import { createFeedback, confirmAction, dollars, gb, Badge, Skeleton } from "../shared/ui.js";
+import {
+  bytesPerGb,
+  createFeedback,
+  confirmAction,
+  dollars,
+  exactAmount,
+  fromAmount,
+  gb,
+  isAdmin,
+  microUsd,
+  Badge,
+  Skeleton,
+} from "../shared/ui.js";
 
 mountPage({
   key: "profile",
@@ -10,7 +22,7 @@ mountPage({
     const [profile, setProfile] = createSignal(null),
       feedback = createFeedback();
     const selected = new URL(location.href).searchParams.get("user");
-    const admin = () => session().user.role === "Administrators";
+    const admin = () => isAdmin(session);
     async function load() {
       setProfile(await rpc("users.get", selected ? { userSub: selected } : {}));
     }
@@ -22,10 +34,12 @@ mountPage({
     feedback.perform(load, "");
     return html`${feedback.view}<${Show}
         when=${profile}
+        keyed=${true}
         fallback=${html`<${Skeleton} rows=${4} label="Loading profile…" />`}
       >
-        ${() => {
-          const user = profile().user;
+        ${(current) => {
+          // Keyed: redrawn for each loaded profile, not when notices change.
+          const user = current.user;
           return html`<section class="panel">
               <div class="section-heading">
                 <div>
@@ -132,11 +146,17 @@ mountPage({
                     change("users.setLimits", {
                       budgetMicroUsd: values.has("inheritBudget")
                         ? null
-                        : Math.round(Number(values.get("budget")) * 1000000),
+                        : fromAmount(
+                            values.get("budget"),
+                            microUsd,
+                            user.budgetMicroUsd,
+                          ),
                       storageBytes: values.has("inheritStorage")
                         ? null
-                        : Math.round(
-                            Number(values.get("storage")) * 1000000000,
+                        : fromAmount(
+                            values.get("storage"),
+                            bytesPerGb,
+                            user.storageBytes,
                           ),
                       period: values.has("inheritPeriod")
                         ? null
@@ -150,9 +170,9 @@ mountPage({
                         name="budget"
                         type="number"
                         min="0"
-                        step="0.01"
+                        step="any"
                         required
-                        value=${dollars(user.budgetMicroUsd)}
+                        value=${exactAmount(user.budgetMicroUsd, microUsd)}
                         disabled=${user.budgetInherited}
                       />
                       <span class="check"
@@ -169,9 +189,9 @@ mountPage({
                         name="storage"
                         type="number"
                         min="0"
-                        step="0.01"
+                        step="any"
                         required
-                        value=${gb(user.storageBytes)}
+                        value=${exactAmount(user.storageBytes, bytesPerGb)}
                         disabled=${user.storageInherited}
                       />
                       <span class="check"

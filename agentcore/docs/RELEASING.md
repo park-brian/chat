@@ -48,14 +48,19 @@ AWS_PROFILE=eaap node scripts/validation-stack.js update controller-<hash>.zip
 `bootstrap` creates a tagged stack with scripted inference enabled and records
 it in `.artifacts/pages-validation-stack.json`. `update` deploys the current
 template and the named ZIP, and refuses resource replacement. Then run the
-live stories against it (`--live-stack` takes the recorded stack name):
+live stories against the recorded stack. `scripts/test-live-pages.js` takes
+one story name: `pages` (the default; every page, roles, credentials,
+background runs), `login`, `runtime-roadmap`, `runtime-foundation`,
+`runtime-benchmark`, `runtime-web` or `runtime-model`. The `test:live`,
+`test:roadmap`, `test:foundation`, `test:runtime-web`, `test:runtime-model`
+and `bench:runtime` npm scripts run the same with the CSP check first.
 
 ```bash
-node ../test.js index.html --story runtime-roadmap --live-stack <stack> --profile eaap --region us-east-1
+AWS_PROFILE=eaap node scripts/test-live-pages.js runtime-roadmap
 ```
 
 ```bash
-node ../test.js index.html --story runtime-foundation --live-stack <stack> --profile eaap --region us-east-1
+AWS_PROFILE=eaap node scripts/test-live-pages.js runtime-foundation
 ```
 
 ```bash
@@ -68,6 +73,22 @@ AWS_PROFILE=eaap node scripts/test-live-pages.js runtime-web
 
 ```bash
 AWS_PROFILE=eaap node scripts/test-live-pages.js runtime-model
+```
+
+After the `pages` story, check that none of its credential secrets, raw or
+base64, reached the Runtime's CloudWatch logs. It calls the `aws` CLI on
+`PATH` with `--profile` (`AWS_PROFILE`, default `eaap`) and drops any static
+keys from its environment:
+
+```bash
+node scripts/test-credential-logs.js
+```
+
+To run a story against another stack, `../test.js` takes the stack name,
+profile and Region explicitly, and refuses `--live-stack` without a name:
+
+```bash
+node ../test.js index.html --story runtime-roadmap --live-stack <stack> --profile eaap --region us-east-1
 ```
 
 `runtime-model` runs real inference on every catalog model (a few cents).
@@ -89,7 +110,7 @@ AWS_PROFILE=eaap node scripts/prepare-production-change-set.js controller-<hash>
 
 This uploads the ZIP and creates a change set for review; it never executes
 one. It refuses replacements. A release that intentionally removes or adds
-resources must name them, for example `--remove Data,Memory --add Table`, and
+resources must name them, for example `--remove OldTable --add NewTable`, and
 the change set must match exactly. Review `.artifacts/pages-production-review.json`,
 then:
 

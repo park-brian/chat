@@ -9,7 +9,8 @@ import {
   pack,
   patterns,
   put,
-  query,
+  queryAll,
+  revised,
   sk,
   update,
   userKey,
@@ -25,11 +26,11 @@ export const agentKey = (sub, projectId, id) =>
 const view = ({ pk, sk: sortKey, ...agent }) => agent;
 
 export async function listAgents(identity, projectId, includeArchived = true) {
-  const page = await query({
+  const rows = await queryAll({
     pk: userPk(identity.sub),
     prefix: sk.agent(projectId),
   });
-  return page.items
+  return rows
     .map(view)
     .filter((agent) => includeArchived || !agent.archived);
 }
@@ -174,9 +175,9 @@ export const agentCommands = {
         typeof input.archived !== "boolean"
       )
         fail("VALIDATION_FAILED");
-      try {
-        return view(
-          await update(
+      return view(
+        await revised(
+          update(
             agentKey(identity.sub, projectId, input.id),
             expression({
               set: { archived: input.archived },
@@ -185,12 +186,8 @@ export const agentCommands = {
               values: { ":revision": input.revision },
             }),
           ),
-        );
-      } catch (error) {
-        if (error.name === "ConditionalCheckFailedException")
-          fail("REVISION_CONFLICT");
-        throw error;
-      }
+        ),
+      );
     },
   },
 };

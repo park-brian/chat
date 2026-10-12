@@ -76,7 +76,7 @@ export const pack = (object) =>
       .filter(([, value]) => value !== undefined)
       .map(([name, value]) => [name, attribute(value)]),
   );
-export const unpack = (item) =>
+const unpack = (item) =>
   item
     ? Object.fromEntries(
         Object.entries(item).map(([name, value]) => [
@@ -107,10 +107,14 @@ export class Failure extends Error {
 export const fail = (code) => {
   throw new Failure(code);
 };
+// A failed condition, alone or inside a transaction. Transactions cancelled
+// for other reasons (conflicts, throttling) are real errors.
 export const conditionFailed = (error) =>
-  ["ConditionalCheckFailedException", "TransactionCanceledException"].includes(
-    error.name,
-  );
+  error.name === "ConditionalCheckFailedException" ||
+  (error.name === "TransactionCanceledException" &&
+    (error.CancellationReasons || []).some(
+      (reason) => reason.Code === "ConditionalCheckFailed",
+    ));
 
 // Builds Update/Condition parameters from plain values. `set` values are
 // assigned and `add` values are numeric increments or set additions. In a
@@ -137,10 +141,12 @@ export function expression({
         attributes[`:set_${name}`] = attribute(value);
         return `${alias(name)} = :set_${name}`;
       }),
-    ...Object.entries(init).map(([name, value]) => {
-      attributes[`:init_${name}`] = attribute(value);
-      return `${alias(name)} = if_not_exists(${alias(name)}, :init_${name})`;
-    }),
+    ...Object.entries(init)
+      .filter(([, value]) => value !== undefined)
+      .map(([name, value]) => {
+        attributes[`:init_${name}`] = attribute(value);
+        return `${alias(name)} = if_not_exists(${alias(name)}, :init_${name})`;
+      }),
   ];
   if (assigned.length) parts.push("SET " + assigned.join(", "));
   const added = Object.entries(add);
@@ -178,6 +184,23 @@ export function expression({
     }),
   };
 }
+// A revision-checked write; a failed check means someone saved first.
+export const revised = (promise) =>
+  promise.catch((error) => {
+    if (conditionFailed(error)) fail("REVISION_CONFLICT");
+    throw error;
+  });
+// Input checks shared by named, revisioned records.
+export const nameOf = (name) => {
+  if (typeof name !== "string" || !name.trim() || name.length > 80)
+    fail("VALIDATION_FAILED");
+  return name.trim();
+};
+export const revisionOf = (revision) => {
+  if (!Number.isSafeInteger(revision) || revision < 0)
+    fail("VALIDATION_FAILED");
+  return revision;
+};
 // A conditional write that resolves to false instead of throwing on conflict.
 export const attempt = (promise) =>
   promise.then(
@@ -204,17 +227,45 @@ export const put = (item, condition = {}) =>
   dynamo.send(
     new PutItemCommand({ TableName: table(), Item: item, ...condition }),
   );
+// Rollups, the profile and request rows are written by up to three runs at
+// once, so a write can collide with another's transaction. DynamoDB rejects
+// the colliding write untouched; it is retried a few times with backoff. A
+// failed condition is never retried.
+const contended = (error) => {
+  const reasons = (error.CancellationReasons || []).map((reason) => reason.Code);
+  return (
+    ["TransactionConflictException", "TransactionInProgressException"].includes(error.name) ||
+    (error.name === "TransactionCanceledException" &&
+      reasons.includes("TransactionConflict") &&
+      !reasons.includes("ConditionalCheckFailed"))
+  );
+};
+async function retried(send) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await send();
+    } catch (error) {
+      if (attempt === 3 || !contended(error)) throw error;
+      await new Promise((resolve) =>
+        setTimeout(resolve, 50 * 2 ** attempt * (1 + Math.random())),
+      );
+    }
+  }
+}
+
 // Resolves to the item as plain values after the update.
 export const update = async (itemKey, parameters) =>
   unpack(
     (
-      await dynamo.send(
-        new UpdateItemCommand({
-          TableName: table(),
-          Key: itemKey,
-          ReturnValues: "ALL_NEW",
-          ...parameters,
-        }),
+      await retried(() =>
+        dynamo.send(
+          new UpdateItemCommand({
+            TableName: table(),
+            Key: itemKey,
+            ReturnValues: "ALL_NEW",
+            ...parameters,
+          }),
+        ),
       )
     ).Attributes,
   );
@@ -225,16 +276,17 @@ export const remove = (itemKey, condition = {}) =>
 // Every transaction carries an explicit token: the SDK's generated one comes
 // from the snapshot-restored random state, so two restored workers would reuse
 // the same token sequence and collide within DynamoDB's idempotency window.
-export const transact = (items, token = uuid()) =>
-  dynamo.send(
-    new TransactWriteItemsCommand({
-      TransactItems: items.map((item) => {
-        const [type, operation] = Object.entries(item)[0];
-        return { [type]: { TableName: table(), ...operation } };
-      }),
-      ClientRequestToken: token,
+// Retries reuse the token, so one that follows an unseen success is a no-op.
+export const transact = (items, token = uuid()) => {
+  const command = new TransactWriteItemsCommand({
+    TransactItems: items.map((item) => {
+      const [type, operation] = Object.entries(item)[0];
+      return { [type]: { TableName: table(), ...operation } };
     }),
-  );
+    ClientRequestToken: token,
+  });
+  return retried(() => dynamo.send(command));
+};
 
 // Many items by key, in input order (missing items are null).
 export async function getMany(keys) {
@@ -257,7 +309,7 @@ export async function getMany(keys) {
   );
 }
 
-// One page of a partition prefix, newest first unless asked otherwise.
+// One page of a partition prefix, in key order unless `forward` is false.
 export async function query({
   pk,
   prefix,
@@ -319,8 +371,8 @@ export async function queryAll(options) {
   return items;
 }
 
-// Opaque, tamper-evident-enough cursors: the server re-checks every decoded
-// key against the caller's own partition before using it.
+// Opaque cursors. They are not signed: the server re-checks every decoded key
+// against the caller's own partition before using it.
 export const encodeCursor = (value) =>
   value ? Buffer.from(JSON.stringify(value)).toString("base64url") : null;
 export function decodeCursor(cursor, valid) {

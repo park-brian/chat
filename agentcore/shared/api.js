@@ -16,12 +16,65 @@ const messages = {
   BRANCH_CONFLICT: "This conversation path changed. Reopen it before sending.",
   RUN_ACTIVE:
     "Wait for active turns to finish before deleting this conversation.",
+  RUN_LIMIT: "Too many turns are running. Wait for one to finish.",
+  ADMISSION_FAILED: "The turn could not start. Try again.",
+  BUDGET_EXHAUSTED: "Your usage budget for this period is used up.",
+  STORAGE_EXHAUSTED: "Your file storage is full. Delete files to continue.",
+  QUOTA_EXCEEDED: "This would exceed your file storage limit.",
+  MODEL_UNAVAILABLE: "This model is not available. Choose another model.",
+  TOOL_UNAVAILABLE: "This model or agent cannot use the requested tool.",
+  AGENT_ARCHIVED: "This agent is archived. Restore it or choose another.",
+  CONNECTION_REVOKED: "This connector's access was revoked. Reconnect it.",
+  CONNECTION_UNAVAILABLE: "A selected connector is no longer available.",
+  CONNECTION_IN_USE: "Remove this connector from its agents before deleting it.",
+  CONNECTION_TEST_UNAVAILABLE: "This connector cannot be tested.",
+  SKILL_UNAVAILABLE: "A selected skill is no longer available.",
+  SKILL_IN_USE: "Remove this skill from its agents before deleting it.",
+  FILE_UNAVAILABLE: "A selected file is no longer available.",
+  REQUEST_ID_CONFLICT: "This request was already sent with different content.",
+  PROJECT_EXISTS: "A project with this ID already exists.",
+  PROJECT_LIMIT: "The project limit has been reached.",
+  USER_EXISTS: "A person with this email already exists.",
+  UPLOAD_MISSING: "The upload did not arrive. Try uploading again.",
+  UPLOAD_SIZE_MISMATCH: "The uploaded file size did not match. Try again.",
+  UPLOAD_OUTCOME_UNKNOWN:
+    "The upload could not be confirmed. Reload to check your files.",
+  HISTORY_INCOMPLETE: "Part of this conversation could not be loaded.",
+  OUTCOME_UNKNOWN: "The outcome is unknown. Reload to check.",
+  CANCELLED: "Cancelled.",
+  ACCESS_REVOKED: "Your access changed. Sign in again.",
+  NOT_IMPLEMENTED: "This deployment does not support that action yet.",
+  TOO_LARGE: "The request is too large.",
+  INTERNAL: "Something went wrong in the Runtime. Try again.",
   SESSION_CHANGED: "Sign in again to refresh your access.",
   UNAUTHENTICATED: "Sign in to continue.",
 };
-const errorText = (error, fallback) =>
-  error?.message || messages[error?.code] || error?.code || fallback;
-export function createApi(auth) {
+const readJson = async (response) => {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// AgentCore's own authorizer answers 401/403 with { message } and no envelope.
+function failure(response, result, fallback, auth) {
+  const code =
+    result?.error?.code ||
+    ([401, 403].includes(response.status) ? "UNAUTHENTICATED" : undefined);
+  if (["SESSION_CHANGED", "UNAUTHENTICATED"].includes(code)) auth.clear();
+  return Object.assign(
+    Error(
+      result?.error?.message ||
+        messages[code] ||
+        result?.message ||
+        code ||
+        (response.ok ? fallback : `${fallback} (HTTP ${response.status})`),
+    ),
+    { status: response.status, code },
+  );
+}
+export function createApi(auth, { onWarming } = {}) {
   const observers = new Set();
   // Short RPCs in flight; long-lived chat.watch streams are reported by the run indicator instead.
   const [pending, setPending] = createSignal(0);
@@ -43,7 +96,7 @@ export function createApi(auth) {
         starting = send(command, input, signal);
         try {
           const response = await starting;
-          if (response.status !== 409) auth.markRuntimeStarted();
+          if (response.ok) auth.markRuntimeStarted();
           return response;
         } finally {
           starting = null;
@@ -54,7 +107,7 @@ export function createApi(auth) {
   }
   async function send(command, input, signal) {
     const requestId = crypto.randomUUID();
-    for (let attempt = 0; ; attempt++) {
+    for (let attempt = 0, cold = 0; ; attempt++) {
       const token = await auth.accessToken(),
         config = auth.deployment();
       const response = await fetch(
@@ -71,10 +124,17 @@ export function createApi(auth) {
           body: JSON.stringify({ v: 1, command, requestId, input }),
         },
       );
+      // 424: usually a cold Runtime that ran nothing. Retried with the same
+      // requestId; writes are guarded by ids and revisions if one did run.
+      if (response.status === 424 && cold < 3) {
+        onWarming?.();
+        await sleep(500 * 2 ** cold++);
+        continue;
+      }
       // A session that expired while idle restarts too. Nothing ran on a 409,
       // and the controller's own failures never reach the browser as 409.
       if (response.status !== 409 || attempt >= 20) return response;
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await sleep(250);
     }
   }
   async function rpc(command, input = {}) {
@@ -87,16 +147,9 @@ export function createApi(auth) {
   }
   async function call(command, input) {
     const response = await request(command, input),
-      result = await response.json();
-    if (!response.ok || !result.ok) {
-      const error = Object.assign(
-        Error(errorText(result.error, "Operation failed")),
-        { status: response.status, code: result.error?.code },
-      );
-      if (["SESSION_CHANGED", "UNAUTHENTICATED"].includes(error.code))
-        auth.clear();
-      throw error;
-    }
+      result = await readJson(response);
+    if (!response.ok || !result.ok)
+      throw failure(response, result, "Operation failed", auth);
     return result.data;
   }
   async function watch(requestId, onEvent, { after = 0, signal } = {}) {
@@ -116,19 +169,13 @@ export function createApi(auth) {
           if (
             !response.ok ||
             !response.headers.get("content-type")?.includes("text/event-stream")
-          ) {
-            const result = await response.json();
-            if (
-              ["SESSION_CHANGED", "UNAUTHENTICATED"].includes(
-                result.error?.code,
-              )
-            )
-              auth.clear();
-            throw Object.assign(
-              Error(errorText(result.error, "Observer could not connect")),
-              { code: result.error?.code },
+          )
+            throw failure(
+              response,
+              await readJson(response),
+              "Observer could not connect",
+              auth,
             );
-          }
           const reader = response.body.getReader(),
             decoder = new TextDecoder();
           let buffer = "",
@@ -168,9 +215,7 @@ export function createApi(auth) {
         } catch (error) {
           if (controller.signal.aborted || error.code || ++reconnects > 3)
             throw error;
-          await new Promise((resolve) =>
-            setTimeout(resolve, 250 * 2 ** reconnects),
-          );
+          await sleep(250 * 2 ** reconnects);
         }
       }
     } finally {

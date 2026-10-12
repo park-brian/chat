@@ -8,6 +8,15 @@ const canonical = JSON.stringify(
   null,
   2,
 );
+// Scripts load only from the one pinned package the import map names.
+const packages = new Set(
+  Object.values(JSON.parse(canonical).imports).map(
+    (url) => url.match(/^https:\/\/cdn\.jsdelivr\.net\/npm\/[\w.-]+@[\w.-]+\//)?.[0],
+  ),
+);
+if (packages.size !== 1 || packages.has(undefined))
+  throw Error("Import map must pin one jsDelivr package version");
+const [cdn] = packages;
 const hash = (text) =>
   "'sha384-" + createHash("sha384").update(text).digest("base64") + "'";
 // Classic and render-blocking, so it registers before the first render: Chrome
@@ -21,8 +30,10 @@ const reveal =
 const policy = [
   "default-src 'none'",
   // solid-js/html compiles static tagged templates with Function at runtime.
-  `script-src 'self' 'unsafe-eval' ${hash(canonical)} ${hash(reveal)} https://cdn.jsdelivr.net`,
+  `script-src 'self' 'unsafe-eval' ${hash(canonical)} ${hash(reveal)} ${cdn}`,
   "style-src 'self'",
+  // The Runtime, S3 presigned uploads (<bucket>.s3.<region>) and the Cognito
+  // hosted domain vary by deployment region; CSP wildcards are leftmost only.
   "connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com",
   "img-src 'self' data:",
   "font-src 'self'",

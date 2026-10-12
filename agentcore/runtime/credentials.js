@@ -2,11 +2,13 @@
 // from the authenticated owner; a reference change and the revision checks of
 // both sides commit in one transaction, so deletion races cannot orphan either.
 import {
-  conditionFailed,
   fail,
   get,
+  nameOf,
   patterns,
   queryAll,
+  revised,
+  revisionOf,
   sk,
   transact,
   userKey,
@@ -17,11 +19,6 @@ import {
 const kinds = ["github", "jira"];
 const credentialKey = (sub, id) => userKey(sub, sk.credential(id));
 const connectionKey = (sub, id) => userKey(sub, sk.connection(id));
-const nameOf = (name) => {
-  if (typeof name !== "string" || !name.trim() || name.length > 80)
-    fail("VALIDATION_FAILED");
-  return name.trim();
-};
 const secretOf = (secret) => {
   if (
     typeof secret !== "string" ||
@@ -31,11 +28,6 @@ const secretOf = (secret) => {
   )
     fail("VALIDATION_FAILED");
   return secret;
-};
-const revisionOf = (revision) => {
-  if (!Number.isSafeInteger(revision) || revision < 0)
-    fail("VALIDATION_FAILED");
-  return revision;
 };
 const withoutSecret = ({ secret, ...item }) => item;
 
@@ -63,14 +55,7 @@ const erase = (itemKey, item) => ({
     ExpressionAttributeValues: { ":revision": { N: String(item.revision) } },
   },
 });
-const commit = async (items) => {
-  try {
-    await transact(items);
-  } catch (error) {
-    if (conditionFailed(error)) fail("REVISION_CONFLICT");
-    throw error;
-  }
-};
+const commit = (items) => revised(transact(items));
 const list = async (sub, prefix) =>
   (await queryAll({ pk: userPk(sub), prefix })).map(decode);
 async function owned(itemKey, id) {
@@ -265,6 +250,8 @@ export const credentialCommands = ownOnly({
       const previous = input.id ? await connectionOf(sub, input.id) : null;
       if (previous && previous.revision !== revisionOf(input.revision))
         fail("REVISION_CONFLICT");
+      // Agents hold at most one connection per kind, so a kind never changes.
+      if (previous && previous.kind !== input.kind) fail("VALIDATION_FAILED");
       const credential = await credentialOf(sub, input.credentialId);
       if (credential.kind !== input.kind) fail("CREDENTIAL_KIND_MISMATCH");
       const item = {
@@ -327,6 +314,10 @@ export const credentialCommands = ownOnly({
       const previous = await connectionOf(sub, input.id);
       if (previous.revision !== revisionOf(input.revision))
         fail("REVISION_CONFLICT");
+      // Agents in any project may use it; deleting it would break their turns.
+      const agents = await queryAll({ pk: userPk(sub), prefix: "AGENT#" });
+      if (agents.some((agent) => agent.connectionIds?.includes(previous.id)))
+        fail("CONNECTION_IN_USE");
       const credential = await credentialOf(sub, previous.credentialId);
       await commit([
         erase(connectionKey(sub, previous.id), previous),

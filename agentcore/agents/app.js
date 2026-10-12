@@ -2,7 +2,7 @@ import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
 import { updateQuery } from "../shared/navigation.js";
-import { createFeedback, confirmAction, dollars, gb, Skeleton } from "../shared/ui.js";
+import { canWrite, confirmAction, createFeedback, createPager, gb, LoadMore, Skeleton } from "../shared/ui.js";
 mountPage({
   key: "agents",
   title: "Agents",
@@ -13,11 +13,15 @@ mountPage({
     const [projects, setProjects] = createSignal([]),
       [agents, setAgents] = createSignal([]),
       [models, setModels] = createSignal([]);
+    // equals: false so clearing the editor after a create re-applies the blank form.
     const [view, setView] = createSignal(null),
-      [editingAgent, setEditingAgent] = createSignal(null),
+      [editingAgent, setEditingAgent] = createSignal(null, { equals: false }),
       [draftModelId, setDraftModelId] = createSignal(null);
     const feedback = createFeedback(),
-      setError = feedback.report;
+      setError = feedback.report,
+      pager = createPager(setError);
+    const writable = () => canWrite(session);
+    let viewRequest = 0;
     const currentProject = () =>
       projects().find((item) => item.id === projectId()) || {
         name: "Main project",
@@ -26,73 +30,88 @@ mountPage({
       models().find(
         (model) => model.id === (draftModelId() || editingAgent()?.modelId),
       ) || models().find((model) => model.active);
-    const modelCompanies = ["Anthropic", "OpenAI", "Google", "Amazon", "Other"];
-    async function setAgentArchived(agent, archived) {
-      setError("");
-      try {
-        const updated = await rpc("agents.setArchived", {
-          projectId: projectId(),
-          id: agent.id,
-          revision: agent.revision || 0,
-          archived,
-        });
-        setAgents((items) =>
-          items.map((item) => (item.id === agent.id ? updated : item)),
-        );
-        feedback.saved(archived ? "Agent archived." : "Agent restored.");
-      } catch (cause) {
-        setError(cause.message);
-      }
+    const companyOf = (model) => model.company || "Other";
+    const modelCompanies = () => [...new Set(models().map(companyOf))];
+    // After a conflict the editor follows the reloaded copy of its agent.
+    async function reloadEditing() {
+      const id = editingAgent()?.id;
+      await read();
+      const fresh = id && agents().find((item) => item.id === id);
+      setEditingAgent(fresh && !fresh.archived ? fresh : null);
+      setDraftModelId(fresh?.modelId || null);
     }
+    const setAgentArchived = (agent, archived) =>
+      feedback.perform(
+        async () => {
+          const updated = await rpc("agents.setArchived", {
+            projectId: projectId(),
+            id: agent.id,
+            revision: agent.revision || 0,
+            archived,
+          });
+          setAgents((items) =>
+            items.map((item) => (item.id === agent.id ? updated : item)),
+          );
+        },
+        archived ? "Agent archived." : "Agent restored.",
+        reloadEditing,
+      );
     async function createAgent(form) {
-      await feedback.perform(async () => {
-        const editing = editingAgent();
-        const result = await rpc("agents.put", {
-          projectId: projectId(),
-          ...(editing && { id: editing.id, revision: editing.revision || 0 }),
-          name: form.get("name"),
-          modelId: form.get("modelId"),
-          systemPrompt: form.get("systemPrompt"),
-          thinkingLevel: form.get("thinkingLevel") || undefined,
-          codeInterpreter: form.has("codeInterpreter"),
-          webSearch: form.has("webSearch"),
-          browser: form.has("browser"),
-          webSearchMaxResults: Number(form.get("webSearchMaxResults")),
-          browserSessionSeconds: Number(form.get("browserSessionSeconds")),
-          connectionIds: form.getAll("connectionId"),
-          skillIds: form.getAll("skillId"),
-        });
-        setAgents((items) =>
-          editing
-            ? items.map((item) => (item.id === result.id ? result : item))
-            : [...items, result],
-        );
-
-        setEditingAgent(null);
-        setDraftModelId(null);
-        await load();
-      });
+      const fields = new FormData(form);
+      if (fields.getAll("connectionId").length && !fields.has("codeInterpreter"))
+        return setError("Enable code workspace to grant connections to this agent.");
+      await feedback.perform(
+        async () => {
+          const editing = editingAgent();
+          const result = await rpc("agents.put", {
+            projectId: projectId(),
+            ...(editing && { id: editing.id, revision: editing.revision || 0 }),
+            name: fields.get("name"),
+            modelId: fields.get("modelId"),
+            systemPrompt: fields.get("systemPrompt"),
+            thinkingLevel: fields.get("thinkingLevel") || undefined,
+            codeInterpreter: fields.has("codeInterpreter"),
+            webSearch: fields.has("webSearch"),
+            browser: fields.has("browser"),
+            webSearchMaxResults: Number(fields.get("webSearchMaxResults")),
+            browserSessionSeconds: Number(fields.get("browserSessionSeconds")),
+            connectionIds: fields.getAll("connectionId"),
+            skillIds: fields.getAll("skillId"),
+          });
+          setAgents((items) =>
+            editing
+              ? items.map((item) => (item.id === result.id ? result : item))
+              : [...items, result],
+          );
+          form.reset();
+          setEditingAgent(null);
+          setDraftModelId(null);
+          await read();
+        },
+        undefined,
+        reloadEditing,
+      );
     }
-    async function moreObjects() {
-      const cursor = view()?.nextCursor;
-      if (!cursor) return;
-      const page = await rpc("objects.list", {
-        projectId: projectId(),
-        cursor,
-      });
-      setView((current) => ({
-        ...current,
-        items: [...current.items, ...page.items],
-        nextCursor: page.nextCursor,
-      }));
-    }
-    async function uploadObject(event) {
+    const moreObjects = () =>
+      pager.more(
+        () =>
+          rpc("objects.list", {
+            projectId: projectId(),
+            cursor: view().nextCursor,
+          }),
+        (page) =>
+          setView((current) => ({
+            ...current,
+            items: [...current.items, ...page.items],
+            nextCursor: page.nextCursor,
+          })),
+      );
+    function uploadObject(event) {
       event.preventDefault();
       const form = event.currentTarget,
         file = form.elements.file.files[0];
       if (!file) return;
-      setError("");
-      try {
+      return feedback.perform(async () => {
         const started = await rpc("objects.beginUpload", {
           projectId: projectId(),
           name: file.name,
@@ -117,11 +136,8 @@ mountPage({
           id: started.id,
         });
         form.reset();
-        await load();
-        feedback.saved("Upload saved.");
-      } catch (cause) {
-        setError(cause.message);
-      }
+        await read();
+      }, "Upload saved.");
     }
     async function downloadObject(item) {
       try {
@@ -140,48 +156,38 @@ mountPage({
     }
     async function deleteObject(item) {
       if (!(await confirmAction(`Delete ${item.name}?`))) return;
-      try {
+      await feedback.perform(async () => {
         await rpc("objects.delete", { projectId: projectId(), id: item.id });
-
-        await load();
-        feedback.saved("Deleted.");
-      } catch (cause) {
-        setError(cause.message);
-      }
+        await read();
+      }, "Deleted.");
     }
-    async function createProject(event) {
+    function createProject(event) {
       event.preventDefault();
       const form = new FormData(event.currentTarget);
-      setError("");
-      try {
+      return feedback.perform(async () => {
         const created = await rpc("projects.create", {
-          id: String(form.get("id") || "")
-            .trim()
-            .toLowerCase(),
+          id: String(form.get("id") || "").trim(),
           name: String(form.get("name") || "").trim(),
         });
         feedback.clean();
         location.assign(pageUrl("agents", { project: created.id }));
-      } catch (cause) {
-        setError(cause.message);
-      }
+      }, "");
     }
-    async function updateProject(item, command, value) {
-      setError("");
-      try {
-        await rpc(command, {
-          id: item.id,
-          revision: item.revision,
-          ...(command === "projects.rename"
-            ? { name: value }
-            : { hidden: value }),
-        });
-        await load();
-        feedback.saved();
-      } catch (cause) {
-        setError(cause.message);
-      }
-    }
+    const updateProject = (item, command, value) =>
+      feedback.perform(
+        async () => {
+          await rpc(command, {
+            id: item.id,
+            revision: item.revision,
+            ...(command === "projects.rename"
+              ? { name: value }
+              : { hidden: value }),
+          });
+          await read();
+        },
+        undefined,
+        read,
+      );
 
     async function availableSkills() {
       const items = [];
@@ -196,44 +202,50 @@ mountPage({
       } while (cursor);
       return items;
     }
-    async function load() {
-      await feedback.perform(async () => {
-        // Project names are needed beside, not before, each section's own reads.
-        const listed = rpc("projects.list").then((result) => {
-          setProjects(result.items);
-          setShellProjects(result.items);
-        });
-        if (section() === "projects") {
-          await listed;
-          setView({ route: "projects", items: projects() });
-          return;
-        }
-        if (section() === "skills") {
-          const [, objects] = await Promise.all([
-            listed,
-            rpc("objects.list", { projectId: projectId() }),
-          ]);
-          setView({ route: "skills", ...objects });
-          return;
-        }
-        const [, saved, catalog, connections, objects] = await Promise.all([
+    // Numbered so a slower read for an earlier tab never replaces the current view.
+    async function read() {
+      const request = ++viewRequest,
+        current = () => request === viewRequest;
+      pager.reset();
+      // Project names are needed beside, not before, each section's own reads.
+      const listed = rpc("projects.list").then((result) => {
+        if (!current()) return;
+        setProjects(result.items);
+        setShellProjects(result.items);
+      });
+      if (section() === "projects") {
+        await listed;
+        if (current()) setView({ route: "projects", items: projects() });
+        return;
+      }
+      if (section() === "skills") {
+        const [, objects] = await Promise.all([
           listed,
-          rpc("agents.list", { projectId: projectId(), includeArchived: true }),
-          rpc("models.list"),
-          rpc("connections.list", { projectId: projectId() }),
-          availableSkills(),
+          rpc("objects.list", { projectId: projectId() }),
         ]);
-        setAgents(saved.items);
-        setModels(catalog.items);
-        setView({
-          route: "agents",
-          items: catalog.items,
-          connections: connections.items,
-          skills: objects,
-        });
-      }, "");
+        if (current()) setView({ route: "skills", ...objects });
+        return;
+      }
+      const [, saved, catalog, connections, objects] = await Promise.all([
+        listed,
+        rpc("agents.list", { projectId: projectId(), includeArchived: true }),
+        rpc("models.list"),
+        rpc("connections.list"),
+        availableSkills(),
+      ]);
+      if (!current()) return;
+      setAgents(saved.items);
+      setModels(catalog.items);
+      setView({
+        route: "agents",
+        connections: connections.items,
+        skills: objects,
+      });
     }
+    const load = () => feedback.perform(read, "");
     load();
+    // The section's child takes a parameter, so Show renders it once per shown
+    // view and notices never redraw its forms.
     return html`${feedback.view}
       <nav class="section-tabs" aria-label="Agent sections">
         <${For} each=${["agents", "projects", "skills"]}
@@ -257,7 +269,7 @@ mountPage({
         <${Show}
           when=${view}
           fallback=${html`<${Skeleton} rows=${5} label="Loading agents…" />`}
-          >${() =>
+          >${(shown) =>
             section() === "projects"
               ? html`<p class="help">
                     Projects separate agents, conversations and files. Your
@@ -265,7 +277,7 @@ mountPage({
                     shared across them. Hiding a project removes it from the
                     picker, but its direct links still work.
                   </p>
-                  <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+                  <${Show} when=${() => writable()}>
                     <form onInput=${feedback.changed} onSubmit=${createProject}>
                       <div class="inline-fields">
                         <div class="field">
@@ -290,7 +302,7 @@ mountPage({
                         </div>
                       </div>
                       <div class="actions">
-                        <button class="primary" type="submit">
+                        <button class="primary" type="submit" disabled=${feedback.saving}>
                           Create project
                         </button>
                       </div>
@@ -314,10 +326,11 @@ mountPage({
                             Open
                           </a>
                           <${Show}
-                            when=${() => item.id !== "main" && session()?.user?.role !== "Auditors"}
+                            when=${() => item.id !== "main" && writable()}
                           >
                             <button
                               class="secondary"
+                              disabled=${feedback.saving}
                               onClick=${() =>
                                 updateProject(
                                   item,
@@ -330,7 +343,7 @@ mountPage({
                           <//>
                         </div>
                         <${Show}
-                          when=${() => item.id !== "main" && session()?.user?.role !== "Auditors"}
+                          when=${() => item.id !== "main" && writable()}
                         >
                           <form
                             onInput=${feedback.changed}
@@ -356,7 +369,7 @@ mountPage({
                               />
                             </div>
                             <div class="actions">
-                              <button class="secondary" type="submit">
+                              <button class="secondary" type="submit" disabled=${feedback.saving}>
                                 Rename
                               </button>
                             </div>
@@ -369,9 +382,9 @@ mountPage({
                       Saved files, skills and artifacts share your
                       ${() => gb(view()?.limitBytes)} GB account limit. Current
                       use: ${() => gb(view()?.usedBytes)} GB. Temporary code
-                      files and chat Memory are not included.
+                      workspace files are not included.
                     </p>
-                    <${Show} when=${() => session()?.user?.role !== "Auditors"}>
+                    <${Show} when=${() => writable()}>
                       <form
                         onInput=${feedback.changed}
                         onSubmit=${uploadObject}
@@ -396,7 +409,9 @@ mountPage({
                           </div>
                         </div>
                         <div class="actions">
-                          <button class="primary" type="submit">Upload</button>
+                          <button class="primary" type="submit" disabled=${feedback.saving}>
+                            Upload
+                          </button>
                         </div>
                       </form>
                     <//>
@@ -421,7 +436,7 @@ mountPage({
                               Download
                             </button>
                             <${Show}
-                              when=${() => session()?.user?.role !== "Auditors"}
+                              when=${() => writable()}
                             >
                               <button
                                 class="secondary"
@@ -438,13 +453,11 @@ mountPage({
                         No saved objects in this project.
                       </div><//
                     >
-                    <${Show} when=${() => view()?.nextCursor}>
-                      <div class="actions">
-                        <button class="secondary" onClick=${moreObjects}>
-                          Load more
-                        </button>
-                      </div><//
-                    >`
+                    <${LoadMore}
+                      when=${() => view()?.nextCursor}
+                      pager=${pager}
+                      onMore=${moreObjects}
+                    />`
                 : html` <p class="help">
                       Create and manage agents for this project. Choose a model,
                       instructions, and the tools it may use.
@@ -477,7 +490,7 @@ mountPage({
                                 <button
                                   class="secondary"
                                   type="button"
-                                  disabled=${() => agent.archived || session().user.role === "Auditors"}
+                                  disabled=${() => agent.archived || !writable()}
                                   onClick=${async () => {
                                     if (!(await feedback.mayLeave())) return;
                                     feedback.clean();
@@ -490,7 +503,8 @@ mountPage({
                                 <button
                                   class="secondary"
                                   type="button"
-                                  disabled=${() => session().user.role === "Auditors"}
+                                  disabled=${() => !writable() || feedback.saving() || editingAgent()?.id === agent.id}
+                                  title=${() => (editingAgent()?.id === agent.id ? "Finish or cancel the edit first" : undefined)}
                                   onClick=${() => setAgentArchived(agent, !agent.archived)}
                                 >
                                   ${agent.archived ? "Restore" : "Archive"}
@@ -501,13 +515,13 @@ mountPage({
                       </div><//
                     >
                     </div>
-                    <${Show} when=${() => session().user.role !== "Auditors"}
+                    <${Show} when=${writable}
                       ><form
                         class="agent-editor"
                         onInput=${feedback.changed}
                         onSubmit=${(event) => {
                           event.preventDefault();
-                          createAgent(new FormData(event.currentTarget));
+                          createAgent(event.currentTarget);
                         }}
                       >
                         <h2 class="editor-title">
@@ -546,19 +560,15 @@ mountPage({
                                 html` <optgroup label=${company}>
                                   <${For}
                                     each=${() =>
-                                      (view()?.route === "agents"
-                                        ? view()?.items || []
-                                        : []
-                                      ).filter(
-                                        (model) =>
-                                          model.company === company,
+                                      models().filter(
+                                        (model) => companyOf(model) === company,
                                       )}
                                   >
                                     ${(model) =>
                                       html`<option
                                         value=${model.id}
                                         disabled=${!model.active}
-                                        selected=${() => (draftModelId() || editingAgent()?.modelId) === model.id}
+                                        selected=${() => chosenModel()?.id === model.id}
                                       >
                                         ${model.name}${model.active ? "" : " · not configured"}
                                       </option>`}<//
@@ -743,7 +753,7 @@ mountPage({
                               Cancel edit
                             </button><//
                           >
-                          <button class="primary" type="submit">
+                          <button class="primary" type="submit" disabled=${feedback.saving}>
                             ${() => (editingAgent() ? "Save agent" : "Create agent")}
                           </button>
                         </div>

@@ -1,8 +1,8 @@
 // Every model and tool step of a turn is recorded as it happens: the step row,
 // the budget period, the day rollup and the request total commit in one
 // transaction. A step whose usage the provider never reported is still
-// recorded, with estimated tokens and quality "unknown", so failures are never
-// free and never silently zero.
+// recorded, with estimated tokens and quality "unknown", so a failed stream is
+// not free. A worker that stops mid-step records nothing for that step.
 import { modelCost, modelRates } from "./accounting.js";
 import { expression, fail, get, pack, sk, transact, userKey } from "./db.js";
 
@@ -16,10 +16,20 @@ const emptyUsage = () => ({
 export { emptyUsage };
 
 // About four characters per token: a deliberately rough, conservative stand-in
-// used only when the provider reported nothing.
-export function estimateUsage(promptText, outputText) {
-  const inputTokens = Math.ceil(promptText.length / 4),
-    outputTokens = Math.ceil(outputText.length / 4);
+// used only when the provider reported nothing. Each provider passes its own
+// request (prompt, system and tool specs); images and other binary parts count
+// a fixed amount instead of their bytes.
+const imageTokens = 1600;
+export function promptTokens(value) {
+  if (typeof value === "string") return Math.ceil(value.length / 4);
+  if (ArrayBuffer.isView(value) || value?.inlineData || value?.image?.source)
+    return imageTokens;
+  if (value && typeof value === "object")
+    return Object.values(value).reduce((sum, part) => sum + promptTokens(part), 0);
+  return 0;
+}
+export function estimateUsage(inputTokens, outputText) {
+  const outputTokens = Math.ceil(outputText.length / 4);
   return {
     ...emptyUsage(),
     inputTokens,
@@ -139,7 +149,6 @@ export function createMeter({
       ]);
       steps++;
       costMicroUsd += cost;
-      return cost;
     },
     // Tools are recorded but unpriced: AgentCore bills them by session time,
     // which is recorded separately when each session closes.

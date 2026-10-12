@@ -400,7 +400,7 @@ async function browserAction(sessionId, input) {
   ];
 }
 
-export function toolSpecs(config) {
+function toolSpecs(config) {
   const specs = [];
   if (config.codeInterpreter)
     specs.push(
@@ -586,23 +586,26 @@ export function toolSession(config, scope, { emit, guard, meter }) {
       input &&
       typeof input === "object",
   };
+  // The session is kept as soon as it starts, so close() stops it even when
+  // setup fails; setup is retried by the next call.
   async function codeSession() {
-    if (sessions.code) return sessions.code.id;
-    if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
-    const started = Date.now();
-    const id = (
-      await agentcore.send(
-        new StartCodeInterpreterSessionCommand({
-          codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID,
-          name: `chat-${uuid().slice(0, 8)}`,
-          clientToken: uuid(),
-          sessionTimeoutSeconds: 900,
-        }),
-      )
-    ).sessionId;
-    sessions.code = { id, started };
-    workspace = await initializeWorkspace(id, scope);
-    return id;
+    if (!sessions.code) {
+      if (!process.env.CODE_INTERPRETER_ID) throw Error("Code workspace unavailable");
+      const started = Date.now();
+      const id = (
+        await agentcore.send(
+          new StartCodeInterpreterSessionCommand({
+            codeInterpreterIdentifier: process.env.CODE_INTERPRETER_ID,
+            name: `chat-${uuid().slice(0, 8)}`,
+            clientToken: uuid(),
+            sessionTimeoutSeconds: 900,
+          }),
+        )
+      ).sessionId;
+      sessions.code = { id, started };
+    }
+    workspace ||= await initializeWorkspace(sessions.code.id, scope);
+    return sessions.code.id;
   }
   async function browserSession() {
     if (sessions.browser) return sessions.browser.id;
@@ -670,10 +673,17 @@ export function toolSession(config, scope, { emit, guard, meter }) {
     if (result.isError) throw Object.assign(Error("Tool reported an error"), { output });
     return [{ text: output }];
   }
+  // Past the limit a call is answered, not run, so the model can still finish
+  // with what earlier calls returned.
   async function execute(name, input) {
     await guard();
-    if (calls.length >= maxToolCalls) throw Error("Agent tool call limit reached");
-    if (!accepts[name]?.(input)) fail("INVALID_TOOL_REQUEST");
+    if (exhausted())
+      return {
+        content: [{ text: "Tool call limit reached for this turn. Answer with the results you have." }],
+        isError: true,
+      };
+    if (!Object.hasOwn(accepts, name) || !accepts[name](input))
+      fail("INVALID_TOOL_REQUEST");
     const started = Date.now();
     let content,
       isError = false;
@@ -711,6 +721,7 @@ export function toolSession(config, scope, { emit, guard, meter }) {
     }
     return { content, isError };
   }
+  const exhausted = () => calls.length >= maxToolCalls;
   const citations = () =>
     sources.size
       ? "\n\nSources:\n" +
@@ -754,6 +765,6 @@ export function toolSession(config, scope, { emit, guard, meter }) {
         .catch(() => console.error("Could not meter managed session"));
     }
   }
-  return { specs, calls, execute, citations, close };
+  return { specs, calls, execute, exhausted, citations, close };
 }
 

@@ -1180,7 +1180,7 @@ dialog::backdrop {
   height: 1px;
   background: var(--rule);
 }
-.load-earlier:hover {
+.load-earlier:hover:not(:disabled) {
   color: var(--ink);
 }
 .welcome {

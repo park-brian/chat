@@ -4,14 +4,17 @@ export const baseUrl = new URL("../", import.meta.url);
 export const pages = [
   { key: "chat", title: "Chat", path: "", group: "primary", scoped: true },
   { key: "agents", title: "Agents", path: "agents/", group: "primary", scoped: true },
-  { key: "connectors", title: "Connectors", path: "connectors/", group: "primary", scoped: true },
+  { key: "connectors", title: "Connectors", path: "connectors/", group: "primary" },
   { key: "usage", title: "Usage", path: "usage/", group: "primary" },
   { key: "profile", title: "Profile", path: "profile/", group: "account" },
   { key: "credentials", title: "Credentials", path: "credentials/", group: "account" },
   { key: "users", title: "Users", path: "users/", group: "account", admin: true },
 ];
-export const projectId = () =>
-  new URL(location.href).searchParams.get("project") || "main";
+// An invalid ?project= falls back to main rather than reaching the Runtime.
+export const projectId = () => {
+  const value = new URL(location.href).searchParams.get("project") || "";
+  return /^[a-z0-9][a-z0-9-]{0,39}$/.test(value) ? value : "main";
+};
 export function pageUrl(key, params = {}) {
   const page = pages.find((page) => page.key === key);
   if (!page) throw Error("Unknown page");

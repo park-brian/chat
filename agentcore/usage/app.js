@@ -2,7 +2,7 @@ import { createSignal, For, Show } from "solid-js";
 import html from "solid-js/html";
 import { mountPage } from "../shared/page.js";
 import { updateQuery } from "../shared/navigation.js";
-import { createFeedback, dollars, gb, Skeleton } from "../shared/ui.js";
+import { createFeedback, createPager, dollars, isAdmin, LoadMore, Skeleton } from "../shared/ui.js";
 mountPage({
   key: "usage",
   title: "Usage",
@@ -12,7 +12,10 @@ mountPage({
       [projects, setProjects] = createSignal([]);
     const feedback = createFeedback(),
       setError = feedback.report;
-    let viewRequest = 0;
+    const usagePager = createPager(setError),
+      dailyPager = createPager(setError);
+    let viewRequest = 0,
+      detailRequest = 0;
     const [usageRange, setUsageRange] = createSignal(
       query.get("range") || "30d",
     );
@@ -68,62 +71,57 @@ mountPage({
             })
         : "—";
     };
-    async function moreUsage() {
-      const cursor = view()?.nextCursor;
-      if (!cursor) return;
-      const request = viewRequest;
-      try {
-        const page = await rpc("usage.list", { ...usageQuery(), cursor });
-        if (request === viewRequest)
+    const moreUsage = () =>
+      usagePager.more(
+        () => rpc("usage.list", { ...usageQuery(), cursor: view().nextCursor }),
+        (page) =>
           setView((current) => ({
             ...current,
             items: [...current.items, ...page.items],
             nextCursor: page.nextCursor,
-          }));
-      } catch (cause) {
-        if (request === viewRequest) setError(cause.message);
-      }
-    }
-    async function moreDaily() {
-      const cursor = view()?.daily?.nextCursor;
-      if (!cursor) return;
-      const request = viewRequest;
-      try {
-        const page = await rpc("usage.daily", {
-          range: usageRange(),
-          scope: usageScope(),
-          cursor,
-          ...(usageScope() === "self" &&
-            usageUser() && { userSub: usageUser().sub }),
-        });
-        if (request === viewRequest)
+          })),
+      );
+    const moreDaily = () =>
+      dailyPager.more(
+        () =>
+          rpc("usage.daily", {
+            range: usageRange(),
+            scope: usageScope(),
+            cursor: view().daily.nextCursor,
+            ...(usageScope() === "self" &&
+              usageUser() && { userSub: usageUser().sub }),
+          }),
+        (page) =>
           setView((current) => ({
             ...current,
             daily: {
               items: [...current.daily.items, ...page.items],
               nextCursor: page.nextCursor,
             },
-          }));
-      } catch (cause) {
-        if (request === viewRequest) setError(cause.message);
-      }
-    }
+          })),
+      );
+    // Numbered so a slow answer for an earlier click never replaces a later one.
     async function inspectUsage(item) {
+      const request = ++detailRequest;
       setError("");
+      setUsageDetail(null);
       try {
-        setUsageDetail(
-          await rpc("usage.request", {
-            requestId: item.requestId,
-            ...(item.userSub && { userSub: item.userSub }),
-          }),
-        );
+        const detail = await rpc("usage.request", {
+          requestId: item.requestId,
+          ...(item.userSub && { userSub: item.userSub }),
+        });
+        if (request === detailRequest) setUsageDetail(detail);
       } catch (cause) {
-        setError(cause.message);
+        if (request === detailRequest) setError(cause.message);
       }
     }
 
     async function loadView() {
       const request = ++viewRequest;
+      detailRequest++;
+      setUsageDetail(null);
+      usagePager.reset();
+      dailyPager.reset();
       updateQuery({
         range: usageRange(),
         sort: usageSort(),
@@ -148,7 +146,7 @@ mountPage({
           ...usageQuery(),
           includeDaily: true,
         });
-        if (request === viewRequest) setView({ route: "usage", ...result });
+        if (request === viewRequest) setView(result);
       }, "");
     }
     // The selected user and filters come from the URL, so these reads are
@@ -158,7 +156,7 @@ mountPage({
         Promise.all([
           rpc("projects.list").then((result) => setProjects(result.items)),
           usageUser() &&
-            session().user.role === "Administrators" &&
+            isAdmin(session) &&
             rpc("users.get", { userSub: usageUser().sub }).then((result) =>
               setUsageUser(result.user),
             ),
@@ -166,12 +164,14 @@ mountPage({
         ]),
       "",
     );
+    // The section's child takes a parameter, so Show renders it once per shown
+    // view and notices never redraw its forms.
     return html`${feedback.view}
       <section class="panel">
         <${Show}
           when=${view}
           fallback=${html`<${Skeleton} rows=${4} label="Loading usage…" />`}
-          >${() =>
+          >${(shown) =>
             html`<p class="help">
                 Model costs estimate reported tokens using the checked-in rates.
                 Provider tiers, discounts and other AWS charges may differ.
@@ -185,7 +185,7 @@ mountPage({
                     onClick=${() => {
                       setUsageUser(null);
                       setUsageScope("self");
-                      loadView("usage");
+                      loadView();
                     }}
                   >
                     My usage
@@ -241,11 +241,12 @@ mountPage({
                   </dd>
                 </div>
               </dl>
-              <${Show} when=${() => view()?.daily?.nextCursor}>
-                <button class="secondary" onClick=${moreDaily}>
-                  Load more daily totals
-                </button><//
-              >
+              <${LoadMore}
+                when=${() => view()?.daily?.nextCursor}
+                pager=${dailyPager}
+                onMore=${moreDaily}
+                label="Load more daily totals"
+              />
               <h3 class="section-title">Requests and tools</h3>
               <div class="inline-fields">
                 <div class="field">
@@ -255,7 +256,7 @@ mountPage({
                     value=${usageRange}
                     onChange=${(event) => {
                       setUsageRange(event.currentTarget.value);
-                      loadView("usage");
+                      loadView();
                     }}
                   >
                     <option value="30d">Last 30 days</option>
@@ -269,7 +270,7 @@ mountPage({
                     value=${usageSort}
                     onChange=${(event) => {
                       setUsageSort(event.currentTarget.value);
-                      loadView("usage");
+                      loadView();
                     }}
                   >
                     <option value="desc">Newest first</option>
@@ -277,7 +278,7 @@ mountPage({
                   </select>
                 </div>
                 <${Show}
-                  when=${() => session()?.user?.role === "Administrators"}
+                  when=${() => isAdmin(session)}
                 >
                   <div class="field">
                     <label for="usage-scope">People</label>
@@ -288,7 +289,7 @@ mountPage({
                         setUsageScope(event.currentTarget.value);
                         if (event.currentTarget.value === "all")
                           setUsageUser(null);
-                        loadView("usage");
+                        loadView();
                       }}
                     >
                       <option value="self">
@@ -305,7 +306,7 @@ mountPage({
                     value=${usageProject}
                     onChange=${(event) => {
                       setUsageProject(event.currentTarget.value);
-                      loadView("usage");
+                      loadView();
                     }}
                   >
                     <option value="all">All projects</option>
@@ -329,7 +330,7 @@ mountPage({
                         .map(([name, value]) => [name, String(value).trim()]),
                     );
                     setUsageFilters(values);
-                    loadView("usage");
+                    loadView();
                   }}
                 >
                   <div class="inline-fields">
@@ -425,7 +426,7 @@ mountPage({
                       type="button"
                       onClick=${() => {
                         setUsageFilters({});
-                        loadView("usage");
+                        loadView();
                       }}
                     >
                       Clear
@@ -434,7 +435,7 @@ mountPage({
                 </form>
               </details>
               <${For}
-                each=${() => (view()?.route === "usage" ? view()?.items || [] : [])}
+                each=${() => view()?.items || []}
               >
                 ${(item) =>
                   html`<div class="item">
@@ -507,13 +508,11 @@ mountPage({
               <${Show} when=${() => !view()?.items?.length}
                 ><div class="empty">No requests in this range.</div><//
               >
-              <${Show} when=${() => view()?.nextCursor}
-                ><div class="actions">
-                  <button class="secondary" onClick=${moreUsage}>
-                    Load more
-                  </button>
-                </div><//
-              >`}
+              <${LoadMore}
+                when=${() => view()?.nextCursor}
+                pager=${usagePager}
+                onMore=${moreUsage}
+              />`}
         <//>
       </section>`;
   },

@@ -28,6 +28,7 @@ import {
   getMany,
   key,
   patterns,
+  revised,
   sk,
   update,
   userKey,
@@ -130,16 +131,23 @@ export const userCommands = {
         !roles.includes(input.role)
       )
         fail("VALIDATION_FAILED");
-      await idp.send(
-        new AdminCreateUserCommand({
-          UserPoolId: pool(),
-          Username: input.email,
-          UserAttributes: [
-            { Name: "email", Value: input.email },
-            { Name: "email_verified", Value: "true" },
-          ],
-        }),
-      );
+      await idp
+        .send(
+          new AdminCreateUserCommand({
+            UserPoolId: pool(),
+            Username: input.email,
+            UserAttributes: [
+              { Name: "email", Value: input.email },
+              { Name: "email_verified", Value: "true" },
+            ],
+          }),
+        )
+        .catch((error) => {
+          if (error.name === "UsernameExistsException") fail("USER_EXISTS");
+          throw error;
+        });
+      // If this fails the person has no role and cannot sign in until
+      // users.setRole gives them one.
       await idp.send(
         new AdminAddUserToGroupCommand({
           UserPoolId: pool(),
@@ -210,8 +218,9 @@ export const userCommands = {
       return { enabled: input.enabled };
     },
   },
-  // Adds the new group before removing the old one, so a failure part-way
-  // leaves two groups, which every token check rejects, never zero.
+  // Adds the new group before removing any other, so a failure part-way leaves
+  // several groups, which every token check rejects, never a wrong role.
+  // Repeating the call repairs any membership, including none.
   "users.setRole": {
     admin: true,
     run: async (input, identity) => {
@@ -219,20 +228,13 @@ export const userCommands = {
       if (!roles.includes(input.role)) fail("VALIDATION_FAILED");
       if (sub === (await owner(identity.sub))) fail("PROTECTED_ADMIN");
       const current = await groupsOf(sub);
-      if (current.length !== 1 || !roles.includes(current[0]))
-        fail("ROLE_CONFLICT");
-      if (current[0] === input.role) return { role: input.role };
       const membership = (Command, group) =>
         idp.send(new Command({ UserPoolId: pool(), Username: sub, GroupName: group }));
-      await membership(AdminAddUserToGroupCommand, input.role);
-      try {
-        await membership(AdminRemoveUserFromGroupCommand, current[0]);
-      } catch (error) {
-        await membership(AdminRemoveUserFromGroupCommand, input.role).catch(() =>
-          console.error("Role change needs administrator repair"),
-        );
-        throw error;
-      }
+      if (!current.includes(input.role))
+        await membership(AdminAddUserToGroupCommand, input.role);
+      for (const group of current)
+        if (group !== input.role)
+          await membership(AdminRemoveUserFromGroupCommand, group);
       forgetAuthorization(sub);
       return { role: input.role };
     },
@@ -252,8 +254,8 @@ export const userCommands = {
       )
         fail("VALIDATION_FAILED");
       await defaults();
-      try {
-        const { pk, sk: sortKey, ...saved } = await update(
+      const { pk, sk: sortKey, ...saved } = await revised(
+        update(
           key(accountPk, "DEFAULTS"),
           expression({
             set: { budgetMicroUsd, storageBytes, period: input.period },
@@ -261,13 +263,9 @@ export const userCommands = {
             condition: "#revision = :revision",
             values: { ":revision": revision },
           }),
-        );
-        return saved;
-      } catch (error) {
-        if (error.name === "ConditionalCheckFailedException")
-          fail("REVISION_CONFLICT");
-        throw error;
-      }
+        ),
+      );
+      return saved;
     },
   },
 };

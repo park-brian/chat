@@ -3,19 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta id="app-csp" http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-s+MvcLOZCMLfJBiTYQE5auOhq6+iX1l2OrRElgkvpm0s8FJORUkW1MeX3S9aUBGm' 'sha384-kjmiTceKUmscxVf84Yzg6uf3NFOxRYOYUX+86R6ib4dZr5NrXX4oxIx8e6LTNaGh' https://cdn.jsdelivr.net; style-src 'self'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'">
+  <meta id="app-csp" http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-eval' 'sha384-ouaWeykTSfJWzevG+2pA+C1BCUhgbpjPU43uJnJQYQ3t4T5esp3DtuQ0oaxsnNiq' 'sha384-kjmiTceKUmscxVf84Yzg6uf3NFOxRYOYUX+86R6ib4dZr5NrXX4oxIx8e6LTNaGh' https://cdn.jsdelivr.net/npm/solid-js@1.9.15/; style-src 'self'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com; img-src 'self' data:; font-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'">
   <title>Usage · AgentCore</title>
   <link rel="stylesheet" href="../shared/styles.css">
   <script type="importmap">{
   "imports": {
     "solid-js": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/dist/solid.js",
     "solid-js/web": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/web/dist/web.js",
-    "solid-js/html": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/html/dist/html.js"
+    "solid-js/html": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/html/dist/html.js",
+    "solid-js/store": "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/store/dist/store.js"
   },
   "integrity": {
     "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/dist/solid.js": "sha384-BE7VFCy88CF6ECpktJQMCXpki/ezM9I9hsndLzUfpDsPvDOeWQlDnnhrmsNxQOYe",
     "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/web/dist/web.js": "sha384-+WZhEcTm3CsmdNBOtGmaXx6GMXon8WVtuDimlh6qpj6DN3jZVr1XLdwlkrT4f0E5",
-    "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/html/dist/html.js": "sha384-y0dvNquDclIU3TJfM5Jpw+ei8Y9ed9mP9YbaCPOuFq9ncniHaE49SN4JgG/43hOU"
+    "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/html/dist/html.js": "sha384-y0dvNquDclIU3TJfM5Jpw+ei8Y9ed9mP9YbaCPOuFq9ncniHaE49SN4JgG/43hOU",
+    "https://cdn.jsdelivr.net/npm/solid-js@1.9.15/store/dist/store.js": "sha384-5vmj5FVSlIbMv7hcHS+LKzMdK82m3r58Q/tCnTxQ/NP0yNLs3B3osLekLKgm5p5j"
   }
 }</script>
   <script>addEventListener("pagereveal",(e)=>{const t=e.viewTransition;if(!t)return;for(const k of["ready","updateCallbackDone","finished"])t[k].catch(()=>{});window.agentcoreReveal=t.finished.catch(()=>{})})</script>

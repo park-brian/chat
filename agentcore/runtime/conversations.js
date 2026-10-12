@@ -88,7 +88,7 @@ export async function pathTo(sub, projectId, conversationId, headTurnId, limit) 
   return { turns, next: cursor || null };
 }
 
-export const turnMessages = (turns) =>
+const turnMessages = (turns) =>
   turns.flatMap((turn) => [
     { turnId: turn.id, role: "user", text: turn.message, status: "complete" },
     {
@@ -101,11 +101,11 @@ export const turnMessages = (turns) =>
   ]);
 
 async function branchesOf(sub, projectId, conversationId) {
-  const page = await query({
+  const rows = await queryAll({
     pk: userPk(sub),
     prefix: sk.branch(projectId, conversationId),
   });
-  return page.items
+  return rows
     .map(branchView)
     .sort((a, b) =>
       a.id === "main" ? -1 : b.id === "main" ? 1 : a.createdAt.localeCompare(b.createdAt),
@@ -113,6 +113,8 @@ async function branchesOf(sub, projectId, conversationId) {
 }
 
 // Up to 25 turns, with their bodies and counted bytes. False when none remain.
+// A turn is deleted only while it exists, so overlapping deletes never return
+// the same bytes twice; the one that loses re-reads on its next step.
 async function removeTurns(sub, projectId, conversationId) {
   const turns = await query({
     pk: userPk(sub),
@@ -131,9 +133,12 @@ async function removeTurns(sub, projectId, conversationId) {
       },
     }),
   );
-  await transact([
+  await attempt(transact([
     ...turns.items.map((turn) => ({
-      Delete: { Key: turnKey(sub, projectId, conversationId, turn.id) },
+      Delete: {
+        Key: turnKey(sub, projectId, conversationId, turn.id),
+        ConditionExpression: "attribute_exists(pk)",
+      },
     })),
     {
       Update: {
@@ -148,7 +153,7 @@ async function removeTurns(sub, projectId, conversationId) {
         }),
       },
     },
-  ]);
+  ]));
   return true;
 }
 
@@ -183,7 +188,8 @@ export function conversationCommands(runs) {
       locks.items.map((lock) => runs.state(identity, lock.requestId)),
     );
   }
-  async function readChat(identity, input) {
+  // A conversation being deleted is hidden from reads; delete resumes it.
+  async function readChat(identity, input, { deleting = false } = {}) {
     const projectId = await projectOf(identity, input);
     if (
       !patterns.id.test(input.conversationId || "") ||
@@ -193,7 +199,7 @@ export function conversationCommands(runs) {
     const chat = await get(chatKey(identity.sub, projectId, input.conversationId));
     if (
       chat &&
-      (chat.status === "DELETING" ||
+      ((chat.status === "DELETING" && !deleting) ||
         (input.agentId !== undefined && chat.agentId !== input.agentId))
     )
       fail("NOT_FOUND");
@@ -236,13 +242,13 @@ export function conversationCommands(runs) {
           branchesOf(identity.sub, projectId, input.conversationId),
           activeRuns(identity, projectId, input.conversationId),
         ]);
-        // A fork's branch row is written when its first turn commits; until
-        // then a running fork is shown as a working alternative.
+        // A branch row is written when its first turn commits; until then a
+        // running branch (main, in a new conversation) is shown as working.
         for (const run of active)
           if (!branches.some((branch) => branch.id === run.branchId))
-            branches.push({
+            branches[run.branchId === "main" ? "unshift" : "push"]({
               id: run.branchId,
-              name: "Alternative · working",
+              name: run.branchId === "main" ? "Main" : "Alternative · working",
               headTurnId: run.forkTurnId,
               rootTurnId: run.forkTurnId,
               createdAt: run.acceptedAt,
@@ -271,12 +277,12 @@ export function conversationCommands(runs) {
     "conversations.delete": {
       write: true,
       run: async (input, identity) => {
-        const { projectId, chat } = await readChat(identity, input).catch(
-          (error) => {
-            if (error.code === "NOT_FOUND") return {};
-            throw error;
-          },
-        );
+        const { projectId, chat } = await readChat(identity, input, {
+          deleting: true,
+        }).catch((error) => {
+          if (error.code === "NOT_FOUND") return {};
+          throw error;
+        });
         if (!chat) return { deleted: true };
         const sub = identity.sub,
           conversationId = input.conversationId,
@@ -307,10 +313,10 @@ export function conversationCommands(runs) {
           if (await removeTurns(sub, projectId, conversationId)) continue;
           if (await removeLeftoverBodies(sub, projectId, conversationId)) continue;
           const [branches, locks] = await Promise.all([
-            query({ pk: userPk(sub), prefix: sk.branch(projectId, conversationId) }),
-            query({ pk: userPk(sub), prefix: sk.lock(projectId, conversationId) }),
+            queryAll({ pk: userPk(sub), prefix: sk.branch(projectId, conversationId) }),
+            queryAll({ pk: userPk(sub), prefix: sk.lock(projectId, conversationId) }),
           ]);
-          for (const row of [...branches.items, ...locks.items])
+          for (const row of [...branches, ...locks])
             await remove(userKey(sub, row.sk));
           await attempt(
             remove(

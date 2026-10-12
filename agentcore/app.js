@@ -1,13 +1,50 @@
-import { createEffect, createSignal, For, Show, onCleanup } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createRenderEffect,
+  createSignal,
+  For,
+  Index,
+  Show,
+  onCleanup,
+} from "solid-js";
+import { createStore } from "solid-js/store";
 import html from "solid-js/html";
 import { mountPage } from "./shared/page.js";
 import { parseDeployment } from "./shared/session.js";
 import { replaceUrl } from "./shared/navigation.js";
 import { createFeedback, confirmAction, Menu, Skeleton } from "./shared/ui.js";
 
-const routeProject = () => {
-  const value = new URL(location.href).searchParams.get("project") || "";
-  return /^[a-z0-9][a-z0-9-]{0,39}$/.test(value) ? value : "main";
+// Unique by id, keeping the first copy: pages can overlap while items move.
+const appendNew = (items, more) => [
+  ...items,
+  ...more.filter((item) => !items.some((existing) => existing.id === item.id)),
+];
+// A stable text node, so streamed text updates in place.
+const textNode = (value) => {
+  const node = document.createTextNode("");
+  createRenderEffect(() => (node.data = value()));
+  return node;
+};
+// Alternating [text, url, text, …]; trailing punctuation and unbalanced closers stay text.
+const linkParts = (text) => {
+  const parts = [];
+  let last = 0;
+  for (const match of text.matchAll(/https:\/\/[^\s<>"']+/g)) {
+    let url = match[0];
+    const unbalanced = (open, close) =>
+      url.split(close).length > url.split(open).length;
+    while (
+      /[.,;:!?]$/.test(url) ||
+      (url.endsWith(")") && unbalanced("(", ")")) ||
+      (url.endsWith("]") && unbalanced("[", "]"))
+    )
+      url = url.slice(0, -1);
+    parts.push(text.slice(last, match.index), url);
+    last = match.index + url.length;
+  }
+  parts.push(text.slice(last));
+  return parts;
 };
 await mountPage({
   key: "chat",
@@ -16,10 +53,11 @@ await mountPage({
     rpc,
     watch,
     session,
+    projectId,
     pageUrl,
     setCrumb,
     setStatus,
-    setProjects: setShellProjects,
+    setProjects,
   }) => {
     const query = new URL(location.href).searchParams,
       feedback = createFeedback();
@@ -29,6 +67,8 @@ await mountPage({
       [filesCursor, setFilesCursor] = createSignal(null),
       [filesLoaded, setFilesLoaded] = createSignal(false),
       [filesRequested, setFilesRequested] = createSignal(false),
+      [filesBusy, setFilesBusy] = createSignal(false),
+      [announcement, setAnnouncement] = createSignal(""),
       [loaded, setLoaded] = createSignal(false),
       [historyOpen, setHistoryOpen] = createSignal(false);
     let observer, fileDialog, fileDialogTrigger;
@@ -38,14 +78,6 @@ await mountPage({
       fileDialog.showModal();
       ensureFiles();
     };
-    const [projects, setProjects] = createSignal([]);
-    const [projectId] = createSignal(routeProject());
-    const currentProject = () =>
-      projects().find((item) => item.id === projectId()) || {
-        id: "main",
-        name: "Main project",
-        hidden: false,
-      };
     function showRoute(
       project = projectId(),
       conversation = null,
@@ -104,15 +136,25 @@ await mountPage({
     const [conversations, setConversations] = createSignal([]);
     const [conversationCursor, setConversationCursor] = createSignal(null);
     const [olderCursor, setOlderCursor] = createSignal(null);
-    const [messages, setMessages] = createSignal([]);
+    const [loadingOlder, setLoadingOlder] = createSignal(false);
+    // A store keeps each message's identity, so streaming updates only its text.
+    const [messages, setMessages] = createStore([]);
     const [draft, setDraft] = createSignal("");
     const [selectedFiles, setSelectedFiles] = createSignal([]);
     const [saveOutputs, setSaveOutputs] = createSignal(false);
     const [sending, setSending] = createSignal(false);
     const [loadingConversation, setLoadingConversation] = createSignal(false);
     let conversationRequest = 0;
+    // The run shown belongs to one conversation and path; switching drops it,
+    // and reopening that conversation resumes it from conversations.get.
+    function detachRun() {
+      observer?.abort();
+      observer = null;
+      setActiveRun(null);
+    }
     function newChat(agent = selectedAgent()) {
       ++conversationRequest;
+      detachRun();
       setSelectedAgent(agent);
       setConversationId(crypto.randomUUID());
       setBranchId("main");
@@ -134,6 +176,7 @@ await mountPage({
       const agent = agents().find((entry) => entry.id === item.agentId);
       if (!agent) return;
       const request = ++conversationRequest;
+      detachRun();
       setSelectedAgent(agent);
       setConversationId(item.id);
       showRoute(projectId(), item.id, selectedBranch);
@@ -155,16 +198,31 @@ await mountPage({
               run.branchId === selectedBranch &&
               run.status === "running",
           );
+          setBranchId(selectedBranch);
+          setBranches(page.branches);
           if (active) {
-            setActiveRun(active.requestId);
+            // A fork shows as a placeholder branch headed at its fork point
+            // until its first turn commits.
+            const head =
+              page.branches.find((branch) => branch.id === selectedBranch)
+                ?.headTurnId ?? null;
             setMessages((items) => [
               ...items,
               { role: "assistant", text: "", status: "pending" },
             ]);
-            observeRun(active.requestId, true);
+            observeRun({
+              requestId: active.requestId,
+              agentId: agent.id,
+              conversationId: item.id,
+              branchId: selectedBranch,
+              fork:
+                selectedBranch !== "main" &&
+                head === (active.forkTurnId ?? null),
+              previousBranch: "main",
+              after: 0,
+              needsMessage: true,
+            });
           }
-          setBranchId(selectedBranch);
-          setBranches(page.branches);
           setHeadTurnId(
             page.branches.find((branch) => branch.id === selectedBranch)
               ?.headTurnId ||
@@ -226,7 +284,7 @@ await mountPage({
         (index < 2 && olderCursor())
       )
         return;
-      const items = messages();
+      const items = messages;
       const userIndex = retry ? index - 1 : index;
       // The edited turn's parent: the turn before it, or none for the first.
       const forkTurnId = items.slice(0, userIndex).at(-1)?.turnId || null;
@@ -240,21 +298,24 @@ await mountPage({
       if (recent) openConversation(recent);
       else newChat(agent);
     }
+    // One conversations.list page at a time, shared by "More" and deep links.
+    let conversationPage = null;
+    function nextConversations() {
+      return (conversationPage ||= rpc("conversations.list", {
+        projectId: projectId(),
+        cursor: conversationCursor(),
+      })
+        .then((page) => {
+          setConversations((items) => appendNew(items, page.items));
+          setConversationCursor(page.nextCursor);
+          return page.items;
+        })
+        .finally(() => (conversationPage = null)));
+    }
     async function moreConversations() {
-      const cursor = conversationCursor();
-      if (!cursor) return;
+      if (!conversationCursor()) return;
       try {
-        const page = await rpc("conversations.list", {
-          projectId: projectId(),
-          cursor,
-        });
-        setConversations((items) => [
-          ...items,
-          ...page.items.filter(
-            (item) => !items.some((existing) => existing.id === item.id),
-          ),
-        ]);
-        setConversationCursor(page.nextCursor);
+        await nextConversations();
       } catch (cause) {
         setError(cause.message);
       }
@@ -262,58 +323,63 @@ await mountPage({
     async function moreMessages() {
       const cursor = olderCursor(),
         agent = selectedAgent(),
-        id = conversationId();
-      if (!cursor || !agent || sending()) return;
+        request = conversationRequest;
+      if (!cursor || !agent || sending() || loadingOlder()) return;
+      setLoadingOlder(true);
       try {
         const page = await rpc("conversations.get", {
           projectId: projectId(),
           agentId: agent.id,
-          conversationId: id,
+          conversationId: conversationId(),
           branchId: branchId(),
           cursor,
         });
-        if (id === conversationId()) {
+        if (request === conversationRequest) {
           setMessages((items) => [...page.messages, ...items]);
           setOlderCursor(page.nextCursor);
         }
       } catch (cause) {
-        setError(cause.message);
+        if (request === conversationRequest) setError(cause.message);
+      } finally {
+        setLoadingOlder(false);
       }
     }
     const modelCompanies = ["Anthropic", "OpenAI", "Google", "Amazon", "Other"];
 
+    // Alternating [text, code, text, …], so each slot keeps its kind while streaming.
     const messageSections = (value) =>
       String(value || "")
         .split(/(```[^\n]*\n[\s\S]*?(?:```|$))/g)
-        .filter(Boolean)
         .map((part, index, parts) =>
-          part.startsWith("```")
-            ? { code: part.replace(/^```[^\n]*\n/, "").replace(/\n?```$/, "") }
-            : {
-                // The code block supplies its own spacing; drop blank lines touching it.
-                text: part
-                  .replace(index > 0 ? /^\n+/ : /(?!)/, "")
-                  .replace(index < parts.length - 1 ? /\n+$/ : /(?!)/, ""),
-              },
+          index % 2
+            ? part.replace(/^```[^\n]*\n/, "").replace(/\n?```$/, "")
+            : // The code block supplies its own spacing; drop blank lines touching it.
+              part
+                .replace(index > 0 ? /^\n+/ : /(?!)/, "")
+                .replace(index < parts.length - 1 ? /\n+$/ : /(?!)/, ""),
         );
 
-    async function observeRun(requestId, resume = false) {
+    // A run: { requestId, agentId, conversationId, branchId, fork,
+    // previousBranch, after, needsMessage }. `after` is the last progress
+    // sequence shown, so a reconnect resumes instead of replaying.
+    async function observeRun(run) {
       observer?.abort();
-      observer = new AbortController();
+      const controller = (observer = new AbortController());
       setSending(true);
-      setActiveRun(requestId);
-      let outcome,
-        acceptedMessage = false;
+      setActiveRun(run);
+      setAnnouncement("");
+      const shown = () => activeRun() === run;
+      const last = () => messages.length - 1;
+      let outcome;
       try {
         await watch(
-          requestId,
+          run.requestId,
           (event) => {
-            if (
-              event.type === "message.accepted" &&
-              resume &&
-              !acceptedMessage
-            ) {
-              acceptedMessage = true;
+            if (!shown()) return;
+            if (event.sequence && event.type !== "run.status")
+              run.after = event.sequence;
+            if (event.type === "message.accepted" && run.needsMessage) {
+              run.needsMessage = false;
               setMessages((items) => [
                 ...items.slice(0, -1),
                 { role: "user", text: event.message },
@@ -321,85 +387,92 @@ await mountPage({
               ]);
             }
             if (event.type === "message.delta")
-              setMessages((items) =>
-                items.map((item, i) =>
-                  i === items.length - 1
-                    ? { ...item, text: item.text + (event.text || "") }
-                    : item,
-                ),
-              );
+              setMessages(last(), "text", (text) => text + (event.text || ""));
             if (event.type === "tool.done")
-              setMessages((items) =>
-                items.map((item, i) =>
-                  i === items.length - 1
-                    ? {
-                        ...item,
-                        tools: [
-                          ...(item.tools || []),
-                          { name: event.name, isError: event.isError },
-                        ],
-                      }
-                    : item,
-                ),
-              );
+              setMessages(last(), "tools", (tools = []) => [
+                ...tools,
+                { name: event.name, isError: event.isError },
+              ]);
             if (event.type === "message.done") {
+              run.branchId = event.branchId;
+              run.turnId = event.turnId;
               setBranchId(event.branchId);
               setHeadTurnId(event.turnId);
               setForkFrom(null);
               setSelectedFiles([]);
               setSaveOutputs(false);
-              setMessages((items) =>
-                items.map((item, i) =>
-                  i >= items.length - 2
-                    ? { ...item, turnId: event.turnId, status: "complete" }
-                    : item,
-                ),
+              setMessages(
+                { from: Math.max(0, last() - 1), to: last() },
+                { turnId: event.turnId, status: "complete" },
               );
             }
             if (event.type === "error") setError(event.message);
             if (event.type === "run.status") outcome = event;
           },
-          { signal: observer.signal },
+          { after: run.after, signal: controller.signal },
         );
-        if (outcome?.status === "completed") {
-          setActiveRun(null);
-          setSending(false);
-          const workspace = await rpc("workspace.get", {
-            projectId: projectId(),
-          });
-          setConversations(workspace.conversations.items);
-          setConversationCursor(workspace.conversations.nextCursor);
-          const saved = workspace.conversations.items.find(
-            (item) => item.id === conversationId(),
-          );
-          if (saved) await openConversation(saved, outcome.branchId);
-        } else if (outcome) {
-          setActiveRun(null);
-          if (!branches().some((branch) => branch.id === branchId())) {
-            setBranchId("main");
-            showRoute(projectId(), conversationId());
-          }
-          setMessages((items) =>
-            items.map((item, i) =>
-              i === items.length - 1 ? { ...item, status: "failed" } : item,
-            ),
-          );
-          setError(
-            outcome.status === "cancelled"
-              ? "Turn cancelled. Observed usage is retained."
-              : "Turn outcome: " +
-                  outcome.status +
-                  ". Check usage before starting another turn.",
-          );
+        if (!shown() || !outcome) return;
+        setActiveRun(null);
+        setSending(false);
+        if (outcome.status === "completed") {
+          setAnnouncement("Response complete.");
+          await refreshConversation(run);
+          return;
         }
+        const text =
+          outcome.status === "cancelled"
+            ? "Turn cancelled. Observed usage is retained."
+            : "Turn outcome: " +
+              outcome.status +
+              ". Check usage before starting another turn.";
+        // A fork that never committed has no branch: return to the path it left.
+        if (run.fork)
+          await openConversation(
+            { id: run.conversationId, agentId: run.agentId },
+            run.previousBranch,
+          );
+        else if (last() >= 0) setMessages(last(), "status", "failed");
+        setError(text);
+        setAnnouncement(text);
       } catch (cause) {
-        if (cause.name !== "AbortError")
+        if (cause.name !== "AbortError" && shown()) {
           setError(
-            "Observation detached. Reopen this conversation to reconnect. " +
+            "Observation detached. Reconnect from the run status, or reopen this conversation. " +
               cause.message,
           );
+          setAnnouncement("Observation detached.");
+        }
       } finally {
-        setSending(false);
+        if (observer === controller) setSending(false);
+      }
+    }
+    // After a turn commits, refresh paths and the history entry in place; the
+    // streamed messages already carry their turn ids.
+    async function refreshConversation(run) {
+      const request = conversationRequest;
+      try {
+        const page = await rpc("conversations.get", {
+          projectId: projectId(),
+          agentId: run.agentId,
+          conversationId: run.conversationId,
+          branchId: run.branchId,
+        });
+        if (request !== conversationRequest) return;
+        setBranches(
+          page.branches.some((branch) => branch.id === run.branchId)
+            ? page.branches
+            : [
+                ...page.branches,
+                { id: run.branchId, name: "New path", headTurnId: run.turnId },
+              ],
+        );
+        if (page.conversation)
+          setConversations((items) => [
+            page.conversation,
+            ...items.filter((item) => item.id !== run.conversationId),
+          ]);
+      } catch (cause) {
+        if (request === conversationRequest) setError(cause.message);
       }
     }
     async function send() {
@@ -415,7 +488,8 @@ await mountPage({
         loadingConversation()
       )
         return;
-      const targetBranch = fork ? crypto.randomUUID() : branchId(),
+      const previousBranch = branchId(),
+        targetBranch = fork ? crypto.randomUUID() : previousBranch,
         requestId = crypto.randomUUID();
       setError("");
       setSending(true);
@@ -445,7 +519,16 @@ await mountPage({
           { role: "assistant", text: "", status: "pending" },
         ]);
         showRoute(projectId(), conversationId(), targetBranch);
-        await observeRun(accepted.requestId);
+        await observeRun({
+          requestId: accepted.requestId,
+          agentId: agent.id,
+          conversationId: conversationId(),
+          branchId: targetBranch,
+          fork: Boolean(fork),
+          previousBranch,
+          after: 0,
+          needsMessage: false,
+        });
       } catch (cause) {
         setError(cause.message);
         setSending(false);
@@ -458,7 +541,6 @@ await mountPage({
             projectId: projectId(),
           });
           setProjects(workspace.projects);
-          setShellProjects(workspace.projects);
           setAgents(workspace.agents);
           setModels(workspace.models);
           setConversations(workspace.conversations.items);
@@ -471,17 +553,10 @@ await mountPage({
               id: query.get("conversation"),
               agentId: query.get("agent"),
             };
-          while (!saved && query.get("conversation") && conversationCursor()) {
-            const page = await rpc("conversations.list", {
-              projectId: projectId(),
-              cursor: conversationCursor(),
-            });
-            setConversations((items) => [...items, ...page.items]);
-            setConversationCursor(page.nextCursor);
-            saved = page.items.find(
+          while (!saved && query.get("conversation") && conversationCursor())
+            saved = (await nextConversations()).find(
               (item) => item.id === query.get("conversation"),
             );
-          }
           if (!saved && query.get("conversation"))
             throw Error("Conversation not found.");
           if (saved) {
@@ -501,8 +576,9 @@ await mountPage({
     }
     // Files only matter once the picker opens, so they no longer delay the first render.
     async function ensureFiles() {
-      if (filesLoaded()) return;
+      if (filesLoaded() || filesBusy()) return;
       setFilesRequested(true);
+      setFilesBusy(true);
       try {
         const objects = await rpc("objects.list", { projectId: projectId() });
         setFiles(objects.items);
@@ -510,6 +586,8 @@ await mountPage({
         setFilesLoaded(true);
       } catch (cause) {
         setError(cause.message);
+      } finally {
+        setFilesBusy(false);
       }
     }
     function toggleSelectedFile(id) {
@@ -522,15 +600,19 @@ await mountPage({
       );
     }
     async function moreFiles() {
+      if (filesBusy() || !filesCursor()) return;
+      setFilesBusy(true);
       try {
         const result = await rpc("objects.list", {
           projectId: projectId(),
           cursor: filesCursor(),
         });
-        setFiles((items) => [...items, ...result.items]);
+        setFiles((items) => appendNew(items, result.items));
         setFilesCursor(result.nextCursor);
       } catch (cause) {
         setError(cause.message);
+      } finally {
+        setFilesBusy(false);
       }
     }
     const toolNames = {
@@ -551,23 +633,28 @@ await mountPage({
     const activeAgents = () => agents().filter((agent) => !agent.archived);
     const currentTitle = () =>
       conversations().find((item) => item.id === conversationId())?.title ||
-      (messages().length ? "Untitled conversation" : "New conversation");
+      (messages.length ? "Untitled conversation" : "New conversation");
     const day = 86400000;
-    const historyGroups = () => {
+    // Groups are keyed by label, so the sidebar keeps its sections across updates.
+    const historyItems = createMemo(() => {
       const startOfToday = new Date().setHours(0, 0, 0, 0),
-        groups = [
-          { label: "Today", items: [] },
-          { label: "Yesterday", items: [] },
-          { label: "Earlier", items: [] },
-        ];
+        groups = { Today: [], Yesterday: [], Earlier: [] };
       for (const item of conversations()) {
         const time = Date.parse(item.lastActivityAt || item.createdAt || "");
         groups[
-          !time || time < startOfToday - day ? 2 : time < startOfToday ? 1 : 0
-        ].items.push(item);
+          !time || time < startOfToday - day
+            ? "Earlier"
+            : time < startOfToday
+              ? "Yesterday"
+              : "Today"
+        ].push(item);
       }
-      return groups.filter((group) => group.items.length);
-    };
+      return groups;
+    });
+    const historyGroups = () =>
+      ["Today", "Yesterday", "Earlier"].filter(
+        (label) => historyItems()[label].length,
+      );
     const relativeTime = (value) => {
       const time = Date.parse(value || "");
       if (!time) return "";
@@ -583,10 +670,19 @@ await mountPage({
     // Follow streaming output only while the reader is already near the bottom.
     let scroller,
       pinned = true;
+    let frame = 0;
+    onCleanup(() => cancelAnimationFrame(frame));
     createEffect(() => {
-      messages();
-      if (scroller && pinned)
-        queueMicrotask(() => (scroller.scrollTop = scroller.scrollHeight));
+      const latest = messages[messages.length - 1];
+      latest?.text;
+      latest?.tools?.length;
+      latest?.status;
+      // At most one layout read per frame, however fast tokens arrive.
+      if (scroller && pinned && !frame)
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          scroller.scrollTop = scroller.scrollHeight;
+        });
     });
     setCrumb(
       () => html`<span class="crumb-sep" aria-hidden="true">/</span>
@@ -642,7 +738,7 @@ await mountPage({
               type="button"
               class="menu-item"
               data-close
-              onClick=${(event) => observeRun(activeRun(), true)}
+              onClick=${(event) => activeRun() && observeRun(activeRun())}
             >
               Reconnect
             </button><//
@@ -652,8 +748,8 @@ await mountPage({
             class="menu-item danger"
             data-close
             onClick=${(event) =>
-              rpc("chat.cancel", { requestId: activeRun() }).catch((cause) =>
-                setError(cause.message),
+              rpc("chat.cancel", { requestId: activeRun()?.requestId }).catch(
+                (cause) => setError(cause.message),
               )}
           >
             Cancel turn
@@ -692,10 +788,10 @@ await mountPage({
               </p>`}
             >
               <${For} each=${historyGroups}
-                >${(group) =>
+                >${(label) =>
                   html`<section class="history-group">
-                    <h2 class="eyebrow">${group.label}</h2>
-                    <${For} each=${() => group.items}
+                    <h2 class="eyebrow">${label}</h2>
+                    <${For} each=${() => historyItems()[label]}
                       >${(item) =>
                         html`<button
                           class="history-item"
@@ -801,9 +897,14 @@ await mountPage({
                 element.scrollHeight - element.scrollTop - element.clientHeight < 80;
             }}
           >
-            <div class="conversation">
+            <p class="visually-hidden" role="status">${announcement}</p>
+            <div class="conversation" role="log" aria-label="Conversation" aria-live="off">
               <${Show} when=${olderCursor}>
-                <button class="load-earlier" onClick=${(event) => moreMessages()}>
+                <button
+                  class="load-earlier"
+                  disabled=${loadingOlder}
+                  onClick=${(event) => moreMessages()}
+                >
                   Load earlier messages
                 </button><//
               >
@@ -815,7 +916,7 @@ await mountPage({
                 /><//
               >
               <${Show}
-                when=${() => loaded() && !loadingConversation() && !messages().length}
+                when=${() => loaded() && !loadingConversation() && !messages.length}
                 ><div class="welcome">
                   <${Show}
                     when=${() => activeAgents().length}
@@ -864,7 +965,7 @@ await mountPage({
                   <//>
                 </div><//
               >
-              <${For} each=${messages}
+              <${For} each=${() => messages}
                 >${(item, index) =>
                   html`<article class=${() => "message " + item.role}>
                     <header class="turn-meta">
@@ -888,22 +989,20 @@ await mountPage({
                       >
                     </header>
                     <div class="message-text">
-                      <${For} each=${() => messageSections(item.text)}>
-                        ${(section) =>
-                          section.code !== undefined
-                            ? html`<pre><code>${section.code}</code></pre>`
-                            : html`<${For}
-                                each=${() => section.text.split(/(https:\/\/[^\s<>"']+)/g)}
-                              >
-                                ${(part) =>
-                                  /^https:\/\/[^\s<>"']+$/.test(part)
+                      <${Index} each=${() => messageSections(item.text)}>
+                        ${(section, slot) =>
+                          slot % 2
+                            ? html`<pre><code>${section}</code></pre>`
+                            : html`<${Index} each=${() => linkParts(section())}>
+                                ${(part, at) =>
+                                  at % 2
                                     ? html`<a
                                         href=${part}
                                         target="_blank"
                                         rel="noopener noreferrer"
                                         >${part}</a
                                       >`
-                                    : part}<//
+                                    : textNode(part)}<//
                               >`}<//
                       >
                     </div>
@@ -1019,7 +1118,7 @@ await mountPage({
               <div class="composer-foot">
                 <${Show}
                   when=${selectedAgent}
-                  fallback=${html`<span class="hint mono">memory · tools · execution handled by AgentCore</span>`}
+                  fallback=${html`<span class="hint mono">tools · execution handled by AgentCore</span>`}
                 >
                   <div class="composer-controls">
                     <select
@@ -1144,7 +1243,7 @@ await mountPage({
               >${(item) => html`<label class="check"><input type="checkbox" checked=${() => selectedFiles().includes(item.id)} disabled=${() => selectedFiles().length >= 4 && !selectedFiles().includes(item.id)} onChange=${() => toggleSelectedFile(item.id)} />${item.name}</label>`}<//
             >
             <${Show} when=${filesCursor}
-              ><button class="secondary" onClick=${(event) => moreFiles()}>Load more files</button><//
+              ><button class="secondary" disabled=${filesBusy} onClick=${(event) => moreFiles()}>Load more files</button><//
             >
           <//>
           <div class="actions">

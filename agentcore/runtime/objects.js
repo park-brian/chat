@@ -23,6 +23,7 @@ import {
   patterns,
   put,
   query,
+  queryAll,
   sk,
   transact,
   userKey,
@@ -32,7 +33,7 @@ import {
 import { projectOf } from "./projects.js";
 
 const bucket = () => process.env.BUCKET;
-export const objectLocation = (sub, projectId, id) =>
+const objectLocation = (sub, projectId, id) =>
   `users/${sub}/${projectId}/files/${id}`;
 const stagingLocation = (sub, id) => `pending/${sub}/${id}`;
 const kinds = ["file", "skill", "artifact"];
@@ -68,9 +69,21 @@ export const validContentType = (type) =>
   typeof type === "string" && contentTypePattern.test(type);
 
 // Copies are idempotent, so a crash between copy and activation is repaired by
-// finding the copied bytes and activating them.
-async function activate(sub, item, sizeBytes, versionId) {
+// finding the copied bytes and activating them. With `limitBytes`, the bytes
+// are counted only if they fit, checked in the same transaction.
+async function activate(sub, item, sizeBytes, versionId, limitBytes = null) {
   const location = objectLocation(sub, item.projectId, item.id);
+  const delta = storageDelta(sub, sizeBytes);
+  if (limitBytes !== null)
+    Object.assign(
+      delta.Update,
+      expression({
+        add: { storageUsedBytes: sizeBytes },
+        condition:
+          "attribute_not_exists(#storageUsedBytes) OR #storageUsedBytes <= :room",
+        values: { ":room": limitBytes - sizeBytes },
+      }),
+    );
   const activated = await attempt(
     transact([
       {
@@ -89,12 +102,25 @@ async function activate(sub, item, sizeBytes, versionId) {
           }),
         },
       },
-      storageDelta(sub, sizeBytes),
+      delta,
     ]),
   );
   const latest = activated
     ? null
     : await get(objectKey(sub, item.projectId, item.id));
+  // A copy that was not activated is removed, so it is never stored uncounted
+  // (and never displaces the counted version as the current one).
+  if (!activated && latest?.versionId !== versionId)
+    await s3
+      .send(
+        new DeleteObjectCommand({
+          Bucket: bucket(),
+          Key: location,
+          ...(versionId && { VersionId: versionId }),
+        }),
+      )
+      .catch(() => console.error("Could not remove an unactivated copy"));
+  if (!activated && latest?.status === "PENDING") fail("QUOTA_EXCEEDED");
   if (!activated && latest?.status !== "ACTIVE")
     fail("UPLOAD_OUTCOME_UNKNOWN");
   return (
@@ -131,10 +157,12 @@ export async function repairPending(sub, item) {
 export async function completeStaged(sub, item, expectedBytes = null) {
   const repaired = await repairPending(sub, item);
   if (repaired.status === "ACTIVE") return repaired;
+  // Without list access to pending/, S3 answers a missing key with 403.
   const head = await s3
     .send(new HeadObjectCommand({ Bucket: bucket(), Key: item.stageKey }))
     .catch((error) => {
-      if (error.$metadata?.httpStatusCode === 404) fail("UPLOAD_MISSING");
+      if ([403, 404].includes(error.$metadata?.httpStatusCode))
+        fail("UPLOAD_MISSING");
       throw error;
     });
   const size = head.ContentLength;
@@ -147,16 +175,26 @@ export async function completeStaged(sub, item, expectedBytes = null) {
     fail("UPLOAD_SIZE_MISMATCH");
   const current = await storage(sub);
   if (current.usedBytes + size > current.limitBytes) fail("QUOTA_EXCEEDED");
+  // Copy exactly the version that was measured; the upload URL stays valid
+  // and could replace the staged object in between.
   const copy = await s3.send(
     new CopyObjectCommand({
       Bucket: bucket(),
       Key: objectLocation(sub, item.projectId, item.id),
-      CopySource: `${bucket()}/${item.stageKey}`,
+      CopySource:
+        `${bucket()}/${item.stageKey}` +
+        (head.VersionId ? `?versionId=${head.VersionId}` : ""),
       MetadataDirective: "REPLACE",
       ContentType: item.contentType,
     }),
   );
-  const saved = await activate(sub, item, size, copy.VersionId);
+  const saved = await activate(
+    sub,
+    item,
+    size,
+    copy.VersionId,
+    current.limitBytes,
+  );
   await s3
     .send(
       new DeleteObjectCommand({
@@ -178,7 +216,7 @@ export const presignUpload = (stageKey, contentType, bytes) =>
     Fields: { "Content-Type": contentType },
     Conditions: [
       { "Content-Type": contentType },
-      ["content-length-range", 1, bytes + 16384],
+      ["content-length-range", 1, bytes],
     ],
   });
 
@@ -207,6 +245,8 @@ export const downloadUrl = (item, seconds = 300) =>
       Bucket: bucket(),
       Key: item.key,
       ...(item.versionId && { VersionId: item.versionId }),
+      // Browsers ignore the download attribute across origins.
+      ResponseContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(item.name)}`,
     }),
     { expiresIn: seconds },
   );
@@ -284,7 +324,7 @@ export const objectCommands = {
         !validContentType(contentType) ||
         !Number.isSafeInteger(sizeBytes) ||
         sizeBytes < 1 ||
-        sizeBytes > maxUploadBytes
+        sizeBytes > (kind === "skill" ? maxSkillBytes : maxUploadBytes)
       )
         fail("VALIDATION_FAILED");
       const current = await storage(identity.sub);
@@ -327,18 +367,30 @@ export const objectCommands = {
           start.pk?.S === userPk(identity.sub) &&
           start.sk?.S?.startsWith(prefix),
       );
+      // Pending uploads are filtered out, so keep reading until the page is
+      // full; otherwise abandoned uploads would leave pages short or empty.
+      const activePage = async () => {
+        const items = [];
+        let next = cursor;
+        do {
+          const page = await query({
+            pk: userPk(identity.sub),
+            prefix,
+            cursor: next,
+            limit: 50 - items.length,
+            filter: {
+              expression: "#status = :active",
+              names: { "#status": "status" },
+              values: { ":active": "ACTIVE" },
+            },
+          });
+          items.push(...page.items);
+          next = page.next;
+        } while (next && items.length < 50);
+        return { items, next };
+      };
       const [page, current] = await Promise.all([
-        query({
-          pk: userPk(identity.sub),
-          prefix,
-          cursor,
-          limit: 50,
-          filter: {
-            expression: "#status = :active",
-            names: { "#status": "status" },
-            values: { ":active": "ACTIVE" },
-          },
-        }),
+        activePage(),
         storage(identity.sub),
       ]);
       return {
@@ -360,6 +412,14 @@ export const objectCommands = {
     run: async (input, identity) => {
       const projectId = await projectOf(identity, input);
       const item = await activeObject(identity.sub, projectId, input.id);
+      if (item.kind === "skill") {
+        const agents = await queryAll({
+          pk: userPk(identity.sub),
+          prefix: sk.agent(projectId),
+        });
+        if (agents.some((agent) => agent.skillIds?.includes(item.id)))
+          fail("SKILL_IN_USE");
+      }
       await s3.send(
         new DeleteObjectCommand({
           Bucket: bucket(),

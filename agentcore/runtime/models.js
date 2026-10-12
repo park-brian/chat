@@ -17,9 +17,12 @@ const scripted = {
   outputRate: 2000000,
 };
 const scriptedEnabled = () => process.env.SCRIPTED_MODEL === "true";
+// Promotional prices end on pricingExpiresAt (a UTC date). After that day the
+// catalog's rates may be wrong, so the model is unavailable until reviewed.
 const configured = (model) =>
-  model.transport === "bedrock" ||
-  (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER));
+  (model.transport === "bedrock" ||
+    (model.transport === "gemini" && Boolean(process.env.GEMINI_PROVIDER))) &&
+  !(Date.parse(`${model.pricingExpiresAt}T23:59:59.999Z`) < Date.now());
 
 export const modelCatalog = () => [
   ...(scriptedEnabled() ? [{ ...scripted, active: true }] : []),
