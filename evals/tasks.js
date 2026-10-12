@@ -4,13 +4,15 @@ import { prose, wordCount } from "./style.js";
 import SWE from "./swe.js";
 import RESEARCH from "./research.js";
 import ANSWER_HARD from "./answer-hard.js";
+import INTENT from "./intent.js";
 
 // Eval tasks: each hits one behavior the prompt asks for. A turn is a user message, { seed } to place a file
 // first (written by the echo model, so the real model finds it in the workspace), or { said: [question, reply] } for an
 // earlier exchange the model is told it had. check(run) returns [ok, label] pairs; run has answer (final text), answers
 // (per turn), dialogue ([{ role, text }]), files, report, calls, results (all tool output), metrics, and probe(path, fn),
 // which opens a file standalone and evaluates fn in it. A task with a rubric (yes/no criteria) and an optional
-// reference answer is also graded by the judge (evals/judge.js).
+// reference answer is also graded by the judge (evals/judge.js). A task with user: { goal, persona, reveal?, maxTurns }
+// goes on past its turns with a simulated user (evals/user.js); run.user then has { userTurns, done, said }.
 
 const BUGGY_TODOS = `<!doctype html>
 <html lang="en">
@@ -1070,4 +1072,5 @@ export default [
   ...SWE,
   ...RESEARCH,
   ...ANSWER_HARD,
+  ...INTENT,
 ];

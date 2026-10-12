@@ -1,5 +1,5 @@
 // Runs the chat harness against real models on fixed tasks, grades each run, and keeps every transcript.
-// npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout | swe | research | answer-hard] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
+// npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout | swe | research | answer-hard | intent] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
 //                 [--system persona.md] [--baseline run-id] [--reasoning off|low|medium|high (default)|xhigh|max] [--headed] [--yes (needed above MAX_UNCONFIRMED jobs)]
 // A task with a rubric is also graded by a judge model (evals/judge.js); its criteria join the checks.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -11,6 +11,7 @@ import { startServer } from "./server.js";
 import TASKS from "./evals/tasks.js";
 import { judge, judgedChecks } from "./evals/judge.js";
 import { mannered } from "./evals/style.js";
+import { simulate } from "./evals/user.js";
 
 const MODELS = {
   fable: "global.anthropic.claude-fable-5-1",
@@ -28,7 +29,7 @@ const START_TIMEOUT = 5_000;
 // Every job calls paid APIs: more than this many must be confirmed with --yes.
 export const MAX_UNCONFIRMED = 20;
 const root = path.dirname(fileURLToPath(import.meta.url));
-export const SETS = ["inner", "holdout", "hard", "game", "answer", "answer-holdout", "swe", "research", "answer-hard"];
+export const SETS = ["inner", "holdout", "hard", "game", "answer", "answer-holdout", "swe", "research", "answer-hard", "intent"];
 const LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function options(argv, tasks = TASKS) {
@@ -66,25 +67,42 @@ export function filePath(dir, file) {
 // Pass rates over the runs that were graded. A run that crashed or didn't finish its turns is a harness failure:
 // it has no score and is reported apart.
 const graded = r => !r.crashed && !r.error && r.total > 0;
+const rowKey = r => `${r.task}·${r.model}`;
+// A run passes when every check it was graded on passed; unjudged criteria are not among them.
+const passedAll = r => r.passed === r.total;
+// pass^k: for each task·model with two or more graded repeats, the share of repeats that passed every check, and how
+// many of those rows passed on every repeat. A 0.9 mean can hide a task that fails one run in three.
+export function passK(results) {
+  const rows = Object.entries(Object.groupBy(results.filter(graded), rowKey)).filter(([, runs]) => runs.length >= 2)
+    .map(([key, runs]) => ({ key, repeats: runs.length, passAll: runs.filter(passedAll).length / runs.length }));
+  return { rows, tasks: rows.length, every: rows.filter(r => r.passAll === 1).length };
+}
 export function summarize(results) {
   const scored = results.filter(graded);
   const mean = scored.length ? scored.reduce((n, r) => n + r.passed / r.total, 0) / scored.length : null;
-  return { mean, scored: scored.length, crashed: results.filter(r => r.crashed), unfinished: results.filter(r => !r.crashed && r.error) };
+  return { mean, scored: scored.length, passK: passK(results), crashed: results.filter(r => r.crashed), unfinished: results.filter(r => !r.crashed && r.error) };
 }
+const kLine = s => (s.passK.tasks ? ` · pass^k ${s.passK.every}/${s.passK.tasks} tasks pass every repeat` : "");
 export function meanLine(results, baseline) {
   const now = summarize(results), was = baseline && summarize(baseline);
-  const line = now.mean === null ? "no graded runs" : `mean pass ${now.mean.toFixed(2)} over ${now.scored} graded runs`;
-  return line + (was ? ` (baseline ${was.mean === null ? "no graded runs" : was.mean.toFixed(2)})` : "");
+  const line = now.mean === null ? "no graded runs" : `mean pass ${now.mean.toFixed(2)} over ${now.scored} graded runs${kLine(now)}`;
+  return line + (was ? ` (baseline ${was.mean === null ? "no graded runs" : was.mean.toFixed(2) + kLine(was)})` : "");
 }
 const fail = message => { throw new Error(message); };
 
 // The conversation as the user saw it: typed messages and the assistant's text, one entry per reply. Echo turns
-// that only placed a file are left out; a reply seeded with { said } stays, marked seeded.
-export function dialogue(messages) {
+// that only placed a file are left out; a reply seeded with { said } stays, marked seeded. With writes, each file the
+// assistant wrote is marked where it wrote it ("[wrote: index.html]"), so a reader can tell what came before the build.
+const WRITES = ["write_file", "edit_file"];
+const wroteIn = m => (m.role === "assistant" && m.modelId !== "echo" ? m.content.filter(b => WRITES.includes(b.toolUse?.name) && typeof b.toolUse.input?.path === "string").map(b => b.toolUse.input.path) : []);
+// The files the assistant wrote, in the order it first wrote them; scratch/ is its bench and left out.
+export const written = messages => [...new Set(messages.flatMap(wroteIn))].filter(p => !/^\/?scratch\//.test(p));
+export function dialogue(messages, { writes = false } = {}) {
   const out = [];
   let seeding = false;
   for (const m of messages) {
-    const text = m.content.filter(b => b.text && !b.harness).map(b => b.text).join("\n").trim();
+    const paths = writes ? wroteIn(m) : [];
+    const text = [m.content.filter(b => b.text && !b.harness).map(b => b.text).join("\n").trim(), paths.length ? `[wrote: ${paths.join(", ")}]` : ""].filter(Boolean).join("\n");
     if (m.role === "user") {
       if (!text) continue; // tool results
       try { seeding = typeof JSON.parse(text) === "object"; } catch { seeding = false; }
@@ -284,7 +302,11 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
 
     const started = Date.now();
     const answers = [];
-    let error = null;
+    const say = async text => {
+      await send(page, text, modelId, reasoning, task.timeout);
+      answers.push(await page.evaluate(() => document.querySelectorAll(".message-block")[document.querySelectorAll(".message-block").length - 1]?.innerText ?? ""));
+    };
+    let error = null, user = null;
     try {
       await page.goto(base + "index.html");
       await page.waitForSelector("form#inputForm");
@@ -307,11 +329,19 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
             if (!m) throw new Error("said: the seeded question was not saved");
             await request(store.put({ ...m, content: m.content.map(b => (b.text === typed ? { ...b, text: question } : b)) }));
           }, { typed, question });
-        } else {
-          await send(page, turn, modelId, reasoning, task.timeout);
-          answers.push(await page.evaluate(() => document.querySelectorAll(".message-block")[document.querySelectorAll(".message-block").length - 1]?.innerText ?? ""));
-        }
+        } else await say(turn);
       }
+      // A simulated user writes the rest: it reads the conversation so far and the files written, never the model's name.
+      if (task.user) user = await simulate(task.user, {
+        sent: task.turns.filter(t => typeof t === "string").length,
+        say,
+        read: async () => {
+          const { threads, messages } = await collect(page);
+          const thread = threads.find(t => t.type !== "subagent");
+          const mine = messages.filter(m => m.threadId === thread?.id).sort((a, b) => a.id - b.id);
+          return { dialogue: dialogue(mine), wrote: written(mine) };
+        },
+      });
     } catch (e) {
       error = String(e.message || e).split("\n")[0];
       // Where it stopped, as the user would have seen it.
@@ -371,12 +401,16 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       metrics: metrics(messages, subagents, ms, subagents.filter(m => forkThreads.has(m.threadId))),
       dialogue: dialogue(messages),
       probe,
+      user,
     };
     const style = mannered(run.dialogue.filter(m => m.role === "assistant" && !m.seeded).map(m => m.text).join("\n\n"));
     Object.assign(run.metrics, { words: style.words, flourishes: style.count, flourishPer1k: style.per1k });
+    // The simulator's tokens are counted apart from the model's, like the judge's.
+    if (user) Object.assign(run.metrics, { userTurns: user.userTurns, userDone: user.done, dontMind: user.dontMind, simTokens: user.tokens.input + user.tokens.output });
     const checks = (error ? [[false, "finished: " + error]] : await task.check(run)).map(([ok, label]) => ({ ok: !!ok, label }));
-    // The judge grades a finished run only; its tokens are counted apart from the model's.
-    const verdict = !error && task.rubric ? await judge(run, task) : null;
+    // The judge grades a finished run only; its tokens are counted apart from the model's. With a simulated user it
+    // also sees where each file was written, to tell asking first from building first.
+    const verdict = !error && task.rubric ? await judge(task.user ? { ...run, dialogue: dialogue(messages, { writes: true }) } : run, task) : null;
     if (verdict) {
       checks.push(...judgedChecks(verdict));
       Object.assign(run.metrics, { judgeInputTokens: verdict.tokens.input, judgeOutputTokens: verdict.tokens.output });
@@ -387,10 +421,10 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
 
     const breaks = prefixBreaks(requests.map(r => r.body));
     run.metrics.prefixBreaks = breaks.length;
-    const result = { task: task.id, model: modelName, modelId, error, escaped, unwritten, passed: checks.filter(c => c.ok).length, total: checks.length, checks, unjudged, judgeError: verdict?.error ?? null, flourishHits: style.hits, metrics: run.metrics, errors: errors.slice(0, 5), netErrors: netErrors.slice(0, 20), requests: requests.length, requestBytes: requests.map(r => r.body.length), breaks };
+    const result = { task: task.id, model: modelName, modelId, error, escaped, unwritten, passed: checks.filter(c => c.ok).length, total: checks.length, checks, unjudged, judgeError: verdict?.error ?? null, flourishHits: style.hits, metrics: run.metrics, user: user && { done: user.done, userTurns: user.userTurns, said: user.said }, errors: errors.slice(0, 5), netErrors: netErrors.slice(0, 20), requests: requests.length, requestBytes: requests.map(r => r.body.length), breaks };
     await writeFile(path.join(dir, "result.json"), JSON.stringify({ ...result, persona: data.persona, messages, subagents, summary: main?.summary ?? null }, null, 1));
     if (requests.length) await writeFile(path.join(dir, "request.json"), requests.at(-1).body);
-    await writeFile(path.join(dir, "transcript.md"), `# ${task.id} · ${modelName}\n\n${[...checks.map(c => `- [${c.ok ? "x" : " "}] ${c.label}${c.reason ? ` — ${c.reason}` : ""}`), ...unjudged.map(u => `- [?] judge: ${u.criterion} (unjudged: ${u.reason})`)].join("\n")}\n\n\`${JSON.stringify(run.metrics)}\`\n` + (await transcript(messages, dir)));
+    await writeFile(path.join(dir, "transcript.md"), `# ${task.id} · ${modelName}\n\n${[...checks.map(c => `- [${c.ok ? "x" : " "}] ${c.label}${c.reason ? ` — ${c.reason}` : ""}`), ...unjudged.map(u => `- [?] judge: ${u.criterion} (unjudged: ${u.reason})`)].join("\n")}\n\n\`${JSON.stringify(run.metrics)}\`\n` + (user ? `\nsimulated user: ${user.done ? "DONE" : "no DONE"} after ${user.userTurns} user turns\n` : "") + (await transcript(messages, dir)));
     return result;
   } finally {
     clearInterval(seeing);
@@ -401,11 +435,11 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
 }
 
 function table(results, baseline) {
-  const key = r => `${r.task}·${r.model}`;
-  const before = Object.groupBy((baseline ?? []).filter(graded), key);
-  const rows = Object.entries(Object.groupBy(results.filter(graded), key)).map(([k, runs]) => {
+  const before = Object.groupBy((baseline ?? []).filter(graded), rowKey);
+  const strict = new Map(passK(results).rows.map(r => [r.key, r.passAll]));
+  const rows = Object.entries(Object.groupBy(results.filter(graded), rowKey)).map(([k, runs]) => {
     const mean = f => runs.reduce((n, r) => n + f(r), 0) / runs.length;
-    const row = { run: k, pass: mean(r => r.passed / r.total), turns: mean(r => r.metrics.turns), calls: mean(r => r.metrics.calls), shots: mean(r => r.metrics.screenshots ?? 0), tShots: mean(r => r.metrics.testShots ?? 0), tViews: mean(r => r.metrics.shotViews ?? 0), scratch: mean(r => r.metrics.scratch ?? 0), kTokIn: mean(r => r.metrics.inputTokens / 1000), kCost: mean(r => (r.metrics.costTokens ?? r.metrics.inputTokens) / 1000), kOut: mean(r => r.metrics.outputTokens / 1000), cache: mean(r => r.metrics.cacheHit), breaks: mean(r => r.metrics.prefixBreaks ?? 0), subs: mean(r => r.metrics.subagents ?? 0), reviews: mean(r => r.metrics.reviews ?? 0), variants: mean(r => r.metrics.variants ?? 0), redundant: mean(r => r.metrics.redundantRunApp), failed: mean(r => r.metrics.failedCalls + r.metrics.failedReports), flourish: mean(r => r.metrics.flourishPer1k ?? 0), kJudge: mean(r => ((r.metrics.judgeInputTokens ?? 0) + (r.metrics.judgeOutputTokens ?? 0)) / 1000), sec: mean(r => r.metrics.seconds) };
+    const row = { run: k, pass: mean(r => r.passed / r.total), ...(strict.has(k) && { passAll: strict.get(k) }), ...(runs.some(r => r.metrics.userTurns) && { uTurns: mean(r => r.metrics.userTurns ?? 0), kSim: mean(r => (r.metrics.simTokens ?? 0) / 1000) }), turns: mean(r => r.metrics.turns), calls: mean(r => r.metrics.calls), shots: mean(r => r.metrics.screenshots ?? 0), tShots: mean(r => r.metrics.testShots ?? 0), tViews: mean(r => r.metrics.shotViews ?? 0), scratch: mean(r => r.metrics.scratch ?? 0), kTokIn: mean(r => r.metrics.inputTokens / 1000), kCost: mean(r => (r.metrics.costTokens ?? r.metrics.inputTokens) / 1000), kOut: mean(r => r.metrics.outputTokens / 1000), cache: mean(r => r.metrics.cacheHit), breaks: mean(r => r.metrics.prefixBreaks ?? 0), subs: mean(r => r.metrics.subagents ?? 0), reviews: mean(r => r.metrics.reviews ?? 0), variants: mean(r => r.metrics.variants ?? 0), redundant: mean(r => r.metrics.redundantRunApp), failed: mean(r => r.metrics.failedCalls + r.metrics.failedReports), flourish: mean(r => r.metrics.flourishPer1k ?? 0), kJudge: mean(r => ((r.metrics.judgeInputTokens ?? 0) + (r.metrics.judgeOutputTokens ?? 0)) / 1000), sec: mean(r => r.metrics.seconds) };
     const old = before[k];
     if (old) row.passWas = old.reduce((n, r) => n + r.passed / r.total, 0) / old.length;
     return Object.fromEntries(Object.entries(row).map(([f, v]) => [f, typeof v === "number" ? +v.toFixed(2) : v]));
