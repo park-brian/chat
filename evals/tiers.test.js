@@ -189,6 +189,9 @@ await expect("hard-ssg-report", reportGood);
 // The plan came after the report, or never.
 await expect("hard-ssg-report", { ...reportGood, calls: [...reportCalls.slice(1), write("PLAN.md")] }, ["before report.md"]);
 await expect("hard-ssg-report", { ...reportGood, calls: reportCalls.slice(1), files: { "report.md": REPORT } }, ["before report.md"]);
+// A goal given to the plan tool counts as the plan; a plan call without one doesn't.
+await expect("hard-ssg-report", { ...reportGood, calls: [{ name: "plan", input: { goal: "Compare the three" } }, ...reportCalls.slice(1)] });
+await expect("hard-ssg-report", { ...reportGood, calls: [{ name: "plan", input: { note: "x" } }, ...reportCalls.slice(1)] }, ["before report.md"]);
 // Sources cited from memory, nothing read; and a short report.
 await expect("hard-ssg-report", { ...reportGood, calls: [reportCalls[0], reportCalls.at(-1)], results: "" }, ["cited links were read", "researched"]);
 await expect("hard-ssg-report", { ...reportGood, files: { "report.md": "# Hugo vs Eleventy vs Astro\n\nAstro. https://astro.build" } }, ["a long report", "covers the five aspects", "cites sources", "cited links were read"]);
