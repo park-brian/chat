@@ -54,12 +54,18 @@ const [{ openDB }, { createTwoFilesPatch, diffLines }, { createStore, produce, r
 const fill = (template, values) => template.replace(/\{(\w+)\}/g, (match, name) => values[name] ?? match);
 
 // Assembled per request: the agent's own prompt and memories, then how this harness works, for the tools it has.
-function systemPrompt(persona, { tools = [], memories = null } = {}) {
+// The date is the day the request is built, so the cached prefix changes once a day.
+function systemPrompt(persona, { tools = [], memories = null, modelId = null } = {}) {
   const guide = TOOL_DOCUMENTATION.split(/\n(?=### )/).filter(part => !part.startsWith("### ") || tools.includes(part.match(/^### (\w+)/)[1]));
   const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && HARNESS_DOCUMENTATION;
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
-  const environment = fill(ENVIRONMENT, { fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT });
+  const cutoff = MODELS.find(m => m.id === modelId)?.cutoff;
+  const environment = fill(ENVIRONMENT, {
+    fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT,
+    today: new Date().toLocaleDateString("en-CA"),
+    cutoff: cutoff ? ` What you know comes from data up to ${cutoff}.` : "",
+  });
   return [persona, memories, environment, WORKING, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
 }
 
@@ -126,7 +132,7 @@ const CLAUDE_BUDGET = { levels: ["off", "low", "medium", "high"], reasoning: lev
 const GPT_6 = { window: 1_050_000, levels: ["off", "low", "medium", "high", "xhigh", "max"], reasoning: effort => ({ reasoning: { effort } }), off: { reasoning: { effort: "none" } } };
 const MODELS = [
   { id: "global.anthropic.claude-fable-5-1", label: "Fable 5.1", group: "AWS Bedrock", ...CLAUDE_5 },
-  { id: "global.anthropic.claude-opus-5-5", label: "Opus 5.5", group: "AWS Bedrock", ...CLAUDE_5 },
+  { id: "global.anthropic.claude-opus-5-5", label: "Opus 5.5", group: "AWS Bedrock", ...CLAUDE_5, cutoff: "June 2026" },
   { id: "global.anthropic.claude-sonnet-5-5", label: "Sonnet 5.5", group: "AWS Bedrock", ...CLAUDE_5 },
   { id: "global.anthropic.claude-haiku-5-5", label: "Haiku 5.5", group: "AWS Bedrock", ...CLAUDE_5, context: 100_000, levels: ["off", ...CLAUDE_5.levels], off: { thinking: { type: "disabled" } } },
   // Bedrock's OpenAI models take no cache points and no documents. They see a tool result's image only beside it,
@@ -1528,7 +1534,7 @@ function getConverseCommand(config) {
   const model = modelInfo(config.modelId);
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
   const tools = config.tools.map(({ toolSpec }) => ({ toolSpec }));
-  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories });
+  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId });
   return {
     modelId: config.modelId,
     messages: prepareMessages(config.messages, { documents: model.documents, beside: model.beside, cache: model.cache, summary: config.summary, tail: config.tail, modelId: config.modelId }),

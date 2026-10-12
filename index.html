@@ -5433,6 +5433,11 @@ if (window.__HARNESS__?.test) (async () => {
           assert(!full.includes("### task") && !full.includes("### mcp"), "docs only for the tools this agent has");
           const plain = systemPrompt("P", { tools: ["code"] });
           assert(!plain.includes("## Artifacts"), "no artifact docs without artifact tools");
+          // Why: Haiku gets no context-budget tags, so with a 100k budget it rushed to finish; and it can't know the date
+          assert(plain.includes(`Today is ${new Date().toLocaleDateString("en-CA")}. Older messages are summarized automatically`) && plain.includes("keep working rather than wrapping up early"), "the date and the compaction line");
+          assert(systemPrompt("P", { tools: [], modelId: "global.anthropic.claude-opus-5-5" }).includes("What you know comes from data up to June 2026.") && !plain.includes("What you know comes from"), "a knowledge cutoff only where it is known");
+          assert(plain.includes("Keep working until everything the user asked for is done, then stop and report") && plain.includes("A syntax check doesn't count as verifying a change: run it."), "keep working, and verify by running");
+          assert(systemPrompt("P", { tools: ["plan"] }).includes("### plan") && !plain.includes("### plan"), "the plan tool's docs come with it");
           const seeded = (await db.get("agents", 1)).systemPrompt;
           assert(!seeded.includes("### code") && !seeded.includes("## Code Environment"), "the seeded prompt no longer carries tool docs");
           assert(seeded.includes("Answer the person directly.") && seeded.includes("## Memory Protocol"), "the persona is intact");
