@@ -1118,12 +1118,14 @@
         const seeTitle = () => live() ? `The agent sees this tab (${s.capture} capture). Click to stop.` : "Share this tab so the agent can screenshot what it makes";
         const attachView = act(ws, async () => { props.onAttach?.(await ws.captureView()); ws.notify("Attached the current view to your message."); });
         const folderTitle = () => !s.folder ? "Open a local folder" : s.folder.status === "permission" ? `Reconnect ${s.folder.name}` : `Synced with ${s.folder.name}`;
-        // The plan the agent keeps, and how far it has got: its steps are ticked as their checks pass.
+        // The plan, and how far the work has got: PLAN.md, which the harness writes from the contract and ticks as
+        // checks pass, else the agent's own SPEC.md.
+        const planPath = () => ["PLAN.md", "SPEC.md"].find(p => s.files[p] != null) ?? null;
         const plan = () => {
-          const text = s.files["SPEC.md"];
-          return text == null ? null : { done: text.match(/^\s*[-*] \[[xX]\]/gm)?.length ?? 0, all: text.match(/^\s*[-*] \[[ xX]\]/gm)?.length ?? 0 };
+          const text = planPath() && s.files[planPath()];
+          return text == null ? null : { path: planPath(), done: text.match(/^\s*[-*] \[[xX]\]/gm)?.length ?? 0, all: text.match(/^\s*[-*] \[[ xX]\]/gm)?.length ?? 0 };
         };
-        const openPlan = act(ws, async () => { ws.setState("tab", "preview"); await ws.select("SPEC.md"); });
+        const openPlan = act(ws, async () => { ws.setState("tab", "preview"); await ws.select(planPath()); });
 
         return html`
           <div class="d-flex flex-column h-100">
@@ -1141,7 +1143,7 @@
               </div>
               <div class="d-flex align-items-center gap-1 ms-auto">
                 <${Show} when=${plan}>
-                  <button type="button" class="btn btn-sm btn-light py-0 px-2 text-nowrap tabular-nums" data-plan title="The agent's plan for this project (SPEC.md)" onClick=${openPlan}>
+                  <button type="button" class="btn btn-sm btn-light py-0 px-2 text-nowrap tabular-nums" data-plan title=${() => `The plan for this project (${plan()?.path})`} onClick=${openPlan}>
                     <i class="bi bi-list-check"></i> ${() => plan().all ? `${plan().done}/${plan().all}` : "Plan"}
                   </button>
                 <//>
@@ -3004,9 +3006,11 @@
           const errors = countRepeats(testRun.errors, previewRun.errors);
           const lines = testRun.console.map(c => c.text);
           const failures = lines.filter(t => t.startsWith("FAIL:")).map(t => t.slice(5).trim().replace(/\s+/g, " ").slice(0, 300));
+          // The passing tests by name, for the harness's checks; requests leave them out.
+          const passes = lines.filter(t => t.startsWith("PASS:")).map(t => t.slice(5).trim().split("\n")[0].slice(0, 120)).slice(0, 100);
           const tests = testRun.tests
-            ? { passed: +testRun.tests.passed || 0, failed: +testRun.tests.failed || 0, failures: failures.slice(0, 5) }
-            : failures.length ? { passed: lines.filter(t => t.startsWith("PASS:")).length, failed: failures.length, failures: failures.slice(0, 5) } : null;
+            ? { passed: +testRun.tests.passed || 0, failed: +testRun.tests.failed || 0, failures: failures.slice(0, 5), ...(passes.length && { passes }) }
+            : failures.length ? { passed: lines.filter(t => t.startsWith("PASS:")).length, failed: failures.length, failures: failures.slice(0, 5), ...(passes.length && { passes }) } : null;
           const timedOut = [...new Set([...testRun.timedOut, ...previewRun.timedOut])];
           // An HTML artifact without tests isn't done, so the report says so where the model looks first.
           const untested = isHtml(version.path) && !parked && !tests && !timedOut.includes("tests");
@@ -3325,7 +3329,8 @@
       if (new URLSearchParams(window.location.search).get("test") === "1" || window.__HARNESS__?.test) {
         // The engine's internals the tests reach for, beside what the app imports.
         const {
-          MEMORY_BUDGET, TOOLS, appendReasoning, applyEdits, blobCache, buildMessageTree, editFile, editor,
+          DIRECTOR_RULES, MEMORY_BUDGET, TOOLS, appendReasoning, applyEdits, blobCache, buildMessageTree, contradictedClaim,
+          createDirector, editFile, editor, runCheck,
           failingReport, forkOf, getBlob, getContentBlock, getConverseClient, getConverseCommand, getGeminiClient,
           getMostRecentPath, getToolResults, listHistory, mcp, memoriesBlock, missingFiles, normalizePath, outline,
           overlap, ownedTools, polishedTake, preflight, prepareMessages, processStreamChunk, providerOf, proxyFetch,
@@ -5113,6 +5118,15 @@ if (window.__HARNESS__?.test) (async () => {
             plan().click();
             await waitFor(() => ws.shownPath() === "SPEC.md");
             assert(ws.state.tab === "preview", "the plan opens, rendered");
+            // The harness's PLAN.md, written from the plan tool, is the plan once there is one.
+            await ws.select("index.html");
+            await ui.send({ text: "Planned.", toolUse: [{ name: "plan", input: { goal: "Notes", add: { title: "A guide", check: { kind: "file", file: "guide.md" } } } }] });
+            await waitFor(() => ws.state.files["PLAN.md"]?.includes("- [ ] 1. A guide"));
+            await ws.select("index.html");
+            await waitFor(() => plan()?.textContent.includes("0/1") && plan().title.includes("PLAN.md"));
+            assert(ws.shownPath() === "index.html", "writing it took nothing off the panel");
+            plan().click();
+            await waitFor(() => ws.shownPath() === "PLAN.md");
           } finally {
             ui.cleanup();
           }
@@ -5832,6 +5846,282 @@ if (window.__HARNESS__?.test) (async () => {
           assert(later.length === 0, `nor a later turn, with the plan still there: ${JSON.stringify(later)}`);
         }
 
+        // A project with files and no frames: enough for file checks and PLAN.md, not for runs.
+        async function headlessProject(files = {}) {
+          const ws = createWorkspace(db, { headless: true });
+          await ws.createProject({ name: "contract" });
+          for (const [path, text] of Object.entries(files)) await ws.exclusive(() => ws.commit(path, text));
+          return ws;
+        }
+
+        // Why: the model claimed more than it did; the contract's state is the harness's, and only a check moves an item
+        async function testPlanTool() {
+          const threadId = await db.add("threads", { agentId: 1, name: "contract", createdAt: Date.now() });
+          const ws = await headlessProject({ "index.html": "<h1>Notes</h1>" });
+          try {
+            const director = await createDirector({ db, threadId, agentId: 1, tools: ["plan"] });
+            const context = { workspace: ws };
+            const first = await director.plan({ goal: "A notes app that searches by tag", done: "notes save and search", assumptions: ["localStorage", "one user"] }, context);
+            assert(first.includes("Goal: A notes app that searches by tag\nDone means: notes save and search\nAssumptions: localStorage; one user\nItems: none yet"), `the result is the state in a few lines: ${first}`);
+            const added = await director.plan({ add: { title: "Write the guide", check: { kind: "file", file: "guide.md", contains: "## Search" } } }, context);
+            assert(added.startsWith("Added item 1. Its check fails now (guide.md doesn't exist), as it should before the work."), `a new check runs at once: ${added}`);
+            assert(added.includes("Items: 0 of 1 items done, 0 checks green.") && added.includes('Current: item 1; check: guide.md exists and contains "## Search"; last run: fail'), `with the progress line and the current item: ${added}`);
+            const weak = await director.plan({ add: { title: "Has a heading", check: { kind: "file", file: "index.html", contains: "<h1>" } } }, context);
+            assert(weak.startsWith("Added item 2. Its check already passes (index.html: 1 words), so it can't show the item gets done"), `red first: a check that passes before the work is flagged: ${weak}`);
+            assert(director.contract.items[1].weak && director.contract.items[1].status === "open", "and its item stays open");
+
+            const claimed = await director.plan({ status: "done", add: { title: "Ship it", status: "done", check: { kind: "source", text: "shipped" } } }, context);
+            assert(claimed.startsWith("Status is the harness's") && director.contract.items[2].status === "open", `the model can't set a status: ${claimed}`);
+            const edited = await director.plan({ edit: 1, status: "done" }, context);
+            assert(edited.startsWith("Status is the harness's") && director.contract.items[0].status === "open", "not by an edit either");
+
+            const changed = await director.plan({ edit: 2, check: { kind: "file", file: "index.html", contains: "<h2>" } }, context);
+            assert(changed.startsWith("Item 2's check changed. Its check fails now"), `an edited check runs red first again: ${changed}`);
+            assert(director.contract.ledger.some(e => e.itemId === 2 && e.result === "replaced" && e.check.contains === "<h1>") && !director.contract.items[1].weak, "the old check stays in the ledger");
+            assert((await director.plan({ add: { title: "No check" } }, context)).startsWith('Not added: "No check" needs a check'), "an item needs a check");
+            assert((await director.plan({ add: { title: "Odd", check: { kind: "vibe" } } }, context)).includes('unknown kind "vibe"'), "of a kind there is");
+            assert((await director.plan({ edit: 9, title: "x" }, context)).startsWith("There is no item 9; the items are 1, 2 and 3."), "an edit names an item there is");
+            const stub = await director.plan({ add: { title: "Reads well", check: { kind: "judge", text: "a reader outside the field follows it" } } }, context);
+            assert(stub.includes("Its check is not run by the harness yet"), `a kind the harness doesn't run says so: ${stub}`);
+
+            await director.plan({ note: "Search is by tag", source: "https://example.com/spec" }, context);
+            const asked = await director.plan({ ask: "Should search include archived notes?" }, context);
+            assert(asked.includes("Notes: 1.\nOpen questions: Should search include archived notes?"), asked);
+            const stored = (await db.get("threads", threadId)).contract;
+            assert(stored.goal === "A notes app that searches by tag" && stored.items.length === 4 && stored.notes[0].source === "https://example.com/spec", `the contract is the thread's: ${JSON.stringify(stored)}`);
+
+            // PLAN.md is the harness's rendering, notes on the work: it never takes the panel.
+            const md = ws.state.files["PLAN.md"];
+            assert(md?.includes("Goal: A notes app that searches by tag") && md.includes('- [ ] 1. Write the guide. Check: guide.md exists and contains "## Search" (failing: guide.md doesn\'t exist)') && md.includes("- Search is by tag (https://example.com/spec)"), `PLAN.md renders the contract: ${md}`);
+            assert(ws.shownPath() === "index.html" && ws.state.project.entry === "index.html", "and is not shown");
+            const version = await db.get("versions", ws.state.project.heads["PLAN.md"]);
+            assert(version.source === "harness", `written by the harness: ${version.source}`);
+
+            // The user's next message answers the open question; the next turn starts from the stored contract.
+            const next = await createDirector({ db, threadId, agentId: 1, tools: ["plan"], messages: () => [{ role: "user", content: [{ text: "files", harness: true }, { text: "Only active ones." }] }], start: 1 });
+            await next.save();
+            assert(next.contract.items.length === 4 && (await db.get("threads", threadId)).contract.questions[0].answer === "Only active ones.", "and the answer is kept");
+            const sub = await TOOLS.find(t => t.toolSpec.name === "plan").fn({ goal: "x" }, {});
+            assert(sub.error?.startsWith("The plan is the main agent's"), "a sub-agent has no contract of its own");
+          } finally {
+            ws.dispose();
+          }
+        }
+
+        // Why: checks the harness runs itself are evidence; the model's word is not
+        async function testCheckKinds() {
+          const ws = await headlessProject({ "report.md": "# Report\n\nAstro uses islands.\n" });
+          try {
+            const file = async check => (await runCheck({ kind: "file", file: "report.md", ...check }, { ws })).result;
+            assert(await file({}) === "pass" && await file({ file: "gone.md" }) === "fail" && await file({ file: "gone.md", exists: false }) === "pass" && await file({ exists: false }) === "fail", "file: exists, or is gone");
+            assert(await file({ contains: "islands" }) === "pass" && await file({ contains: "hydration" }) === "fail", "file: contains");
+            assert(await file({ min_words: 5 }) === "pass" && await file({ min_words: 500 }) === "fail" && await file({ max_words: 3 }) === "fail" && await file({ max_words: 500 }) === "pass", "file: word counts");
+            assert(await file({ matches: "^# Report$" }) === "pass" && await file({ matches: "^## Sources" }) === "fail", "file: a pattern");
+          } finally {
+            ws.dispose();
+          }
+          const messages = [
+            { role: "assistant", content: [{ toolUse: { toolUseId: "r", name: "read_url", input: { url: "https://astro.build/docs" } } }, { toolUse: { toolUseId: "p", name: "plan", input: {} } }] },
+            { role: "user", content: [{ toolResult: { toolUseId: "r", content: [{ json: { result: { text: "Astro   builds 300 pages\nin 9 s." } } }] } }, { toolResult: { toolUseId: "p", content: [{ json: { result: 'Goal: "a plan-only quote"' } }] } }] },
+          ];
+          const source = text => runCheck({ kind: "source", text }, { messages });
+          const found = await source("astro builds 300 pages in 9 s");
+          assert(found.result === "pass" && found.evidence === "found in read_url https://astro.build/docs", `source: a quote matches across case and spacing, and says where: ${JSON.stringify(found)}`);
+          assert((await source("12 s")).result === "fail" && (await source("a plan-only quote")).result === "fail", "a number no result holds fails, and the plan's own results don't count");
+          for (const kind of ["compute", "consistency", "judge", "user"]) {
+            const stub = await runCheck({ kind, text: "x" }, {});
+            assert(stub.result === "not run" && stub.evidence.startsWith("not run by the harness yet"), `${kind} is not run yet, and says so: ${JSON.stringify(stub)}`);
+          }
+
+          const ui = createTestUI();
+          try {
+            const env = { ws: ui.workspace }, context = { workspace: ui.workspace, agentId: 1, threadId: null };
+            const none = await runCheck({ kind: "test" }, env);
+            assert(none.result === "fail" && none.evidence.startsWith("no project is open"), `test: nothing to run is a failure: ${JSON.stringify(none)}`);
+            await writeFile({ content: fixtureApp("good") }, context);
+            const test = check => runCheck({ kind: "test", ...check }, env);
+            const green = await test({ file: "index.html" });
+            assert(green.result === "pass" && green.evidence === "index.html: 1 passed", `test: the page's tests pass: ${JSON.stringify(green)}`);
+            assert((await test({ name: "value is GOOD" })).result === "pass", "a named test is found among those passing");
+            assert((await test({ name: "search works" })).evidence === 'index.html: 1 passed, none named "search works"', "and one not there fails");
+            assert((await test({ file: "audio.test.js" })).evidence === "audio.test.js doesn't exist", "a test file not written yet fails");
+            const probe = script => runCheck({ kind: "probe", script }, env);
+            assert((await probe('document.getElementById("v").textContent === "good"')).result === "pass", "probe: an expression that is true passes");
+            const other = await probe('return document.getElementById("v").textContent');
+            assert(other.result === "fail" && other.evidence === 'index.html: returned "good"', `anything but true fails, with what came back: ${JSON.stringify(other)}`);
+            assert((await probe("nope()")).evidence.startsWith("index.html: the script threw"), "a script that throws fails");
+            await editFile({ patch: '<<<<<<< SEARCH\n<p id="v">good\n=======\n<p id="v">bad\n>>>>>>> REPLACE' }, context);
+            const red = await test({});
+            assert(red.result === "fail" && red.evidence.startsWith("index.html: 0 passed, 1 failed: value is good"), `test: a failing test fails the check: ${JSON.stringify(red)}`);
+            assert((await probe('document.getElementById("v").textContent === "good"')).evidence === "index.html: returned false", "and the probe sees the change");
+            // After a change, a test check reads the run the change made rather than running the page again.
+            const threadId = await db.add("threads", { agentId: 1, name: "test check", createdAt: Date.now() });
+            const director = await createDirector({ db, threadId, agentId: 1, tools: ["plan"] });
+            await director.plan({ goal: "A good value", add: { title: "The value is good", check: { kind: "test", name: "value is good" } } }, context);
+            const fixed = await editFile({ patch: '<<<<<<< SEARCH\n<p id="v">bad\n=======\n<p id="v">good\n>>>>>>> REPLACE' }, context);
+            const run = ui.workspace.run;
+            let runs = 0;
+            ui.workspace.run = (...args) => (runs++, run(...args));
+            const notes = await director.step({ ws: ui.workspace, start: 0, messages: [
+              { role: "assistant", content: [{ toolUse: { toolUseId: "f", name: "edit_file", input: {} } }] },
+              { role: "user", content: [{ toolResult: { toolUseId: "f", content: [{ json: { result: { ...fixed, __media: undefined } } }] } }] },
+            ] });
+            ui.workspace.run = run;
+            assert(director.contract.items[0].status === "done" && notes[0]?.startsWith("Item 1's check passed, so it is done") && runs === 0, `the edit's own report passes the check: ${runs} runs, ${JSON.stringify(notes)}`);
+            // The names are the harness's: the model's request carries the counts.
+            const report = { path: "a.html", ok: true, tests: { passed: 1, failed: 0, failures: [], passes: ["value is good"] } };
+            const [, sent] = prepareMessages([{ role: "assistant", content: [{ toolUse: { toolUseId: "w", name: "write_file", input: {} } }] }, { role: "user", content: [{ toolResult: { toolUseId: "w", content: [{ json: { result: { report } } }] } }] }]);
+            assert(eq(sent.content[0].toolResult.content[0].json.result.report.tests, { passed: 1, failed: 0, failures: [] }), `passing names stay out of requests: ${JSON.stringify(sent)}`);
+          } finally {
+            ui.cleanup();
+          }
+        }
+
+        // Why: an item is done when its check passes after the work, and stays done only while it keeps passing
+        async function testContractRerun() {
+          const threadId = await db.add("threads", { agentId: 1, name: "rerun", createdAt: Date.now() });
+          const ws = await headlessProject({ "index.html": "<h1>x</h1>" });
+          try {
+            const context = { workspace: ws, agentId: 1, threadId };
+            const director = await createDirector({ db, threadId, agentId: 1, tools: ["plan", "write_file"] });
+            await director.plan({ goal: "Two notes", add: [{ title: "Notes", check: { kind: "file", file: "notes.md", contains: "alpha" } }, { title: "Todo", check: { kind: "file", file: "todo.md", contains: "beta" } }] }, context);
+            // A step as the loop hands it over: the calls, then their results.
+            const history = [];
+            const step = async writes => {
+              const calls = [], results = [];
+              for (const [path, content] of writes) {
+                const id = "w" + history.length + calls.length;
+                await ws.exclusive(() => ws.commit(path, content));
+                calls.push({ toolUse: { toolUseId: id, name: "write_file", input: { path } } });
+                results.push({ toolResult: { toolUseId: id, content: [{ json: { result: { version: ws.state.project.heads[path], path, change: "+1 -0" } } }] } });
+              }
+              history.push({ role: "assistant", content: calls }, { role: "user", content: results });
+              return director.step({ messages: history, start: 0, ws });
+            };
+            const items = () => director.contract.items.map(i => i.status).join(" ");
+            const entries = director.contract.ledger.length;
+            const other = await step([["other.md", "alpha"]]);
+            assert(other.length === 0 && director.contract.ledger.length === entries, `a change to a file no check names runs no check: ${JSON.stringify(other)}`);
+            const wrong = await step([["notes.md", "gamma"]]);
+            assert(items() === "failing open" && eq(wrong, [`Item 1's check ran after this change and fails: notes.md doesn't contain "alpha".`]), `a change to an item's file runs its check: ${JSON.stringify(wrong)}`);
+            const again = await step([["notes.md", "gamma delta"]]);
+            assert(again.length === 1 && again[0].startsWith(`Item 1's check failed twice the same way (notes.md doesn't contain "alpha"), so the approach isn't working yet.`), `the same failure twice says so: ${JSON.stringify(again)}`);
+            assert((await step([["notes.md", "gamma delta epsilon"]])).length === 0, "once");
+            const right = await step([["notes.md", "alpha"]]);
+            assert(items() === "done open" && eq(right, [`Item 1's check passed, so it is done (1 of 2 items done, 1 check green). Next: item 2, "Todo"; its check: todo.md exists and contains "beta".`]), `a passing check finishes its item and hands over the next: ${JSON.stringify(right)}`);
+            // Item 2 passes as item 1 breaks: the milestone runs item 1 again, and it reopens.
+            const both = await step([["notes.md", "omega"], ["todo.md", "beta"]]);
+            assert(items() === "failing done", `a regression reopens its item: ${items()}`);
+            assert(both[0].startsWith(`Item 1's check passed before and fails now (notes.md doesn't contain "alpha"), so the item is open again.`) && both[1].startsWith(`Item 2's check passed, so it is done (1 of 2 items done, 1 check green). Next: item 1`), JSON.stringify(both));
+            assert(director.contract.ledger.some(e => e.itemId === 1 && e.after === "milestone" && e.result === "fail"), "the milestone's run is in the ledger");
+            const md = ws.state.files["PLAN.md"];
+            assert(md.includes("- [x] 2. Todo") && md.includes("- [ ] 1. Notes") && md.includes("1 of 2 items done"), `PLAN.md follows the checks: ${md}`);
+            const all = await step([["notes.md", "alpha"]]);
+            assert(all[0].includes("Every item is done: compare the work with the goal, then report what was done and what wasn't."), JSON.stringify(all));
+          } finally {
+            ws.dispose();
+          }
+        }
+
+        // A turn through the loop with a contract on its thread, fake tools, and a scripted model.
+        const fakeTool = (name, fn = () => ({ text: "probe ok" })) => ({ toolSpec: { name, description: "d", inputSchema: { json: { type: "object", properties: {} } } }, fn });
+        const planTool = TOOLS.find(t => t.toolSpec.name === "plan");
+        async function directedTurn({ script, tools = [fakeTool("probe"), planTool], contract = null, text = "go", workspace = null, history = [] }) {
+          const threadId = await db.add("threads", { agentId: 1, name: "director", createdAt: Date.now(), ...(contract && { contract }) });
+          const messages = [];
+          for (const m of [...history, { role: "user", content: [{ text }] }]) messages.push({ ...m, id: await db.add("messages", { ...m, threadId, agentId: 1 }) });
+          const [store, setStore] = createStore({ modelId: "echo", systemPrompt: "P", tools, messages });
+          const sent = [];
+          const mock = createMockClient(script);
+          const client = { send: (input, o) => (sent.push(input), mock.send(input, o)) };
+          await runAgentWithBranching(store, setStore, client, messages.at(-1).id, { threadId, agentId: 1 }, db, { workspace });
+          const notes = store.messages.flatMap(m => m.content.filter(c => c.harness).map(c => c.text));
+          return { store, notes, sent, thread: await db.get("threads", threadId) };
+        }
+        const calls = (n, name = "probe", input = {}) => Array.from({ length: n }, (_, i) => ({ blocks: mockToolUseBlock(name, input, `${name}${i}`), stopReason: "tool_use" }));
+        const reply = text => ({ blocks: mockTextBlock(text) });
+        const item = (id, check, status = "open") => ({ id, title: `Item ${id}`, check, status, history: [] });
+        const withItems = (...items) => ({ goal: "The user's goal", done: "", assumptions: [], items, ledger: [], notes: [], questions: [] });
+
+        // Why: the director speaks under its condition and not otherwise, and as often as its rule says
+        async function testDirectorRules() {
+          const GOAL = "This is long work, so the harness keeps a contract";
+          const count = (notes, start) => notes.filter(n => n.startsWith(start)).length;
+          // The size threshold: eight calls in a turn, or a long request that isn't a question.
+          assert(count((await directedTurn({ script: [...calls(9), reply("Done.")] })).notes, GOAL) === 1, "eight calls and no goal: once");
+          assert(count((await directedTurn({ script: [...calls(7), reply("Done.")] })).notes, GOAL) === 0, "seven: none");
+          const long = Array.from({ length: 110 }, (_, i) => "word" + i).join(" ");
+          assert(count((await directedTurn({ script: [...calls(1), reply("Done.")], text: long + "." })).notes, GOAL) === 1, "a long request: at its first step");
+          assert(count((await directedTurn({ script: [...calls(1), reply("Done.")], text: long + "?" })).notes, GOAL) === 0, "a long question: no");
+          assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], contract: withItems(item(1, { kind: "source", text: "probe" })) })).notes, GOAL) === 0, "with a goal: no");
+          // Goal set, no items.
+          const ITEMS = "The goal is set and the plan has no items.";
+          assert(count((await directedTurn({ script: [...calls(3), reply("Done.")], contract: withItems() })).notes, ITEMS) === 1, "a goal with no items: once a turn");
+          assert(count((await directedTurn({ script: [...calls(3), reply("Done.")], contract: withItems(item(1, { kind: "source", text: "ok" }, "done")) })).notes, ITEMS) === 0, "with items: no");
+          // Red first, in the run: the note rides after the plan's own result.
+          const red = await directedTurn({ script: [...calls(1), ...calls(1, "plan", { add: { title: "Probed", check: { kind: "source", text: "probe ok" } } }), reply("Done.")], contract: withItems() });
+          assert(red.notes.some(n => n.startsWith("Item 1's check already passes before any work")), `a check that already passes is flagged: ${JSON.stringify(red.notes)}`);
+          // No progress in six steps.
+          const STALL = "No check has passed in 6 steps, and item 1";
+          const stuck = withItems(item(1, { kind: "source", text: "never seen" }));
+          assert(count((await directedTurn({ script: [...calls(7), reply("Stopping: the source is down.")], contract: stuck })).notes, STALL) === 1, "six steps with no check passing: once");
+          assert(count((await directedTurn({ script: [...calls(5), reply("Done.")], contract: stuck })).notes, STALL) === 0, "five: none");
+          // Stopping with items open: once a turn, then the model's word stands; not when it stopped to ask.
+          const OPEN = 'Item 1 is open, and the harness counts an item done only when its check passes. Continue with item 1, "Item 1" (check: "never seen" appears in a tool result), or say why the work stops here.';
+          const open = await directedTurn({ script: [...calls(1), reply("Done."), reply("It needs the user.")], contract: stuck });
+          assert(eq(open.notes, [OPEN]) && open.store.messages.at(-1).content[0].text === "It needs the user.", `open items are named at the stop: ${JSON.stringify(open.notes)}`);
+          assert((await directedTurn({ script: [reply("Search is by tag.")], contract: stuck })).notes.length === 0, "not after a turn that only answered");
+          assert((await directedTurn({ script: [...calls(1), reply("Done.")], contract: withItems(item(1, { kind: "source", text: "x" }, "done"), item(2, { kind: "judge", text: "reads well" })) })).notes.length === 0, "not when every item the harness can check is done");
+          const asking = await directedTurn({ script: [...calls(1, "plan", { ask: "Which tags?" }), reply("Which tags should search use?")], contract: stuck });
+          assert(!asking.notes.some(n => n.startsWith("Item 1 is open")), `nor when it stopped to ask: ${JSON.stringify(asking.notes)}`);
+          // The context near the summary: write notes, once until the next summary.
+          const BUDGET = "The context is at 100k tokens, near the 120k at which older messages are summarized";
+          const heavy = n => Array.from({ length: n }, (_, i) => ({ blocks: [...mockToolUseBlock("probe", {}, "h" + i), { metadata: { usage: { inputTokens: 100_000 } } }], stopReason: "tool_use" }));
+          const near = await directedTurn({ script: [...heavy(3), reply("Done.")] });
+          assert(count(near.notes, BUDGET) === 1, `near the budget: once: ${JSON.stringify(near.notes)}`);
+          assert(count((await directedTurn({ script: [...heavy(3), reply("Done.")], tools: [fakeTool("probe")] })).notes, "The context is at") === 0, "not without the plan tool to write notes with");
+          // The rules are one table, each with when it is read and how often it speaks.
+          assert(DIRECTOR_RULES.every(r => ["step", "stop", "summary"].includes(r.at) && ["turn", "event", "summary"].includes(r.every)), "every rule says when and how often");
+          for (const id of ["polished", "goal", "silent", "failing", "untested", "unadopted"]) assert(DIRECTOR_RULES.some(r => r.id === id), `the old ${id} reminder is a rule`);
+        }
+
+        // Why: "17 passed" with no report saying so was the commonest failure on swe
+        async function testClaimCheck() {
+          const ran = tests => [{ role: "assistant", content: [{ toolUse: { toolUseId: "e", name: "edit_file", input: {} } }] }, { role: "user", content: [{ toolResult: { toolUseId: "e", content: [{ json: { result: { report: { path: "index.html", ok: !tests.failed, tests } } } }] } }] }];
+          const says = (text, before = []) => contradictedClaim([...before, { role: "assistant", content: [{ text }] }]);
+          assert(says("All tests pass now.", ran({ passed: 3, failed: 2 })) === 'Your reply says "All tests pass", but the last run of index.html shows failing, 3 passed, 2 failed. Correct the reply, since the user reads it as checked.', `a pass the report contradicts: ${says("All tests pass now.", ran({ passed: 3, failed: 2 }))}`);
+          assert(says("All tests pass.", ran({ passed: 5, failed: 0 })) === null && says("5 tests passed.", ran({ passed: 5, failed: 0 })) === null, "a claim the report shows stands");
+          assert(says("17 passed.")?.includes("no run report or tool result in this chat shows 17 passing"), "a count nothing shows");
+          const node = [{ role: "assistant", content: [{ toolUse: { toolUseId: "c", name: "code", input: {} } }] }, { role: "user", content: [{ toolResult: { toolUseId: "c", content: [{ json: { result: { logs: ["# tests 17", "# pass 17"] } } }] } }] }];
+          assert(says("17 passed.", node) === null, "a count a tool printed stands");
+          assert(says("Item 3 passed its check; version 2 passed review.") === null && says("Not all tests pass yet.", ran({ passed: 1, failed: 1 })) === null, "an item or a version is not a test count, and a negation is not a claim");
+          assert(says("The tests pass.")?.includes("shows a test run"), "a pass with no run at all");
+          assert((await directedTurn({ script: [reply("Jest reports that the tests pass when every expect holds.")], tools: [] })).notes.length === 0, "an answer about tests in general is not a claim");
+          const run = await directedTurn({ script: [...calls(1), reply("All 5 tests pass."), reply("Corrected: nothing was run.")], tools: [fakeTool("probe")] });
+          assert(run.notes.length === 1 && run.notes[0].startsWith('Your reply says "5 tests pass", but no run report'), `at the stop, once: ${JSON.stringify(run.notes)}`);
+        }
+
+        // Why: cheap models lose the thread after a summary; the harness hands back the goal and the current item
+        async function testReinjectAfterSummary() {
+          const contract = { ...withItems(item(1, { kind: "file", file: "a.md" }, "done"), item(2, { kind: "file", file: "b.md", contains: "Sources" })), notes: [{ text: "b.md cites three pages", source: "https://example.com", at: 1 }] };
+          const history = Array.from({ length: 10 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: [{ text: "turn " + i }], ...(i === 9 && { usage: { inputTokens: 190_000 } }) }));
+          const summarizing = { send: async input => JSON.stringify(input.messages).includes("Older messages are about to be dropped") ? createMockClient([reply("Summary: halfway.")]).send(input) : createMockClient([reply("Done.")]).send(input) };
+          const threadId = await db.add("threads", { agentId: 1, name: "resummary", createdAt: Date.now(), contract });
+          const messages = [];
+          for (const m of [...history, { role: "user", content: [{ text: "files", harness: true }, { text: "go on" }] }]) messages.push({ ...m, id: await db.add("messages", { ...m, threadId, agentId: 1 }) });
+          const userId = messages.at(-1).id;
+          const [store, setStore] = createStore({ modelId: "echo", systemPrompt: "P", tools: [planTool], messages });
+          const sent = [];
+          await runAgentWithBranching(store, setStore, { send: (input, o) => (sent.push(input), summarizing.send(input, o)) }, userId, { threadId, agentId: 1 }, db);
+          const NOTE = 'A summary replaced older messages; the contract still holds. Goal: The user\'s goal. Done: item 1. Current: item 2, "Item 2"; check: b.md exists and contains "Sources". Notes: b.md cites three pages (https://example.com).';
+          const request = sent.find(r => !JSON.stringify(r.messages).includes("Older messages are about to be dropped")), last = request.messages.at(-1);
+          assert(request.messages[0].content[0].text.includes("Summary: halfway."), "the request starts from the summary");
+          assert(eq(last.content.filter(b => b.text).map(b => b.text), ["files", NOTE, "go on"]), `the contract comes back at the tail, before the user's words: ${JSON.stringify(last.content)}`);
+          const saved = await db.get("messages", userId);
+          assert(saved.content[1].text === NOTE && saved.content[1].harness, "and stays on the message, so later requests keep it");
+          assert(sent.at(-1).messages.flatMap(m => m.content).filter(b => b.text?.includes("the contract still holds")).length === 1, "once per summary");
+        }
+
         // Why: a reply that was only thought, or only blank, left a message with nothing in it, and the request was refused
         async function testEmptyMessages() {
           const thought = { reasoningContent: { reasoningText: { text: "hm", signature: "s" } } };
@@ -6126,6 +6416,12 @@ if (window.__HARNESS__?.test) (async () => {
           testCallsRunWhateverTheStopReason,
           testFailingReportReminder,
           testUnplannedTask,
+          testPlanTool,
+          testCheckKinds,
+          testContractRerun,
+          testDirectorRules,
+          testClaimCheck,
+          testReinjectAfterSummary,
           testEmptyMessages,
           testEditorReplacePatterns,
           testToolLookup,

@@ -43,6 +43,24 @@ screenshot: true shows you the page as well.
 Dedicated space for reasoning. Use before complex decisions.
 - { "thought": "Let me analyze the structure..." }
 
+### plan
+The contract for work longer than a few steps (an app, a change across several files, research across several
+sources). The harness keeps it through summaries, runs its checks, and writes it to PLAN.md for the user, so don't
+write PLAN.md yourself. Each call returns the current state.
+- { "goal": "the request in the user's words", "done": "what done means", "assumptions": ["Weekly goals, not daily"] }
+- { "add": { "title": "Search filters the list", "check": { "kind": "probe", "script": "return app.search('milk').length === 1" } } }
+- { "edit": 2, "check": { ... } } changes an item's title or check; the old check stays in the ledger
+- { "note": "Astro builds 300 pages in 9 s", "source": "https://..." } keeps a fact with where it came from
+- { "ask": "Should the export include archived items?" } for what only the user can answer
+Check kinds the harness runs, after each change to the files a check names:
+- test: { "kind": "test", "file": "index.html", "name": "search filters" } the page's in-file tests pass, the named one among them
+- probe: { "kind": "probe", "file": "index.html", "script": "return ..." } the script returns true in the page
+- file: { "kind": "file", "file": "report.md", "contains": "## Sources", "min_words": 800 } also exists, max_words, matches
+- source: { "kind": "source", "text": "a quote or number" } the text appears in a tool result in this chat
+An item is done when the harness sees its check pass, never by your say. A new check runs at once and should fail,
+since the work isn't done yet; one that already passes doesn't test the work. Add the items in the order you will do
+them, the one you are least sure of first, and edit the plan when the work teaches you something.
+
 ### editor
 Virtual filesystem for notes, skills, memories, and secrets. Artifacts have their own tools.
 - List directory: { "command": "view", "path": "/" }
