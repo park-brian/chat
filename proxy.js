@@ -3,15 +3,16 @@
 //   http://localhost:8001/https://example.com/x  fetches the URL and adds CORS headers
 //   ws://localhost:8001/host:port                 opens a TCP socket (the tcpipe protocol)
 //   http://example.com.localhost:8001/x           mirrors https://example.com/x at an origin of its own
-// Only pages served from localhost may use it; set PROXY_ORIGINS=* (or a comma list) to widen that.
+// Only pages served from localhost may use it; set PROXY_ORIGINS=* (or a comma list, entries trimmed) to widen that.
+// A mirror answers only the frame such a page opens and that frame's own same-origin requests (see mirrorAllowed).
 
 import { lookup } from "node:dns/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { BlockList, connect, isIP } from "node:net";
-import { Readable, pipeline } from "node:stream";
+import { Readable, Transform, pipeline } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
+import { createBrotliDecompress, createGunzip, createInflate, createInflateRaw } from "node:zlib";
 import { WebSocketServer } from "ws";
 
 const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
@@ -25,6 +26,7 @@ const allowed = (origin) =>
     [process.env.PROXY_ORIGINS]
       .join()
       .split(",")
+      .map((o) => o.trim())
       .some((o) => o === "*" || o === origin));
 // The Host a request was sent to, if it names this proxy's port: anything else is a rebound DNS name.
 const hostOn = (header, port) => {
@@ -40,18 +42,45 @@ const PRIVATE = new BlockList();
 for (const [net, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16],
   ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["224.0.0.0", 3]])
   PRIVATE.addSubnet(net, prefix, "ipv4");
-for (const [net, prefix] of [["::", 127], ["64:ff9b::", 96], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8]])
+for (const [net, prefix] of [["::", 96], ["64:ff9b::", 96], ["64:ff9b:1::", 48], ["2001::", 32], ["2001:db8::", 32],
+  ["2002::", 16], ["fc00::", 7], ["fe80::", 10], ["fec0::", 10], ["ff00::", 8]])
   PRIVATE.addSubnet(net, prefix, "ipv6");
+export const privateAddress = (address) => PRIVATE.check(address, `ipv${isIP(address)}`);
 const refused = (message) => Object.assign(new Error(message), { status: 403 });
 // Hop-by-hop and browser-identity headers stay behind; fetch sets its own framing.
 const DROP_REQUEST =
   /^(host|origin|referer|cookie|connection|keep-alive|proxy-.*|te|trailer|transfer-encoding|upgrade|content-length|sec-fetch-.*|x-proxy-api-key)$/i;
 const DROP_RESPONSE =
-  /^(connection|keep-alive|transfer-encoding|content-encoding|content-length|access-control-.*|set-cookie)$/i;
+  /^(connection|keep-alive|transfer-encoding|upgrade|trailer|te|proxy-authenticate|access-control-.*|set-cookie)$/i;
+// What a decoded body no longer has.
+const DROP_CODING = /^(content-encoding|content-length)$/i;
 // The app frames a mirror, which the site's own policies would forbid.
 const DROP_MIRROR = /^(content-security-policy.*|x-frame-options)$/i;
-const DECODERS = { gzip: createGunzip, "x-gzip": createGunzip, deflate: createInflate, br: createBrotliDecompress };
+// Deflate should be zlib-wrapped, but some servers send it raw: a zlib stream's first byte names method 8.
+const inflate = () => {
+  let inner;
+  return new Transform({
+    transform(chunk, _, done) {
+      inner ??= ((chunk[0] & 0x0f) === 8 && chunk[0] >> 4 <= 7 ? createInflate() : createInflateRaw())
+        .on("data", (data) => this.push(data))
+        .on("error", (error) => this.destroy(error));
+      inner.write(chunk) ? done() : inner.once("drain", done);
+    },
+    flush(done) {
+      inner ? inner.once("end", done).end() : done();
+    },
+    destroy(error, done) {
+      inner?.destroy();
+      done(error);
+    },
+  });
+};
+const DECODERS = { gzip: createGunzip, "x-gzip": createGunzip, deflate: inflate, br: createBrotliDecompress };
 const RENDER_LIMIT = 15000;
+// A mirror's body stops at 20 MB decoded, and its request at 20 s, DNS and redirects included: about as long as the
+// page waits for a frame.
+export const MIRROR_CAP = 20 << 20,
+  MIRROR_DEADLINE = 20_000;
 
 // The browser offers zstd, which neither fetch here can decode; it would pass the bytes on still compressed.
 const upstreamHeaders = (request) => ({
@@ -64,10 +93,13 @@ const requestBody = async (request) =>
   ["GET", "HEAD"].includes(request.method)
     ? undefined
     : Buffer.concat(await request.toArray());
-const keptHeaders = (entries, drop) =>
-  Object.fromEntries(
-    entries.filter(([name]) => !DROP_RESPONSE.test(name) && !drop?.test(name)),
+// Hop-by-hop headers stay behind, and so do those the response's Connection names.
+export const keptHeaders = (entries, ...drops) => {
+  const named = String(entries.find(([name]) => name === "connection")?.[1] ?? "").toLowerCase().split(/\s*,\s*/);
+  return Object.fromEntries(
+    entries.filter(([name]) => !named.includes(name) && ![DROP_RESPONSE, ...drops].some((drop) => drop.test(name))),
   );
+};
 // A client that leaves takes its upstream request with it.
 const abortOnLeave = (response) => {
   const controller = new AbortController();
@@ -78,7 +110,7 @@ const abortOnLeave = (response) => {
 async function forward(request, response, port) {
   const host = hostOn(request.headers.host, port);
   if (host?.hostname.endsWith(".localhost"))
-    return mirror(request, response, host.hostname.slice(0, -".localhost".length), host.host);
+    return mirror(request, response, host.hostname.slice(0, -".localhost".length));
   if (!host || !LOCAL_NAME.test(host.hostname))
     return response.writeHead(403).end("Host not allowed\n");
   const origin = request.headers.origin;
@@ -122,7 +154,7 @@ async function forward(request, response, port) {
     });
     // The page reads it with fetch; opened as a document, it is inert.
     response.writeHead(upstream.status, {
-      ...keptHeaders([...upstream.headers]),
+      ...keptHeaders([...upstream.headers], DROP_CODING),
       ...cors,
       "content-security-policy": "sandbox",
       "x-content-type-options": "nosniff",
@@ -142,16 +174,27 @@ async function forward(request, response, port) {
 }
 
 // The address a mirror fetch connects to, checked once and then pinned, so a second resolution can't rebind it.
-async function publicAddress(url) {
+async function publicAddress(url, signal) {
   const name = url.hostname.replace(/\.$/, "");
   if (!/^https?:$/.test(url.protocol) || LOCAL_HOST.test(name) || NUMERIC.test(name) || isIP(name))
     throw refused("Not mirrored");
-  const addresses = await lookup(name, { all: true });
-  if (!addresses.length || addresses.some(({ address, family }) => PRIVATE.check(address, `ipv${family}`)))
+  const addresses = await until(lookup(name, { all: true }), signal);
+  if (!addresses.length || addresses.some(({ address }) => privateAddress(address)))
     throw refused("Not mirrored");
-  return addresses[0];
+  return addresses;
 }
-const send = (url, method, headers, body, address, signal) =>
+// A lookup that answers only with the checked addresses: all of them when asked for all.
+export const pinned = (addresses) => (_, options, done) =>
+  options?.all ? done(null, addresses) : done(null, addresses[0].address, addresses[0].family);
+// The promise, or the signal's reason once it aborts.
+const until = (promise, signal) =>
+  new Promise((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    if (signal.aborted) return stop();
+    signal.addEventListener("abort", stop, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+  });
+const send = (url, method, headers, body, addresses, signal) =>
   new Promise((resolve, reject) =>
     (url.protocol === "https:" ? httpsRequest : httpRequest)(
       url,
@@ -159,8 +202,7 @@ const send = (url, method, headers, body, address, signal) =>
         method,
         headers: body ? { ...headers, "content-length": body.length } : headers,
         signal,
-        lookup: (_, options, done) =>
-          options?.all ? done(null, [address]) : done(null, address.address, address.family),
+        lookup: pinned(addresses),
       },
       resolve,
     )
@@ -172,7 +214,7 @@ async function fetchPublic(request, url, body, signal) {
   let method = request.method;
   const headers = upstreamHeaders(request);
   for (let hop = 0; ; hop++) {
-    const upstream = await send(url, method, headers, body, await publicAddress(url), signal);
+    const upstream = await send(url, method, headers, body, await publicAddress(url, signal), signal);
     const { statusCode: status, headers: { location } } = upstream;
     if (![301, 302, 303, 307, 308].includes(status) || !location) return upstream;
     upstream.resume();
@@ -184,9 +226,34 @@ async function fetchPublic(request, url, body, signal) {
     url = next;
   }
 }
-const decoded = (upstream) => {
-  const decoder = DECODERS[upstream.headers["content-encoding"]?.trim().toLowerCase()]?.();
-  return decoder ? pipeline(upstream, decoder, () => {}) : upstream;
+const bodiless = (method, status) => method === "HEAD" || status === 204 || status === 304;
+// A body's decoder, if it has a body in one coding decoded here; otherwise the body passes as it came.
+export const decoderFor = (method, status, encoding) =>
+  bodiless(method, status) ? undefined : DECODERS[encoding?.trim().toLowerCase()];
+// The streams piped together and failing past the cap; a failure destroys them all, the upstream with them.
+export const capped = (...streams) => {
+  let size = 0;
+  const count = new Transform({
+    transform(chunk, _, done) {
+      size += chunk.length;
+      done(size > MIRROR_CAP ? new Error(`body over ${MIRROR_CAP >> 20} MB`) : null, chunk);
+    },
+  });
+  return pipeline(...streams, count, () => {});
+};
+// The client leaving or the deadline passing, whichever comes first.
+export const deadline = (leave, ms = MIRROR_DEADLINE) => AbortSignal.any([leave, AbortSignal.timeout(ms)]);
+// A mirror serves the frame the app opens, framed cross-site by a page that may use this proxy, and that frame's own
+// requests, which are same-origin: its subresources and in-frame navigations (the frame needs allow-same-origin).
+// The rest is refused: a top-level visit, a request without Sec-Fetch-Site, and a same-site one, which is any other
+// mirror, since all of them share localhost.
+export const mirrorAllowed = (headers) => {
+  const site = headers["sec-fetch-site"],
+    dest = headers["sec-fetch-dest"];
+  return (
+    (site === "same-origin" && dest !== "document") ||
+    (site === "cross-site" && dest === "iframe" && allowed(URL.parse(headers.referer ?? "")?.origin))
+  );
 };
 // The charset the response declares, in its header or its own meta tag.
 function decodeHtml(bytes, type) {
@@ -201,14 +268,10 @@ function decodeHtml(bytes, type) {
 }
 
 // A site at an origin of its own, for read_url to render: its paths resolve on its host, and its router sees its own
-// path. It answers only the page itself, framed by a page that may use this proxy, and only for a site out on the
-// internet. Its origin is neither the app's nor one this proxy lets in, so the page's scripts reach neither the app's
-// storage nor the proxy nor the relay.
-async function mirror(request, response, site, host) {
-  const own = `http://${host}`,
-    origin = request.headers.origin;
+// path. It answers as mirrorAllowed says, and only for a site out on the internet. Its origin is neither the app's nor
+// one this proxy lets in, so the page's scripts reach neither the app's storage nor the proxy nor the relay.
+async function mirror(request, response, site) {
   const framed = request.headers["sec-fetch-dest"] === "iframe";
-  const framer = URL.parse(request.headers.referer ?? "")?.origin;
   // A framed failure tells the frame's parent, which would otherwise wait out its limit.
   const fail = (status, error) =>
     framed
@@ -219,32 +282,41 @@ async function mirror(request, response, site, host) {
           )
       : response.writeHead(status).end(error + "\n");
   const target = URL.parse(`https://${site}${request.url}`);
-  if (
-    (origin && origin !== own) ||
-    (framed && framer !== own && !(framer && allowed(framer))) ||
-    target?.hostname !== site
-  )
-    return fail(403, "Not mirrored");
-  const signal = abortOnLeave(response);
+  if (!mirrorAllowed(request.headers)) return fail(403, "Not allowed");
+  if (target?.hostname !== site) return fail(403, "Not mirrored");
+  const leave = abortOnLeave(response),
+    signal = deadline(leave);
   try {
     const upstream = await fetchPublic(request, target, await requestBody(request), signal);
-    const headers = keptHeaders(Object.entries(upstream.headers), DROP_MIRROR);
-    const type = upstream.headers["content-type"];
-    if (!framed || !/^text\/html/i.test(type))
-      return pipeline(decoded(upstream), response.writeHead(upstream.statusCode, headers), () => {});
+    const { statusCode: status, headers: { "content-type": type, "content-encoding": encoding } } = upstream;
+    const entries = Object.entries(upstream.headers);
+    const decoder = decoderFor(request.method, status, encoding);
+    const body = () => capped(upstream, ...(decoder ? [decoder()] : []));
+    // Past the cap a stream is cut short: its status has gone out.
+    if (!framed || !/^text\/html/i.test(type) || bodiless(request.method, status))
+      return pipeline(
+        body(),
+        response.writeHead(status, keptHeaders(entries, DROP_MIRROR, ...(decoder ? [DROP_CODING] : []))),
+        () => {},
+      );
+    if (!decoder && !/^(identity)?$/i.test(encoding?.trim() ?? "")) {
+      upstream.destroy();
+      throw new Error(`can't decode ${encoding}`);
+    }
     const script = `<script>(${reader})(${RENDER_LIMIT})</script>`;
-    const html = decodeHtml(Buffer.concat(await decoded(upstream).toArray()), type)
+    const html = decodeHtml(Buffer.concat(await body().toArray()), type)
       .replace(/<meta[^>]+http-equiv=["']?content-security-policy[^>]*>/gi, "")
       .replace(/^(\s*<!doctype[^>]*>)?/i, (doctype) => doctype + script);
     response
-      .writeHead(upstream.statusCode, {
-        ...headers,
+      .writeHead(status, {
+        ...keptHeaders(entries, DROP_MIRROR, DROP_CODING),
         "content-type": "text/html; charset=utf-8",
       })
       .end(html);
   } catch (error) {
-    if (signal.aborted) return;
-    fail(error.status ?? 502, error.status ? error.message : `Proxy error: ${error.cause?.message || error.message}`);
+    if (leave.aborted) return;
+    const reason = signal.aborted ? `no answer in ${MIRROR_DEADLINE / 1000} s` : error.cause?.message || error.message;
+    fail(error.status ?? 502, error.status ? error.message : `Proxy error: ${reason}`);
   }
 }
 // Runs first in a framed mirror: once the page has loaded and gone quiet, it sends its frame's parent what it built,
@@ -316,11 +388,15 @@ function relay(ws, host, port) {
     ws.close();
   });
   tcp.on("close", () => ws.close());
+  let waiting = false;
   ws.on("message", (data) => {
-    if (!tcp.write(data)) {
-      ws.pause();
-      tcp.once("drain", () => ws.resume());
-    }
+    if (tcp.write(data) || waiting) return;
+    waiting = true;
+    ws.pause();
+    tcp.once("drain", () => {
+      waiting = false;
+      ws.resume();
+    });
   });
   ws.on("close", () => tcp.destroy());
   ws.on("error", () => tcp.destroy());
@@ -332,6 +408,8 @@ export async function startProxy(port = 8001) {
   );
   const sockets = new WebSocketServer({ noServer: true });
   server.on("upgrade", (request, socket, head) => {
+    // The server stops handling this socket's errors here: a client resetting it would otherwise crash the proxy.
+    socket.on("error", () => socket.destroy());
     const refuse = (status) =>
       socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
     const host = hostOn(request.headers.host, server.address().port);

@@ -45,15 +45,17 @@ export async function testTabs(browser, url) {
     });
 
     await story("a host call moves when its tab closes", async () => {
-      // Each tab is named, and the code frame logs its tab's name, so the result says which tab ran it.
+      // Each tab is named, and the code frame logs its tab's name as it starts and as it ends, so the console says
+      // where it started and the result says which tab ran it.
       const a = await open();
       await a.evaluate(() => { window.name = "tab-a"; });
       const b = await open();
-      await send(a, { toolUse: [{ name: "code", input: { source: "await new Promise(r => setTimeout(r, 2500)); console.log('ran in ' + parent.name + ' ' + (window.parent !== window))", timeout: 10000 } }] });
+      const startedInA = a.waitForEvent("console", { predicate: m => m.text().includes("started in tab-a"), timeout: 15000 });
+      await send(a, { toolUse: [{ name: "code", input: { source: "console.log('started in ' + parent.name); await new Promise(r => setTimeout(r, 2500)); console.log('ran in ' + parent.name + ' ' + (window.parent !== window))", timeout: 10000 } }] });
       await b.goto(a.url());
       await b.waitForSelector("form#inputForm");
       await b.evaluate(() => { window.name = "tab-b"; });
-      await a.waitForTimeout(800);
+      await startedInA;
       await a.close();
       await shows(b, "Echo: received", 20000);
       await idle(b);
@@ -63,7 +65,7 @@ export async function testTabs(browser, url) {
         db.close();
         return JSON.stringify(all.filter(m => m.threadId === id).flatMap(m => m.content ?? []).filter(c => c.toolResult));
       }, Number(new URL(b.url()).searchParams.get("threadId")));
-      assert(/ran in tab-b true/.test(result) && !/tab-a|No tab is open/.test(result), "the call ran again in the tab left: " + result.slice(0, 300));
+      assert(/started in tab-b/.test(result) && /ran in tab-b true/.test(result) && !/tab-a|No tab is open/.test(result), "the call ran again in the tab left: " + result.slice(0, 300));
       await b.close();
     });
 
@@ -84,8 +86,10 @@ export async function testTabs(browser, url) {
       const a = await open();
       await send(a, { text: "Interrupted by its last tab closing, then continued from the chat when a tab came back, to the very last word.", chunk: 400 });
       const at = a.url();
-      await a.waitForTimeout(600);
-      assert((await workers()).length, "no shared worker to wait for");
+      // Close once the run is going and the engine's worker is listed.
+      await a.waitForFunction(() => document.querySelector("form#inputForm")?.dataset.loading === "true", null, { timeout: 3000 });
+      for (const deadline = Date.now() + 5000; !(await workers()).length; await new Promise(r => setTimeout(r, 100)))
+        assert(Date.now() < deadline, "no shared worker to wait for");
       await a.close();
       // The engine's worker goes with its last tab: wait until this context has no shared worker left.
       const deadline = Date.now() + 10000;

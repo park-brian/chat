@@ -33,14 +33,21 @@ const CDN = Object.fromEntries(Object.entries({
   turndown: "7.2.4", "turndown-plugin-gfm": "1.0.2",
 }).map(([name, version]) => [name, `https://cdn.jsdelivr.net/npm/${name}@${version}`]));
 
-const [{ BedrockRuntimeClient, ConverseStreamCommand }, { GoogleGenAI }, { openDB }, { createTwoFilesPatch, diffLines }] = await Promise.all(
-  ["@aws-sdk/client-bedrock-runtime", "@google/genai", "idb", "diff"].map(name => import(`${CDN[name]}/+esm`)));
-
 // A tab shares its Solid with the engine, so the UI tracks the stores the engine makes. A worker has no import map
-// and no UI: it takes the store from the CDN, and has nothing to batch.
-const inWorker = typeof WorkerGlobalScope === "function";
-const { createStore, produce, reconcile, unwrap } = await import(inWorker ? `${CDN["solid-js"]}/store/+esm` : "solid-js/store");
-const batch = inWorker ? fn => fn() : (await import("solid-js")).batch;
+// and no UI: it takes the store from the CDN, and has nothing to batch. A worker whose imports fail refuses every
+// tab that connects, and goes: the next tab starts a new one.
+const [{ openDB }, { createTwoFilesPatch, diffLines }, { createStore, produce, reconcile, unwrap }, batch] = await Promise.all([
+  import(`${CDN.idb}/+esm`), import(`${CDN.diff}/+esm`),
+  import(inSharedWorker ? `${CDN["solid-js"]}/store/+esm` : "solid-js/store"),
+  inSharedWorker ? fn => fn() : import("solid-js").then(m => m.batch),
+]).catch(e => {
+  if (!inSharedWorker) throw e;
+  const refuse = port => port.postMessage({ type: "refused", reason: `The engine failed to start: ${e.message}` });
+  onconnect = event => refuse(event.ports[0]);
+  early.splice(0).forEach(refuse);
+  close();
+  return new Promise(() => {});
+});
 
 // A prompt's {name} placeholders, filled. Values go in as they are: none is read as a replacement pattern.
 const fill = (template, values) => template.replace(/\{(\w+)\}/g, (match, name) => values[name] ?? match);
@@ -138,7 +145,10 @@ function setSubagent(toolUseId, entry) {
   if (entry) subagents.set(toolUseId, entry);
   else subagents.delete(toolUseId);
   subagentListeners.forEach(fn => fn(toolUseId));
+  return entry;
 }
+// The answer a tool result block carries.
+const resultOf = block => block?.toolResult?.content?.[0]?.json?.result;
 
 const TOOLS = [
   {
@@ -434,11 +444,12 @@ Examples:
 const DB_NAME = /\/__ws\//.test(globalThis.location?.pathname ?? "") ? "chat-workspace" : "chat";
 
 // One schema, no migrations: a database made by any other version starts over empty.
-// blocking: a newer version wants to upgrade, so this connection closes and its owner reloads. blocked: an older
-// version still holds the database open.
+// blocking: a newer version wants to upgrade; the owner lets go of its work, then this connection closes.
+// blocked: an older version still holds the database open.
 const SCHEMA = { agents: [], threads: ["agentId"], messages: ["agentId", "threadId"], resources: ["agentId", "threadId"], projects: [], versions: ["projectId"] };
+const DB_VERSION = 7;
 async function initDB({ blocking = () => {}, blocked = () => {} } = {}) {
-  const db = await openDB(DB_NAME, 7, {
+  const db = await openDB(DB_NAME, DB_VERSION, {
     upgrade(db) {
       for (const name of [...db.objectStoreNames]) db.deleteObjectStore(name);
       for (const [name, indexes] of Object.entries(SCHEMA)) {
@@ -448,8 +459,9 @@ async function initDB({ blocking = () => {}, blocked = () => {} } = {}) {
       db.createObjectStore("blobs", { keyPath: "hash" });
     },
     blocked,
-    blocking() { db.close(); blocking(); },
+    blocking() { blocking(); db.close(); blobCache.clear(); },
   });
+  blobCache.clear();
   return db;
 }
 
@@ -472,10 +484,10 @@ async function ensureDefaultAgent(db) {
 // The engine runs chats; the UI shows one of them. Runs are keyed by thread, each with a store of its own, so a
 // chat goes on while another is open. Commands and events are plain data, so the engine can move behind a port.
 // workspaces.for(threadId) finds the workspace a chat's project is in, for as long as the run needs it.
-function createEngine(db, { tools = TOOLS, workspaces = null, host = null, client = modelId => getConverseClient(providerOf(modelId)) } = {}) {
-  const runs = new Map(); // threadId -> { store, setStore, controller, from, timer }
+function createEngine(db, { tools = TOOLS, workspaces = null, host = null, client = modelClient } = {}) {
+  const runs = new Map(); // threadId -> { store, setStore, controller, from, timer, release, leafId }
   const listeners = new Set();
-  const emit = event => listeners.forEach(fn => fn(event));
+  const emit = event => { event = structuredClone(event); listeners.forEach(fn => fn(event)); };
   const running = () => [...runs.keys()];
   // A run holds run:<threadId> while it lives, so a row still marked running whose lock is free lost its tab.
   const lock = name => new Promise(granted => navigator.locks.request(name, { ifAvailable: true }, held => held ? new Promise(release => granted(release)) : granted(null)));
@@ -489,14 +501,21 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
     await db.put("threads", thread);
   }
 
-  // A sub-agent's entry goes out when it changes, every 50ms at most; null is one that went.
-  const changed = new Set();
+  // A sub-agent's entry goes out when it changes, every 50ms at most, with only the messages the tabs haven't had:
+  // from is where they start. null is one that went.
+  const changed = new Set(), told = new Map(); // toolUseId -> messages sent
   let subagentTimer = null;
   const watchSubagents = toolUseId => {
     changed.add(toolUseId);
     subagentTimer ??= setTimeout(() => {
       subagentTimer = null;
-      emit({ type: "subagents", entries: structuredClone([...changed].map(id => [id, subagents.get(id) ?? null])) });
+      emit({ type: "subagents", entries: [...changed].map(id => {
+        const entry = subagents.get(id);
+        if (!entry) return told.delete(id), [id, null];
+        const { messages, ...fields } = entry, from = Math.min(told.get(id) ?? 0, messages.length);
+        told.set(id, messages.length);
+        return [id, { ...fields, from, messages: messages.slice(from) }];
+      }) });
       changed.clear();
     }, 50);
   };
@@ -550,7 +569,7 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
       run.timer ??= setTimeout(() => flush(threadId), 50);
     };
     const workspace = workspaces && (() => workspaces.for(threadId));
-    return runAgentWithBranching(run.store, set, () => client(modelId), activePath.at(-1), { agentId, threadId }, db, { signal: run.controller.signal, workspace, host, resume });
+    return runAgentWithBranching(run.store, set, () => client(modelId), activePath.at(-1), { agentId, threadId }, db, { signal: run.controller.signal, workspace, host, resume, modelClient: client });
   }
 
   // An event carries the messages from the first that changed, and the id of the one before them: a tab showing
@@ -563,21 +582,21 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
     const messages = unwrap(run.store.messages);
     const from = Math.min(run.from, messages.length);
     run.from = Infinity;
-    emit({ type: "thread", threadId, from, after: messages[from - 1]?.id ?? null, messages: structuredClone(messages.slice(from)), activeLeafId: run.store.activeLeafId, running: true });
+    emit({ type: "thread", threadId, from, after: messages[from - 1]?.id ?? null, messages: messages.slice(from), activeLeafId: run.store.activeLeafId, running: true });
   }
 
-  // A chat as it stands: the run's store while it runs, else the database's most recent branch.
+  // A chat as it stands: the run's store while it runs, else the database's branch to its newest message.
   async function open(threadId) {
-    const run = runs.get(threadId);
     const thread = await db.get("threads", threadId);
     if (!thread) return null;
+    const run = runs.get(threadId);
     if (run) {
       const { messages, messageTree, activePath, activeLeafId, modelId } = unwrap(run.store);
-      return { thread, messages: structuredClone(messages), tree: messageTree, activePath: [...activePath], activeLeafId, modelId, running: true };
+      return { thread, messages, tree: messageTree, activePath, activeLeafId, modelId, running: true };
     }
     const history = await db.getAllFromIndex("messages", "threadId", threadId);
     const tree = history.length ? buildMessageTree(history) : null;
-    const activePath = tree ? getMostRecentPath(tree) : [];
+    const activePath = tree ? getPathToMessage(tree, Math.max(...history.map(m => m.id))) : [];
     const messages = activePath.map(id => tree.nodes.get(id)?.message).filter(Boolean);
     return { thread, messages, tree, activePath, activeLeafId: activePath.at(-1) ?? null, running: false };
   }
@@ -639,10 +658,13 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
   async function finish(threadId) {
     const run = runs.get(threadId);
     clearTimeout(run?.timer);
-    await markRun(threadId, null);
-    runs.delete(threadId);
-    run?.release?.();
-    workspaces?.release(threadId);
+    try {
+      await markRun(threadId, null);
+    } finally {
+      runs.delete(threadId);
+      run?.release?.();
+      workspaces?.release(threadId);
+    }
     const state = await open(threadId);
     emit({ type: "runs", threadIds: running() });
     if (state) emit({ type: "thread", threadId, ...state, from: 0, after: run?.leafId ?? null });
@@ -686,7 +708,9 @@ function createWorkspaces(db, host) {
 // connects a port and holds tab:<id> while it lives. The engine sends it every event and answers its commands,
 // and asks a tab for what only a tab has (run, code): the tab showing the chat, else a visible one, else any.
 // A call a tab took with it when it closed goes to the next.
-const PROTOCOL = 3; // bump when a command, event, or host call changes
+// Bump when a command, event, or host call changes. The worker's URL carries it and DB_VERSION, so a page of
+// another version gets a worker of its own; hello checks it too.
+const PROTOCOL = 4;
 let served = null;
 function serve(port) {
   const starting = served ??= startEngine();
@@ -702,10 +726,14 @@ const toError = e => e?.message !== undefined ? Object.assign(new Error(e.messag
 
 async function startEngine() {
   const tabs = new Map(); // tabId -> { port, visible, threadId, calls: Map(id -> call) }
-  // A newer version wants the database: this engine lets it go, and its tabs reload into the new one.
+  let engine = null;
+  // A newer version wants the database: this engine stops its runs and lets it go, and its tabs reload into the new one.
   const db = await initDB({
-    blocking: () => { served = null; tabs.forEach(t => t.port.postMessage({ type: "reload" })); },
-    blocked: () => console.warn("An older version of this app holds the database open: close its other tabs."),
+    blocking: () => {
+      served = null;
+      engine?.dispose();
+      tabs.forEach(t => t.port.postMessage({ type: "reload" }));
+    },
   });
   let calls = 0;
   const choose = threadId => {
@@ -739,7 +767,7 @@ async function startEngine() {
     release: (projectId, branch = null) => tabs.forEach(t => t.port.postMessage({ type: "release", projectId, branch })),
   };
   const workspaces = createWorkspaces(db, host);
-  const engine = createEngine(db, { workspaces, host });
+  engine = createEngine(db, { workspaces, host });
   engine.on(event => tabs.forEach(t => t.port.postMessage(event)));
 
   function drop(tabId) {
@@ -767,7 +795,7 @@ async function startEngine() {
         tabs.set(data.tabId, tab);
         navigator.locks.request("tab:" + data.tabId, () => drop(data.tabId));
         port.postMessage({ type: "runs", threadIds: engine.running() });
-        port.postMessage({ type: "subagents", entries: structuredClone([...subagents]), full: true });
+        port.postMessage({ type: "subagents", entries: [...subagents], full: true });
         engine.recover();
       } else if (data.type === "settings") {
         applySettings(data.settings);
@@ -805,7 +833,7 @@ async function startEngine() {
 
 // The note for a turn whose latest run report is not ok, or null.
 function failingReport(messages) {
-  const report = messages.flatMap(m => m.content ?? []).map(c => c?.toolResult?.content?.[0]?.json?.result?.report).filter(r => r && !isScratch(r.path)).at(-1);
+  const report = messages.flatMap(m => m.content ?? []).map(c => resultOf(c)?.report).filter(r => r && !isScratch(r.path)).at(-1);
   if (!report || report.ok !== false) return null;
   const why = [...(report.errors ?? []), ...(report.tests?.failures ?? []), ...(report.notes ?? [])].slice(0, 3).join("; ").replace(/(?<=[^.])$/, ".") || "see the report.";
   return `The last run report for ${report.path} is not ok: ${why} Fix the cause before you finish, or say why you can't. Never fake data or drop what was asked to get a passing report.`;
@@ -814,7 +842,7 @@ function failingReport(messages) {
 // The note for a turn that changed a file without adding a test to it, or null. The count to beat is the file's
 // last report before the turn; a file new this turn has none, so any test will do.
 function untestedChange(messages, start) {
-  const reports = messages.map((m, i) => (m.content ?? []).map(c => [i, c?.toolResult?.content?.[0]?.json?.result?.report]).filter(([, r]) => r?.path && !isScratch(r.path))).flat();
+  const reports = messages.map((m, i) => (m.content ?? []).map(c => [i, resultOf(c)?.report]).filter(([, r]) => r?.path && !isScratch(r.path))).flat();
   const count = r => (r?.tests?.passed ?? 0) + (r?.tests?.failed ?? 0);
   const changed = messages.slice(start).flatMap(m => (m.content ?? []).filter(c => ["edit_file", "write_file"].includes(c?.toolUse?.name))).length;
   const [, after] = reports.findLast(([i]) => i >= start) ?? [];
@@ -827,8 +855,8 @@ function untestedChange(messages, start) {
 // The note for a turn whose variants made versions and none was restored after them, or null: their work is on
 // their branches, and the user sees none of it.
 function unadoptedVariants(messages, start) {
-  const blocks = messages.slice(start).flatMap(m => m.content ?? []), result = c => c?.toolResult?.content?.[0]?.json?.result;
-  const last = blocks.findLastIndex(c => result(c)?.type === "variant" && Object.keys(result(c).versions ?? {}).length);
+  const blocks = messages.slice(start).flatMap(m => m.content ?? []);
+  const last = blocks.findLastIndex(c => resultOf(c)?.type === "variant" && Object.keys(resultOf(c).versions ?? {}).length);
   if (last < 0 || blocks.slice(last).some(c => c?.toolUse?.name === "restore")) return null;
   return "Your variants' versions are on their branches, not in your files: the user sees none of them. Restore the one you choose, or ask the user to choose from the takes.";
 }
@@ -836,7 +864,7 @@ function unadoptedVariants(messages, start) {
 // The note for a turn that chose from its takes and kept reworking the choice, or null: a taste polished past
 // its fixes costs the user's wait and buys another taste.
 function polishedTake(messages, start, most = 6) {
-  const results = messages.slice(start).flatMap(m => m.content ?? []).map(c => c?.toolResult?.content?.[0]?.json?.result).filter(Boolean);
+  const results = messages.slice(start).flatMap(m => m.content ?? []).map(resultOf).filter(Boolean);
   const last = results.findLastIndex(r => r.type === "variant" && Object.keys(r.versions ?? {}).length);
   const since = last < 0 ? 0 : results.slice(last + 1).filter(r => r.version != null && r.path).length;
   return since < most ? null : `${since} versions since your takes came back. Stop when the next change would be a different taste, not a fix: say which take you chose and why.`;
@@ -855,7 +883,8 @@ function silentReply(messages) {
 // workspace: the run's workspace, or a function that finds it each turn, since the chat's project can open in
 // the panel or close there while the run goes on.
 // resume: pick up a run whose tab closed, from the last message it saved.
-async function runAgentWithBranching(store, setStore, client, lastMessageId, params, db, { signal, workspace, host = null, maxTurns = MAX_TURNS, resume = false } = {}) {
+// modelClient: a client for a model id, for the sub-agents the run starts.
+async function runAgentWithBranching(store, setStore, client, lastMessageId, params, db, { signal, workspace, host = null, maxTurns = MAX_TURNS, resume = false, modelClient: clientFor = modelClient } = {}) {
   // Each message records the file heads it left behind, so a branch can restore the code it saw.
   const saveMsg = async msg => db.add("messages", { ...unwrap(msg), agentId: params.agentId, threadId: params.threadId, heads: workspace ? await projectHeads(db, params.threadId) : null });
   const toolMap = Object.fromEntries(store.tools.map(t => [t.toolSpec.name, t.fn]));
@@ -871,7 +900,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   const reminded = new Set();
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
-    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff };
+    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor };
     const results = await getToolResults(store.messages.at(-1).content, toolMap, context);
     // Reworking a chosen take is noticed while it happens, once per turn, since the turn may not end before the user's patience.
     const polished = !reminded.has("polished") && polishedTake([...store.messages, results], start);
@@ -958,7 +987,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     const allMessages = await db.getAllFromIndex("messages", "threadId", params.threadId);
     const tree = buildMessageTree(allMessages);
     setStore("messageTree", tree);
-    setStore("activePath", getMostRecentPath(tree));
+    setStore("activePath", getPathToMessage(tree, store.activeLeafId ?? parentId));
   }
 }
 
@@ -1067,7 +1096,7 @@ function stubResult(part, call) {
 // turns becomes one summary, saved on the thread so later requests start from it. A summary that fails is noted on
 // the thread by the usage that asked for it, and not asked for again until a request uses more.
 async function compactHistory(store, client, db, threadId, summary, memories, signal, keep = 6) {
-  const messages = store.messages;
+  const messages = unwrap(store.messages);
   const last = messages.findLast(m => m.usage);
   const u = last?.usage ?? {};
   const used = (u.inputTokens || 0) + (u.cacheReadInputTokens || 0) + (u.cacheWriteInputTokens || 0);
@@ -1081,7 +1110,7 @@ async function compactHistory(store, client, db, threadId, summary, memories, si
   const head = messages.slice(0, cut).map(({ id, role, content }) => ({ id, role, content }));
   head[cut - 1] = { ...head[cut - 1], content: [...head[cut - 1].content, { text: SUMMARY_PROMPT }] };
   try {
-    const output = await watchedSend(client, getConverseCommand({ ...store, memories, summary, messages: head }), signal);
+    const output = await watchedSend(client, getConverseCommand({ ...unwrap(store), memories, summary, messages: head }), signal);
     const content = [];
     for await (const chunk of output.stream) processStreamChunk(content, chunk);
     const text = content.filter(b => b?.text).map(b => b.text).join("\n").trim();
@@ -1157,19 +1186,28 @@ function joinBytes(a, b) {
 // AI provider clients (AWS Bedrock, Google Gemini) and configuration.
 // =============================================================================
 
+// A provider's SDK loads when its first request does, so a tab that never asks never downloads it. One that failed
+// to load is tried again by the next request.
+const sdks = {};
+const sdk = name => sdks[name] ??= import(`${CDN[name]}/+esm`).catch(e => { delete sdks[name]; throw e; });
+
 async function getConverseClient(type = "aws") {
   if (type === "aws") {
-    const client = new BedrockRuntimeClient(getStoredConfig("aws-config", "AWS"));
-    const send = (input, { signal } = {}) => client.send(new ConverseStreamCommand(input), { abortSignal: signal });
-    return { client, send };
+    const config = getStoredConfig("aws-config", "AWS");
+    const { BedrockRuntimeClient, ConverseStreamCommand } = await sdk("@aws-sdk/client-bedrock-runtime");
+    const client = new BedrockRuntimeClient(config);
+    return { send: (input, { signal } = {}) => client.send(new ConverseStreamCommand(input), { abortSignal: signal }) };
   }
   if (type === "google") {
-    return getGeminiClient(new GoogleGenAI(getStoredConfig("google-config", "Google")));
+    const config = getStoredConfig("google-config", "Google");
+    const { GoogleGenAI } = await sdk("@google/genai");
+    return getGeminiClient(new GoogleGenAI(config));
   }
   if (type === "echo") {
     return getEchoClient();
   }
 }
+const modelClient = modelId => getConverseClient(providerOf(modelId));
 
 // A model that sends nothing this long has stalled: the turn ends with an error, not a spinner that never stops.
 const STALL_MS = 5 * 60_000;
@@ -1274,7 +1312,7 @@ export function getGeminiClient(client) {
       if (b.toolUse) {
         toolNames.set(b.toolUse.toolUseId, b.toolUse.name);
         // Gemini 3 wants its thought signature back on each call; calls from other models carry the documented stand-in.
-        const functionCall = { name: b.toolUse.name, args: typeof b.toolUse.input === "string" ? JSON.parse(b.toolUse.input) : b.toolUse.input, id: b.toolUse.toolUseId };
+        const functionCall = { name: b.toolUse.name, args: b.toolUse.input, id: b.toolUse.toolUseId };
         return [{ functionCall, thoughtSignature: b.toolUse.signature ?? "skip_thought_signature_validator" }];
       }
       if (b.toolResult) {
@@ -1358,16 +1396,17 @@ export function getGeminiClient(client) {
     }
   }
 
-  return { client, send: (input, { signal } = {}) => Promise.resolve({ stream: stream(input, signal) }) };
+  return { send: (input, { signal } = {}) => Promise.resolve({ stream: stream(input, signal) }) };
 }
 
 // Credentials and the proxy are set in Settings and kept in localStorage. A worker has none: each tab sends its
-// settings with every command, and again when another tab changes them; the latest copy stands in.
+// settings with every command, and again when another tab changes them; the latest copy stands in. The proxy sent
+// is the stored one: the worker finds the local proxy itself.
 const SETTING_KEYS = ["aws-config", "google-config", "brave-config"];
 const settings = { items: {}, proxy: null };
 const setting = key => globalThis.localStorage ? localStorage.getItem(key) : settings.items[key] ?? null;
 const storedJSON = key => { try { return JSON.parse(setting(key) || "null"); } catch { return null; } };
-const snapshotSettings = () => ({ items: Object.fromEntries(SETTING_KEYS.map(key => [key, setting(key)])), proxy: getProxyConfig() });
+const snapshotSettings = () => ({ items: Object.fromEntries(SETTING_KEYS.map(key => [key, setting(key)])), proxy: storedProxyConfig() });
 const applySettings = ({ items, proxy }) => Object.assign(settings, { items, proxy });
 
 function getStoredConfig(key, label) {
@@ -1387,10 +1426,15 @@ function getStoredConfig(key, label) {
 // answers its health check as itself.
 const LOCAL_PROXY = "http://localhost:8001";
 let detectedProxy = null;
-const storedProxyConfig = () => storedJSON(PROXY_CONFIG_KEY);
-const getProxyConfig = () => globalThis.localStorage ? storedProxyConfig() ?? detectedProxy : settings.proxy;
-if (globalThis.localStorage && !storedProxyConfig())
+const storedProxyConfig = () => globalThis.localStorage ? storedJSON(PROXY_CONFIG_KEY) : settings.proxy;
+const getProxyConfig = () => storedProxyConfig() ?? detectedProxy;
+if (!storedProxyConfig())
   fetch(LOCAL_PROXY + "/health").then(r => r.json()).then(body => { if (body?.proxy === "chat") detectedProxy = { endpoint: LOCAL_PROXY }; }, () => {});
+
+// This machine, whose addresses the proxy doesn't reach for. Stringified into the code sandbox's bridge.
+function isLocalHost(hostname) {
+  return ["localhost", "127.0.0.1", "[::1]"].includes(hostname) || hostname.endsWith(".localhost");
+}
 
 // The proxy also relays TCP over WebSocket at the same address (the tcpipe protocol).
 const relayUrl = () => getProxyConfig()?.endpoint?.replace(/^http/, "ws").replace(/\/+$/, "") ?? null;
@@ -1400,9 +1444,8 @@ const FETCH_TIMEOUT_MS = 60_000;
 async function proxyFetch(url, { signal, ...options } = {}) {
   const proxy = getProxyConfig();
   const target = new URL(url, location.origin);
-  const local = ["localhost", "127.0.0.1", "[::1]"].some(h => target.hostname === h || target.hostname.endsWith(".localhost"));
   const timed = AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), ...(signal ? [signal] : [])]);
-  if (!proxy?.endpoint || local) return fetch(url, { ...options, signal: timed });
+  if (!proxy?.endpoint || isLocalHost(target.hostname)) return fetch(url, { ...options, signal: timed });
   const headers = new Headers(options.headers || {});
   if (proxy.headerName && proxy.headerValue) headers.set(proxy.headerName, proxy.headerValue);
   return fetch(proxy.endpoint.replace(/\/+$/, "") + "/" + target.href, { ...options, headers, signal: timed });
@@ -1500,7 +1543,7 @@ async function wordToMarkdown(bytes) {
 const RENDER_LIMIT = 15000;
 function mirrorOf(url) {
   const proxy = URL.parse(getProxyConfig()?.endpoint ?? "");
-  if (!proxy || !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(proxy.hostname) || url.protocol !== "https:" || url.port) return null;
+  if (!proxy || !isLocalHost(proxy.hostname) || url.protocol !== "https:" || url.port) return null;
   return new URL(url.pathname + url.search, `http://${url.hostname}.localhost:${proxy.port}`);
 }
 async function renderPage(url, mirror, { screenshot, signal }) {
@@ -1577,7 +1620,7 @@ async function readUrl({ url, from = 0, render = false, screenshot = false } = {
   });
 }
 
-function think(input) {
+function think() {
   return "Thinking complete.";
 }
 
@@ -1750,6 +1793,7 @@ async function editor({ command, path, view_range, old_str, new_str, file_text, 
       if (!new_str && new_str !== "") return { status: "error", error: "new_str is required for insert" };
       const resource = await getResource(normPath);
       if (!resource) return { status: "error", error: missing() };
+      if (typeof resource.content !== "string") return { status: "error", error: `${path} is not text.` };
       const lines = resource.content.split("\n");
       const idx = Math.max(0, Math.min(lines.length, insert_line));
       lines.splice(idx, 0, new_str);
@@ -1917,7 +1961,7 @@ async function task({ prompt, type, folder, model, files }, context = {}) {
   if (toolUseId) setSubagent(toolUseId, { threadId: subagentThreadId, messages: [], currentMessage: null, status: "running", type });
   const update = change => {
     const entry = toolUseId && subagents.get(toolUseId);
-    if (entry) setSubagent(toolUseId, { ...entry, ...(typeof change === "function" ? change(entry) : change) });
+    return entry && setSubagent(toolUseId, { ...entry, ...(typeof change === "function" ? change(entry) : change) });
   };
   const save = message => subagentThreadId && db.add("messages", { ...message, threadId: subagentThreadId, agentId, createdAt: message.createdAt ?? Date.now() });
 
@@ -1925,8 +1969,8 @@ async function task({ prompt, type, folder, model, files }, context = {}) {
   const finish = async status => {
     const thread = subagentThreadId && await db.get("threads", subagentThreadId);
     if (thread) await db.put("threads", { ...thread, status, updatedAt: Date.now() });
-    update({ status, currentMessage: null });
-    if (toolUseId) setTimeout(() => subagents.get(toolUseId)?.status === status && setSubagent(toolUseId, null), SUBAGENT_KEPT_MS);
+    const final = update({ status, currentMessage: null });
+    if (final) setTimeout(() => subagents.get(toolUseId) === final && setSubagent(toolUseId, null), SUBAGENT_KEPT_MS);
   };
 
   let branch = null, messages, capped = true;
@@ -1962,7 +2006,7 @@ async function task({ prompt, type, folder, model, files }, context = {}) {
     }
 
     const effectiveModelId = (model && !forked && MODELS.find(m => m.label === model)?.id) || modelId || DEFAULT_MODEL;
-    const client = await getConverseClient(providerOf(effectiveModelId));
+    const client = await (context.modelClient ?? modelClient)(effectiveModelId);
     const subContext = { db, threadId, agentId, signal, host, ...((type === "fork" || type === "review") && { workspace }), ...(branch && { workspace: branch }) };
     // A fork's history is the caller's; its thread shows the question it was asked.
     await save({ role: "user", content: forked ? [{ text: prompt }] : messages[0].content });
@@ -2064,19 +2108,15 @@ async function getContentBlock(file) {
   const DOC_TYPES = ["pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md"];
   const IMG_TYPES = ["png", "jpg", "jpeg", "gif", "webp"];
 
-  let ext = file.name.split(".").pop().toLowerCase();
-  const isText = file.type.startsWith("text/") || /json|xml/.test(file.type);
-
-  if (isText && !DOC_TYPES.includes(ext)) ext = "txt";
-  if (ext === "htm") ext = "html";
-  if (ext === "jpg") ext = "jpeg";
+  const named = file.name.split(".").pop().toLowerCase();
+  let ext = { htm: "html", jpg: "jpeg" }[named] ?? named;
+  if ((file.type.startsWith("text/") || /json|xml/.test(file.type)) && !DOC_TYPES.includes(ext)) ext = "txt";
 
   const type = IMG_TYPES.includes(ext) ? "image" : DOC_TYPES.includes(ext) ? "document" : null;
   if (!type) return null;
 
   const bytes = new Uint8Array(await file.arrayBuffer());
-  const name = file.name.replace(/[^A-Z0-9 _\-\(\)\[\]]/gi, "_").replace(/\s+/g, " ").trim();
-  return { [type]: { format: ext, name, source: { bytes } } };
+  return { [type]: { format: ext, name: documentName(file.name.replace(/\.[^.]*$/, "")), source: { bytes } } };
 }
 
 // #endregion
@@ -2132,7 +2172,7 @@ async function transformBytes(bytes, stream) {
 // Content-addressed and gzipped: identical file states share one row, so keeping every version stays cheap.
 async function putBlob(db, text) {
   const hash = await sha256(text);
-  if (!blobCache.has(hash) && !(await db.getKey("blobs", hash))) {
+  if (!(await db.getKey("blobs", hash))) {
     const content = await transformBytes(new TextEncoder().encode(text), new CompressionStream("gzip"));
     await db.put("blobs", { hash, content, size: text.length });
   }
@@ -2374,8 +2414,7 @@ function proxyRewrite(url) {
   let u;
   try { u = new URL(url); } catch { return null; }
   const endpoint = proxy.endpoint.replace(/\/+$/, "");
-  const isLocal = ["localhost", "127.0.0.1", "[::1]"].some(h => u.hostname === h || u.hostname.endsWith(".localhost"));
-  if (!/^https?:$/.test(u.protocol) || isLocal || u.origin === location.origin || u.href.startsWith(endpoint)) return null;
+  if (!/^https?:$/.test(u.protocol) || isLocalHost(u.hostname) || u.origin === location.origin || u.href.startsWith(endpoint)) return null;
   const headers = proxy.headerName && proxy.headerValue ? { [proxy.headerName]: proxy.headerValue } : {};
   return { url: endpoint + "/" + u.href, headers };
 }
@@ -2449,8 +2488,8 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
 
   const enqueueRun = fn => { const p = runQueue.then(fn); runQueue = p.catch(() => {}); return p; };
   // Read-modify-commit sections run one at a time, so parallel tool calls never lose an edit. Each starts from
-  // the database, since another workspace may have moved the heads.
-  const exclusive = fn => navigator.locks.request("project:" + (state.project?.id ?? null), async () => { await sync(); return fn(); });
+  // the database, since another workspace may have moved the heads. signal: a caller that stops stops waiting.
+  const exclusive = (fn, { signal } = {}) => navigator.locks.request("project:" + (state.project?.id ?? null), signal ? { signal } : {}, async () => { await sync(); return fn(); });
   // Other workspaces on the same project, in this tab or another, follow each change. A quiet one is the
   // engine's, which a tab runs next and announces as ran, so the panel runs each version once.
   const channel = new BroadcastChannel("projects");
@@ -2493,13 +2532,13 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
 
   // screenshot: true forces one, false skips it, "auto" attaches one while the user shares the tab.
   // announce: tell the other workspaces on the project, for a run the engine asked for.
-  // signal: a run its caller stopped while it waited its turn doesn't start.
+  // signal: a run its caller stopped doesn't start, or stops where it is.
   function run({ versionId = null, script = null, screenshot = false, viewport = null, announce = false, signal = null } = {}) {
     if (host) return hostRun({ versionId, script, screenshot, viewport }, signal);
     if (viewport) setState("viewport", viewport);
     return enqueueRun(async () => {
       signal?.throwIfAborted();
-      const result = await runNow({ versionId, script, screenshot });
+      const result = await runNow({ versionId, script, screenshot, signal });
       if (announce) channel.postMessage({ projectId: state.project.id, ran: true });
       return result;
     });
@@ -2520,7 +2559,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   const refresh = () => run().catch(e => e.closed || notify(e.message));
 
   // The runner answers with the report; the version keeps it, as the shown artifact's latest.
-  async function runNow({ versionId, script, screenshot }) {
+  async function runNow({ versionId, script, screenshot, signal }) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
     const shown = shownPath(project);
@@ -2541,7 +2580,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     if (missing.length) return { report: { version: version.id, path: version.path, ok: false, errors: missing, notes: ["Not run: the page loads files the workspace doesn't have."] } };
     setState({ running: true, ...(!scratch && { logs: [], preview: isHead ? null : { versionId: version.id, path: version.path, text: content } }) });
     try {
-      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, parked: scratch });
+      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, parked: scratch, signal });
       if (!scratch) setState("runLog", runLog);
       if (isHead) {
         const stored = { ...report, thumb: thumb || version.report?.thumb || null };
@@ -3244,10 +3283,11 @@ async function workspaceFor(context, { create = false } = {}) {
 // largest size Bedrock takes; Claude and Gemini read both inside a tool result, Sol and Luna see images beside it.
 const MEDIA = { png: ["image", 3.75e6], jpeg: ["image", 3.75e6], gif: ["image", 3.75e6], webp: ["image", 3.75e6], pdf: ["document", 4.5e6] };
 const withMedia = (result, ...files) => (files = files.filter(Boolean)).length ? { ...result, __media: files } : result;
+// Bedrock allows a document name letters, digits, single spaces, hyphens, parentheses, and brackets.
+const documentName = name => (name || "document").replace(/[^A-Z0-9 \-()[\]]+/gi, "-").replace(/\s+/g, " ").trim().slice(0, 200) || "document";
 const mediaBlock = ({ format, bytes, name }) => MEDIA[format][0] === "image"
   ? { image: { format, source: { bytes } } }
-  // Bedrock allows a document name letters, digits, single spaces, hyphens, parentheses, and brackets.
-  : { document: { format, name: (name || "document").replace(/[^A-Z0-9 \-()[\]]+/gi, "-").replace(/\s+/g, " ").trim().slice(0, 200) || "document", source: { bytes } } };
+  : { document: { format, name: documentName(name), source: { bytes } } };
 
 // A binary file in resources (a screenshot, a PDF), read as itself.
 async function viewResource(path, blob) {
@@ -3555,11 +3595,7 @@ function parseJSON(input) {
     while (index < jsonString.length && numberChars.includes(jsonString[index])) index++;
     const numStr = jsonString.substring(startIndex, index);
     if (!numStr) throw new Error("Empty number literal");
-    try { return parseFloat(numStr); }
-    catch (e) {
-      if (numStr.length > 1) return parseFloat(numStr.slice(0, -1));
-      throw e;
-    }
+    return parseFloat(numStr);
   }
 
   return parseValue();
@@ -3651,14 +3687,15 @@ if (inSharedWorker) {
 // #endregion
 
 export {
-  CAPTURE_CHOICE_KEY, CDN, DEFAULT_MODEL, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL, PROXY_CONFIG_KEY, TOOLS,
-  VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, countLines, countRepeats, createWorkspace,
-  editFile, editor, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getConverseClient,
-  getConverseCommand, getProxyConfig, getToolResults, initDB, inspectArgs, isHtml, isRenderable, isScratch,
-  listHistory, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap, ownedTools, parseJSON,
-  parsePatch, plainError, polishedTake, preflight, prepareMessages, processStreamChunk, providerOf, proxyFetch,
-  proxyRewrite, readUrl, reasoningFields, reasoningLevel, relayUrl, restoreVersion, runAgentWithBranching, runApp,
-  runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent, siblingFiles, silentReply, sleep,
-  snapshotSettings, storedProxyConfig, summarizeReport, systemPrompt, task, think, timeAgo, toDocument, toError,
-  toResultValue, unadoptedVariants, unmuteScripts, untestedChange, viewFile, watchedSend, webSearch, writeFile,
+  CAPTURE_CHOICE_KEY, CDN, DB_VERSION, DEFAULT_MODEL, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL, PROXY_CONFIG_KEY,
+  TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, countLines, countRepeats,
+  createWorkspace, editFile, editor, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
+  getConverseClient, getConverseCommand, getProxyConfig, getToolResults, initDB, inspectArgs, isHtml, isLocalHost,
+  isRenderable, isScratch, listHistory, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
+  ownedTools, parseJSON, parsePatch, plainError, polishedTake, preflight, prepareMessages, processStreamChunk,
+  providerOf, proxyFetch, proxyRewrite, readUrl, reasoningFields, reasoningLevel, relayUrl, restoreVersion,
+  runAgentWithBranching, runApp, runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent,
+  siblingFiles, silentReply, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, systemPrompt,
+  task, think, timeAgo, toDocument, toError, toResultValue, unadoptedVariants, unmuteScripts, untestedChange,
+  viewFile, watchedSend, webSearch, writeFile,
 };

@@ -25,13 +25,14 @@ function options(argv) {
   const [target, ...flags] = argv;
   if (!target)
     throw new Error(
-      "Usage: node test.js <target.html> [--story name] [--screenshot] [--viewports desktop,mobile] [--headed] [--live-stack name --profile name --region name [--published]]",
+      "Usage: node test.js <target.html> [--story name] [--screenshot] [--viewports desktop,mobile] [--headed] [--net] [--live-stack name --profile name --region name [--published]]",
     );
   const result = {
     target,
     story: null,
     screenshot: false,
     headed: false,
+    net: false,
     viewports: ["desktop"],
     liveStack: null,
     published: false,
@@ -41,6 +42,8 @@ function options(argv) {
   for (let i = 0; i < flags.length; i++) {
     if (flags[i] === "--screenshot") result.screenshot = true;
     else if (flags[i] === "--headed") result.headed = true;
+    // The page's tests that reach third-party sites run only with --net; npm test stays offline.
+    else if (flags[i] === "--net") result.net = true;
     else if (flags[i] === "--story") result.story = flags[++i];
     else if (flags[i] === "--viewports")
       result.viewports = flags[++i]?.split(",") ?? [];
@@ -129,6 +132,7 @@ async function run(config = options(process.argv.slice(2))) {
     if (!liveUrl) {
       pageUrl.searchParams.set("test", "1");
       if (config.story) pageUrl.searchParams.set("story", config.story);
+      if (config.net) pageUrl.searchParams.set("net", "1");
     }
 
     browser = await chromium.launch({ headless: !config.headed });
