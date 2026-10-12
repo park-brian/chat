@@ -4,3 +4,7 @@ agentcore/.artifacts/
 docs/
 !agentcore/docs/
 !agentcore/docs/*.md
+.artifacts/
+.claude/settings.local.json
+*.tmp.mjs
+probe*.mjs

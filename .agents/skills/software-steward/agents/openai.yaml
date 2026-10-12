@@ -1,0 +1,4 @@
+interface:
+  display_name: "Software Steward"
+  short_description: "Choose and evolve architecture from concrete evidence"
+  default_prompt: "Use $software-steward to choose and test the architecture for this change, with explicit tradeoffs and a path to evolve it."
