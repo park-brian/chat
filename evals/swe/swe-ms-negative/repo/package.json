@@ -1,0 +1,14 @@
+{
+  "name": "ms",
+  "version": "2.1.1",
+  "description": "Tiny millisecond conversion utility",
+  "repository": "zeit/ms",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

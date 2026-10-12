@@ -1,6 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import vm from "node:vm";
 import { prose, wordCount } from "./style.js";
+import SWE from "./swe.js";
+import RESEARCH from "./research.js";
+import ANSWER_HARD from "./answer-hard.js";
 
 // Eval tasks: each hits one behavior the prompt asks for. A turn is a user message, { seed } to place a file
 // first (written by the echo model, so the real model finds it in the workspace), or { said: [question, reply] } for an
@@ -1064,4 +1067,7 @@ export default [
     check: run => [[run.answer.includes("The quarterly report is due on Friday."), "fixes it"], noTools(run), noArtifact(run), [run.answer.length <= 200, `short (${run.answer.length} chars)`]],
     rubric: ["Gives the corrected sentence.", "Has no explanation beyond what was asked."],
   },
+  ...SWE,
+  ...RESEARCH,
+  ...ANSWER_HARD,
 ];

@@ -1,0 +1,15 @@
+{
+  "name": "mitt",
+  "version": "3.0.1",
+  "description": "Tiny 200b functional Event Emitter / pubsub.",
+  "repository": "developit/mitt",
+  "license": "MIT",
+  "type": "module",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

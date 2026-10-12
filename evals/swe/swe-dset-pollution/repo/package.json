@@ -1,0 +1,15 @@
+{
+  "name": "dset",
+  "version": "3.1.1",
+  "description": "A tiny (194B) utility for safely writing deep Object values~!",
+  "repository": "lukeed/dset",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./merge": "./src/merge.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

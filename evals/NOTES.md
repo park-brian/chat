@@ -1207,3 +1207,44 @@ Work items 1-3 of docs/specs/2026-10-12-answer-quality-plan.md.
 Smoke (2026-10-12T19-15-30-682s, haiku, correct-ipv6 and debug-await ×1): 0.94. correct-ipv6 missed "says the
 earlier answer was wrong" on "No. … The 64 I gave is …", which the judge passed; the regex now takes that form.
 Each run used about 13.5k model input tokens and 1.2k judge tokens.
+
+## Answer baseline (2026-10-12): Haiku 5.5 0.97 answer, 0.94 holdout; Gemini 3.8 Flash 0.95
+
+Runs: answer ×3 (2026-10-12T19-17-13-yvq8), answer-holdout ×2, answer on Gemini ×1, inner ×1 (0.97), all at
+reasoning high, prompt as of 0efcae4.
+
+- **The answer set doesn't separate.** Nine of twelve tasks pass every criterion on all three Haiku runs. Short,
+  well-posed questions are answered well: the answer comes first, explanations are plain, compare-cli checked
+  the registry before recommending and named what it hadn't checked, ambiguous-tons stated the metric ton and gave
+  the other two.
+- **Where points are lost is writing and length.** The judge failed "states things literally" on commit messages,
+  the long conversation and two holdout answers, and "each reply is as short as its question allows" on every
+  long-bookclub run. long-bookclub also lost the rename once (a later reply said "meetings").
+- **The flourish counter found almost nothing** (0 everywhere except long-bookclub, 0.73 per 1000 words on Haiku;
+  0 on Gemini). Mannered phrasing in these answers is mostly outside the list, so the judge carries this measure.
+- **Gemini is slower on single turns** (3-22 s against Haiku's 2-12 s) and faster on long-bookclub (40 s
+  against 56 s), with a similar score.
+- Holdout misses: a merge/rebase explanation that skipped the merge commit, a fixed function shown with an
+  undefined variable, Fermi answers that ended with a range instead of one estimate.
+
+Next: harder tiers (swe, research, answer-hard) for a baseline the prompt round can move.
+
+## Harder tiers baseline (2026-10-12): research 0.91, answer-hard 0.86 (Haiku 5.5 ×3)
+
+These separate. Every miss below is one the prompt doesn't address today:
+
+- **Sources not named** (8 research runs): the value is right and came from a tool, but the answer doesn't say
+  which URL, package and file.
+- **No plan file** on the long report (3 of 3): hard-ssg-report wrote report.md after 28-41 calls with no PLAN.md.
+  Two of its replies also claimed reading the tool calls don't show.
+- **Computed in the head**: research-arxiv-llama2 read the export record but didn't run code for the count and
+  the interval in 2 of 3 runs; one lodash run gave 308 (Object.keys) instead of 306 functions.
+- **Ambiguity handled by asking**: hard-graphql-plan asked questions instead of stating assumptions in 2 of 3
+  runs, and didn't give steps to start on in one.
+- **Writing for the reader**: the caching explainer for non-engineers came with headings and undefined terms (CDN,
+  TTL) in 3 of 3, and failed plain writing once.
+- **Facts beyond the given ones**: the decision record added features and figures that weren't in the brief in 3
+  of 3 (one invented number, 21).
+- **Length**: the false-premise correction came with a code walkthrough in 3 of 3.
+
+Runs: research 2026-10-12 (×3, 21 jobs), answer-hard (×3, 21 jobs), prompt as of 0efcae4.

@@ -1,5 +1,5 @@
 // Runs the chat harness against real models on fixed tasks, grades each run, and keeps every transcript.
-// npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
+// npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout | swe | research | answer-hard] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
 //                 [--system persona.md] [--baseline run-id] [--reasoning off|low|medium|high (default)|xhigh|max] [--headed] [--yes (needed above MAX_UNCONFIRMED jobs)]
 // A task with a rubric is also graded by a judge model (evals/judge.js); its criteria join the checks.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -28,7 +28,7 @@ const START_TIMEOUT = 5_000;
 // Every job calls paid APIs: more than this many must be confirmed with --yes.
 export const MAX_UNCONFIRMED = 20;
 const root = path.dirname(fileURLToPath(import.meta.url));
-export const SETS = ["inner", "holdout", "hard", "game", "answer", "answer-holdout"];
+export const SETS = ["inner", "holdout", "hard", "game", "answer", "answer-holdout", "swe", "research", "answer-hard"];
 const LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function options(argv, tasks = TASKS) {
@@ -365,6 +365,8 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       files,
       report: shown?.report ?? null,
       calls: messages.filter(m => m.modelId !== "echo").flatMap(m => m.content.filter(b => b.toolUse).map(b => b.toolUse)),
+      // Each call's result by its id, so the judge can see what a claimed check returned.
+      outcomes: Object.fromEntries(messages.flatMap(m => m.content.filter(b => b.toolResult).map(b => [b.toolResult.toolUseId, b.toolResult.content.map(c => c.text ?? JSON.stringify(c.json ?? "")).join("\n")]))),
       results: messages.flatMap(m => m.content.filter(b => b.toolResult).flatMap(b => b.toolResult.content.map(c => c.text ?? JSON.stringify(c.json ?? "")))).join("\n"),
       metrics: metrics(messages, subagents, ms, subagents.filter(m => forkThreads.has(m.threadId))),
       dialogue: dialogue(messages),

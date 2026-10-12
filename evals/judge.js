@@ -1,5 +1,5 @@
 // A fixed, stronger model grades what scripts can't see: each answer task's rubric, one yes/no criterion at a time.
-// It reads the conversation, the tools called, the rubric and a reference answer; it never sees which model answered.
+// It reads the conversation, the tools called and what each returned, the rubric and a reference answer; it never sees which model answered.
 
 export const JUDGE_MODEL = "global.anthropic.claude-sonnet-5-5";
 export const PLAIN = "States things literally; no metaphor or flourish where a literal phrase exists.";
@@ -35,7 +35,11 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 // The Converse request: the model id travels outside the text, and the graded model's name is in none of it.
 export function judgePrompt(run, criteria) {
   const turns = (run.dialogue ?? []).map(m => `<${m.role}>\n${m.text}\n</${m.role}>`).join("\n\n");
-  const tools = (run.calls ?? []).filter(c => c.name !== "think").map(c => `${c.name} ${clip(JSON.stringify(c.input ?? {}), 300)}`);
+  // Each call with what it returned, so a claim about a check can be held against the check.
+  const tools = (run.calls ?? []).filter(c => c.name !== "think").map(c => {
+    const out = run.outcomes?.[c.toolUseId];
+    return `${c.name} ${clip(JSON.stringify(c.input ?? {}), 300)}` + (out ? `\n  → ${clip(out, 600).replaceAll("\n", "\n    ")}` : "");
+  });
   const text = [
     `<conversation>\n${turns}\n</conversation>`,
     `<tool_calls>\n${tools.join("\n") || "none"}\n</tool_calls>`,

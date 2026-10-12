@@ -1,0 +1,17 @@
+{
+  "name": "klona",
+  "version": "2.0.4",
+  "description": "A tiny (240B to 501B) and fast utility to \"deep clone\" Objects, Arrays, Dates, RegExps, and more!",
+  "repository": "lukeed/klona",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./lite": "./src/lite.js",
+    "./json": "./src/json.js",
+    "./full": "./src/full.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

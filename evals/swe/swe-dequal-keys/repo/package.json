@@ -1,0 +1,15 @@
+{
+  "name": "dequal",
+  "version": "2.0.3",
+  "description": "A tiny (304B to 489B) utility for check for deep equality",
+  "repository": "lukeed/dequal",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./lite": "./src/lite.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
