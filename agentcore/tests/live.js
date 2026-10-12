@@ -627,6 +627,18 @@ export async function runLiveStory(
     console.log(
       "PASS: live acceptance, duplicate/branch protection, navigation, closed browser, watcher detach/reconnect, exactly-once result/charges, cancellation, forced Runtime loss",
     );
+  } catch (error) {
+    // What the page showed, so a live failure can be read from its log.
+    const state = await page
+      .evaluate(() => ({
+        url: location.href,
+        app: document.querySelector("#app")?.dataset,
+        alerts: [...document.querySelectorAll("[role=alert]")].map((node) => node.textContent),
+        main: document.querySelector("main")?.innerText.slice(0, 2000),
+      }))
+      .catch(() => null);
+    console.error("Live story failed on:", JSON.stringify(state, null, 2));
+    throw error;
   } finally {
     for (const context of contexts) await context.close();
     await replacementBrowser?.close();

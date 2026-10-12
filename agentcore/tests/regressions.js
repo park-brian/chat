@@ -655,12 +655,9 @@ export async function runRegression(
           branchId: "main",
           expectedHeadTurnId: second.done.turnId,
         });
-        const deleted = await call("objects.delete", {
+        const inUse = await call("objects.delete", {
           projectId: "alpha",
           id: begin.data.id,
-        });
-        const afterDelete = await call("objects.list", {
-          projectId: "alpha",
         });
         const unskilledAgent = await call("agents.put", {
           projectId: "alpha",
@@ -669,6 +666,13 @@ export async function runRegression(
           name: "Foundation smoke",
           modelId: "test.echo",
           skillIds: [],
+        });
+        const deleted = await call("objects.delete", {
+          projectId: "alpha",
+          id: begin.data.id,
+        });
+        const afterDelete = await call("objects.list", {
+          projectId: "alpha",
         });
         const zeroLimit = await call("users.setLimits", {
           sub: self.data.user.sub,
@@ -724,6 +728,7 @@ export async function runRegression(
           content,
           quota,
           skillAgent,
+          inUse,
           skilled,
           deleted,
           afterDelete,
@@ -769,6 +774,7 @@ export async function runRegression(
       result.quota?.error?.code !== "QUOTA_EXCEEDED" ||
       !result.skillAgent?.ok ||
       !result.skilled?.done ||
+      result.inUse?.error?.code !== "SKILL_IN_USE" ||
       !result.deleted?.ok ||
       result.afterDelete?.data?.usedBytes <= result.archiveUsed ||
       !result.unskilledAgent?.ok ||
