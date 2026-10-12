@@ -108,7 +108,7 @@ const MODELS = [
   { id: "global.anthropic.claude-fable-5-1", label: "Fable 5.1", group: "AWS Bedrock", ...CLAUDE_5 },
   { id: "global.anthropic.claude-opus-5-5", label: "Opus 5.5", group: "AWS Bedrock", ...CLAUDE_5 },
   { id: "global.anthropic.claude-sonnet-5-5", label: "Sonnet 5.5", group: "AWS Bedrock", ...CLAUDE_5 },
-  { id: "global.anthropic.claude-haiku-5-5", label: "Haiku 5.5", group: "AWS Bedrock", ...CLAUDE_5, levels: ["off", ...CLAUDE_5.levels], off: { thinking: { type: "disabled" } } },
+  { id: "global.anthropic.claude-haiku-5-5", label: "Haiku 5.5", group: "AWS Bedrock", ...CLAUDE_5, context: 100_000, levels: ["off", ...CLAUDE_5.levels], off: { thinking: { type: "disabled" } } },
   // Bedrock's OpenAI models take no cache points and no documents. They see a tool result's image only beside it,
   // in the same message, never inside it (evals/NOTES.md).
   { id: "global.openai.gpt-6.1-sol", label: "Sol 6.1", group: "AWS Bedrock", ...GPT_6, levels: ["low", "medium", "high", "xhigh", "max"], cache: false, documents: false, beside: true },
@@ -122,7 +122,10 @@ const MODELS = [
 const DEFAULT_MODEL = "global.anthropic.claude-haiku-5-5";
 const SUBAGENT_TYPES = ["fork", "variant", "part", "explore", "plan", "general", "review"];
 const SUBAGENT_MODELS = MODELS.filter(m => m.group !== "Test").map(m => m.label);
-const modelInfo = id => ({ maxTokens: 32_000, window: 200_000, cache: true, documents: true, beside: false, ...(MODELS.find(m => m.id === id) ?? { id, ...(/anthropic/.test(id) && CLAUDE_BUDGET) }) });
+const modelInfo = id => {
+  const info = { maxTokens: 32_000, window: 200_000, cache: true, documents: true, beside: false, ...(MODELS.find(m => m.id === id) ?? { id, ...(/anthropic/.test(id) && CLAUDE_BUDGET) }) };
+  return { ...info, context: Math.min(info.context ?? CONTEXT, info.window) };
+};
 // The level a model runs at: the one asked for, or the nearest it accepts.
 function reasoningLevel(model, level) {
   if (!model.levels) return "off";
@@ -135,7 +138,10 @@ function reasoningFields(model, level) {
 }
 const providerOf = id => (id === "echo" ? "echo" : /^gemini/.test(id) ? "google" : "aws");
 const MAX_TURNS = 60; // model calls per message before the loop pauses
-const COMPACT_AT = 0.6; // share of the context window that triggers a summary
+const COMPACT_AT = 0.6; // share of the context budget that triggers a summary
+// The context a request may use, whatever the model accepts: smaller requests are faster and keep attention on
+// the work. A model can set its own (Haiku 5.5: 100k); a smaller window wins.
+const CONTEXT = 256_000;
 
 // Sub-agents as they run, by the toolUseId of their task call: { threadId, messages, currentMessage, status, type }.
 // A finished one stays a minute, for a card or a test that asks after it, then goes.
@@ -872,6 +878,18 @@ function polishedTake(messages, start, most = 6) {
   return since < most ? null : `${since} versions since your takes came back. Stop when the next change would be a different taste, not a fix: say which take you chose and why.`;
 }
 
+// The note for a turn that has made PLAN_AFTER calls (think aside) and has no plan file, or null. A plan file counts
+// at the project's root or in the shown artifact's folder: the places the prompt's "beside the work" means.
+// Why: Haiku made ~35 calls on hard-ssg-report and never wrote the PLAN.md its prompt asks for.
+const PLAN_AFTER = 8;
+function unplannedTask(messages, start, files, shown = null) {
+  const calls = messages.slice(start).flatMap(m => m.content ?? []).filter(c => c?.toolUse && c.toolUse.name !== "think").length;
+  if (calls < PLAN_AFTER) return null;
+  const folder = shown?.includes("/") ? shown.slice(0, shown.lastIndexOf("/") + 1) : "";
+  if (files.some(p => PLAN_FILES.some(name => p === name || p === folder + name))) return null;
+  return "This task is long. Write PLAN.md now with write_file (SPEC.md if you are building an app): the goal in the user's words, the steps with the check for each, what is done, what you learned. Then continue.";
+}
+
 // The note for a reply that ended in thought alone, with no text and no call, or null.
 function silentReply(messages) {
   const last = messages.at(-1);
@@ -907,6 +925,9 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     // Reworking a chosen take is noticed while it happens, once per turn, since the turn may not end before the user's patience.
     const polished = !reminded.has("polished") && polishedTake([...store.messages, results], start);
     if (polished) { reminded.add("polished"); results.content.push({ text: polished, harness: true }); }
+    // A long turn without a plan is told so while it runs, once: its end may be too late for the plan to help.
+    const unplanned = ws && toolMap.write_file && !reminded.has("unplanned") && unplannedTask(store.messages, start, Object.keys(ws.state?.files ?? {}), ws.shownPath?.());
+    if (unplanned) { reminded.add("unplanned"); results.content.push({ text: unplanned, harness: true }); }
     return push({ ...results, parentId: callsId, createdAt: Date.now() });
   };
 
@@ -1102,7 +1123,7 @@ async function compactHistory(store, client, db, threadId, summary, memories, si
   const last = messages.findLast(m => m.usage);
   const u = last?.usage ?? {};
   const used = (u.inputTokens || 0) + (u.cacheReadInputTokens || 0) + (u.cacheWriteInputTokens || 0);
-  if (used < modelInfo(store.modelId).window * COMPACT_AT || last.id === summary?.usageId) return summary;
+  if (used < modelInfo(store.modelId).context * COMPACT_AT || last.id === summary?.usageId) return summary;
   let cut = messages.length - keep;
   while (cut > 1 && messages[cut].role !== "assistant") cut--;
   if (cut <= 1 || messages[cut - 1].id === summary?.throughId) return summary;
@@ -2301,6 +2322,9 @@ const isRenderable = path => Object.hasOwn(RENDERERS, extensionOf(path));
 const isHtml = path => /^html?$/.test(extensionOf(path));
 // scratch/ is the agent's bench: spikes, fixtures, harder tests. It runs off screen and never becomes the shown artifact.
 const isScratch = path => normalizePath(path).startsWith("scratch/");
+// The agent's plan for the work, in any folder: notes on the work, never the artifact on show.
+const PLAN_FILES = ["PLAN.md", "SPEC.md"];
+const isPlanFile = path => PLAN_FILES.includes(normalizePath(path).split("/").pop());
 
 async function toDocument(path, text) {
   return RENDERERS[extensionOf(path)](text);
@@ -2520,7 +2544,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   function shownPath(project = state.project) {
     if (!project) return null;
     if (project.heads[project.entry] && isRenderable(project.entry)) return project.entry;
-    return Object.keys(project.heads).sort().find(p => isRenderable(p) && !isScratch(p)) ?? null;
+    return Object.keys(project.heads).sort().find(p => isRenderable(p) && !isScratch(p) && !isPlanFile(p)) ?? null;
   }
 
   // Files that render become the shown artifact; others open as code. A new artifact opens the panel.
@@ -3313,8 +3337,8 @@ async function finishChange(ws, { version, change, notes, checked }, screenshot,
   const result = { version: version.id, path: version.path, change, ...(notes?.length && { notes }) };
   if (checked?.errors.length)
     return { ...result, report: { version: version.id, path: version.path, ok: false, errors: checked.errors, notes: ["Not run: the file does not parse. Fix these first."] } };
-  // The spec is the agent's notes on the work, not the work: the panel keeps showing the artifact.
-  if (version.path === "SPEC.md") return result;
+  // The plan is the agent's notes on the work, not the work: the panel keeps showing the artifact.
+  if (isPlanFile(version.path)) return result;
   const scratch = isScratch(version.path);
   // A module, stylesheet or data file reports through the page that loads it: the shown one.
   const page = scratch || await ws.show(version.path) || isHtml(ws.shownPath() ?? "");
@@ -3702,11 +3726,11 @@ export {
   PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, countLines, countRepeats,
   createWorkspace, editFile, editor, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
   getConverseClient, getConverseCommand, getProxyConfig, getToolResults, initDB, inspectArgs, isHtml, isLocalHost,
-  isRenderable, isScratch, listHistory, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
+  isPlanFile, isRenderable, isScratch, listHistory, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
   ownedTools, parseJSON, parsePatch, plainError, polishedTake, preflight, prepareMessages, processStreamChunk,
   providerOf, proxyFetch, proxyRewrite, readUrl, reasoningFields, reasoningLevel, relayUrl, restoreVersion,
   runAgentWithBranching, runApp, runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent,
   siblingFiles, silentReply, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, systemPrompt,
-  task, think, timeAgo, toDocument, toError, toResultValue, unadoptedVariants, unmuteScripts, untestedChange,
+  task, think, timeAgo, toDocument, toError, toResultValue, unadoptedVariants, unmuteScripts, unplannedTask, untestedChange,
   viewFile, watchedSend, webSearch, webToolNames, writeFile,
 };

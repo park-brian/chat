@@ -3330,8 +3330,8 @@
           getMostRecentPath, getToolResults, listHistory, mcp, memoriesBlock, missingFiles, normalizePath, outline,
           overlap, ownedTools, polishedTake, preflight, prepareMessages, processStreamChunk, providerOf, proxyFetch,
           reasoningFields, relayUrl, restoreVersion, runAgentWithBranching, runApp, runningSubagents, setSubagent,
-          siblingFiles, silentReply, systemPrompt, task, think, toDocument, unadoptedVariants, untestedChange, viewFile,
-          watchedSend, writeFile,
+          siblingFiles, silentReply, systemPrompt, task, think, toDocument, unadoptedVariants, unplannedTask, untestedChange, viewFile,
+          watchedSend, webSearch, writeFile,
         } = await import("./engine.js");
         const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
         // Tests that reach third-party sites run only when asked (npm test -- --net adds net=1).
@@ -4892,6 +4892,11 @@
             assert(imported.report?.result === "hello x", `a script's import resolves in the page's folder: ${JSON.stringify(imported.report)}`);
             const spec = await writeFile({ path: "SPEC.md", content: "# Greeter\n- [x] greets by name\n" }, context);
             assert(!spec.report && ui.workspace.shownPath() === "index.html", `the spec is notes on the work: it neither runs nor takes the panel: ${JSON.stringify(spec)}`);
+            // Why: the reminder to keep PLAN.md would otherwise put the plan in the panel over the report it plans
+            for (const path of ["PLAN.md", "src/PLAN.md"]) {
+              const plan = await writeFile({ path, content: "# Plan\n- [ ] greet\n" }, context);
+              assert(!plan.report && ui.workspace.shownPath() === "index.html" && ui.workspace.state.project.entry === "index.html", `${path} is notes too: ${JSON.stringify(plan)}`);
+            }
             const steps = Array.from({ length: 50 }, (_, i) => `- [ ] step ${i}`);
             await writeFile({ path: "SPEC.md", content: steps.join("\n") }, context);
             const resent = await writeFile({ path: "SPEC.md", content: steps.with(3, "- [x] step 3").join("\n") }, context);
@@ -5467,8 +5472,10 @@ if (window.__HARNESS__?.test) (async () => {
           ];
           for (const id of latest) {
             assert(MODELS.some(m => m.id === id), `${id} is selectable`);
-            assert(modelInfo(id).window >= 1_000_000, `${id} uses its full context window`);
+            assert(modelInfo(id).window >= 1_000_000, `${id} accepts its full context window`);
+            assert(modelInfo(id).context === (id === "global.anthropic.claude-haiku-5-5" ? 100_000 : 256_000), `${id} works within its context budget (${modelInfo(id).context})`);
           }
+          assert(modelInfo("anthropic.claude-old").context === 200_000, "a window smaller than the budget wins");
           assert(DEFAULT_MODEL === "global.anthropic.claude-haiku-5-5", "new chats default to Haiku 5.5");
           const image = { image: { format: "png", source: { bytes: new Uint8Array([1]) } } };
           const request = modelId => getConverseCommand({ modelId, reasoningMode: "high", systemPrompt: "P", tools: TOOLS, messages: [{ role: "user", content: [{ text: "hi" }, image] }] });
@@ -5789,6 +5796,42 @@ if (window.__HARNESS__?.test) (async () => {
           assert(store.messages.at(-1).content[0]?.text === "Still no tests; stopping.", "after one reminder the model's word stands");
         }
 
+        // Why: Haiku made ~35 calls on hard-ssg-report and never wrote the PLAN.md its prompt asks for
+        async function testUnplannedTask() {
+          const call = name => ({ role: "assistant", content: [{ toolUse: { toolUseId: "c", name, input: {} } }] });
+          const calls = n => Array.from({ length: n }, () => call("code"));
+          assert(unplannedTask(calls(8), 0, [])?.startsWith("This task is long. Write PLAN.md now with write_file"), "eight calls with no plan file are reminded");
+          assert(unplannedTask(calls(7), 0, []) === null && unplannedTask([...calls(7), call("think"), call("think")], 0, []) === null, "seven are not, and thinking is not a call");
+          assert(unplannedTask([...calls(5), { role: "user", content: [{ text: "next" }] }, ...calls(5)], 6, []) === null, "only this turn's calls count");
+          assert(unplannedTask(calls(8), 0, ["PLAN.md"]) === null && unplannedTask(calls(8), 0, ["SPEC.md", "index.html"]) === null, "a plan file at the root stops it");
+          assert(unplannedTask(calls(8), 0, ["app/SPEC.md"], "app/index.html") === null, "so does one beside the shown artifact");
+          assert(unplannedTask(calls(8), 0, ["notes/PLAN.md"], "app/index.html"), "but not one elsewhere");
+
+          // In a run: once per turn, as a note beside the results, and never with a plan file in the workspace.
+          const files = {};
+          const workspace = { state: { files }, shownPath: () => null };
+          const fake = name => ({ toolSpec: { name, description: "d", inputSchema: { json: { type: "object", properties: {} } } }, fn: input => (name === "write_file" && (files[input.path] = "plan"), { ok: true }) });
+          const tools = [fake("probe"), fake("write_file"), ...TOOLS.filter(t => t.toolSpec.name === "think")];
+          const turn = async script => {
+            const threadId = await db.add("threads", { agentId: 1, name: "plan", createdAt: Date.now() });
+            const userId = await db.add("messages", { role: "user", content: [{ text: "go" }], threadId, agentId: 1 });
+            const [store, setStore] = createStore({ modelId: "echo", systemPrompt: "P", tools, messages: [{ id: userId, role: "user", content: [{ text: "go" }] }] });
+            const client = createMockClient([...script.map(([name, input = {}], i) => ({ blocks: mockToolUseBlock(name, input, "t" + i), stopReason: "tool_use" })), { blocks: mockTextBlock("Done.") }]);
+            await runAgentWithBranching(store, setStore, client, userId, { threadId, agentId: 1 }, db, { workspace });
+            const results = store.messages.filter(m => m.content.some(c => c.toolResult));
+            return results.map(m => m.content.filter(c => c.harness).map(c => c.text)).map((notes, i) => [i, notes]).filter(([, notes]) => notes.length);
+          };
+          const probes = n => Array.from({ length: n }, () => ["probe"]);
+          const once = await turn([...probes(3), ["think", { thought: "hm" }], ...probes(9)]);
+          assert(once.length === 1 && once[0][0] === 8 && once[0][1][0].startsWith("This task is long"), `the eighth call that isn't thought gets the note, once in the turn: ${JSON.stringify(once)}`);
+          const again = await turn(probes(8));
+          assert(again.length === 1, `each turn gets its own: ${JSON.stringify(again)}`);
+          const planned = await turn([["write_file", { path: "PLAN.md" }], ...probes(10)]);
+          assert(planned.length === 0, `a turn that wrote its plan is not told to: ${JSON.stringify(planned)}`);
+          const later = await turn(probes(10));
+          assert(later.length === 0, `nor a later turn, with the plan still there: ${JSON.stringify(later)}`);
+        }
+
         // Why: a reply that was only thought, or only blank, left a message with nothing in it, and the request was refused
         async function testEmptyMessages() {
           const thought = { reasoningContent: { reasoningText: { text: "hm", signature: "s" } } };
@@ -6082,6 +6125,7 @@ if (window.__HARNESS__?.test) (async () => {
           testStalledStream,
           testCallsRunWhateverTheStopReason,
           testFailingReportReminder,
+          testUnplannedTask,
           testEmptyMessages,
           testEditorReplacePatterns,
           testToolLookup,
