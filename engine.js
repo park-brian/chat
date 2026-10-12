@@ -1443,7 +1443,7 @@ const relayUrl = () => getProxyConfig()?.endpoint?.replace(/^http/, "ws").replac
 
 // Without a proxy, a site that sends no CORS headers fails as "Failed to fetch", which names neither the cause nor
 // the fix. The code sandbox's fetch says the same.
-const CORS_BLOCKED = "blocked by CORS: no local proxy. Use a CORS-open source, or run `npm run start:proxy`.";
+const CORS_BLOCKED = "blocked by CORS (or unreachable): no local proxy. Use a CORS-open source, or run `npm run start:proxy`.";
 const crossOrigin = target => /^https?:$/.test(target.protocol) && target.origin !== location.origin && !isLocalHost(target.hostname);
 
 // A tool's fetch, through the proxy unless the URL is this machine's. It gives up after a minute, or when the run stops.

@@ -3934,7 +3934,7 @@
             if (getProxyConfig()?.endpoint) return console.log("SKIP: testCorsBlocked (a proxy was detected at " + LOCAL_PROXY + ")");
             const read = await readUrl({ url: "https://example.com/x" });
             assert(read.error === "Failed to fetch https://example.com/x: " + CORS_BLOCKED, `read_url names the cause and the fix: ${JSON.stringify(read)}`);
-            assert(CORS_BLOCKED === "blocked by CORS: no local proxy. Use a CORS-open source, or run `npm run start:proxy`.", CORS_BLOCKED);
+            assert(CORS_BLOCKED === "blocked by CORS (or unreachable): no local proxy. Use a CORS-open source, or run `npm run start:proxy`.", CORS_BLOCKED);
             assert(sent[0].get("accept") && !sent[0].has("upgrade-insecure-requests"), "sent directly, it asks nothing that needs a preflight");
             const search = await webSearch({ query: "x" });
             assert(search.error === "Failed to fetch " + "https://api.search.brave.com/res/v1/web/search?q=x&count=10&extra_snippets=true: " + CORS_BLOCKED, `web_search names it too: ${JSON.stringify(search)}`);
