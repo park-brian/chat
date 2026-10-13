@@ -485,14 +485,19 @@ export function createGitHubClient({ token = null, fetch: fetcher = (...args) =>
     throw new RateLimitError(rateMessage(`GitHub allows ${perMinute} content creations a minute and this needs ${count} (${recent()} made in the last minute)`, reset), reset);
   }
 
+  let rate = null; // the last answer's { remaining, reset }: what a poller paces itself by
   async function request(method, path, body = undefined, { accept = "application/vnd.github+json", raw = false } = {}) {
     if (method !== "GET") { reserve(1); created.push(now()); }
-    const response = await fetcher(path.startsWith("http") ? path : api + path, {
+    let response = await fetcher(path.startsWith("http") ? path : api + path, {
       method,
       headers: { Accept: accept, "X-GitHub-Api-Version": "2022-11-28", ...(token && { Authorization: `Bearer ${token}` }), ...(body !== undefined && { "Content-Type": "application/json" }) },
       ...(body !== undefined && { body: JSON.stringify(body) }),
     });
+    // A redirect a fetch handed back (one that doesn't follow them): a job's log is at a storage URL, without the token.
+    const location = response.status >= 300 && response.status < 400 ? response.headers?.get?.("location") : null;
+    if (location && method === "GET") response = await fetcher(location);
     const header = name => response.headers?.get?.(name) ?? null;
+    if (header("x-ratelimit-remaining") != null && header("x-ratelimit-reset") != null) rate = { remaining: +header("x-ratelimit-remaining"), reset: new Date(+header("x-ratelimit-reset") * 1000) };
     if (response.ok) return raw ? response : response.status === 204 ? null : response.json();
     const data = await response.json().catch(() => ({}));
     const message = data.message || response.statusText || `HTTP ${response.status}`;
@@ -510,6 +515,7 @@ export function createGitHubClient({ token = null, fetch: fetcher = (...args) =>
     post: (path, body) => request("POST", path, body),
     patch: (path, body) => request("PATCH", path, body),
     creationsLeft: () => perMinute - recent(),
+    rate: () => rate,
   };
 }
 
@@ -551,7 +557,7 @@ const DEFAULT_BRANCH = branch => `${branch} is the repository's default branch: 
 // files() is the working copy: { path: text } for every file the journal holds (the rest are as the base has them).
 // Local commits wait in record.commits until push turns them into commits on a branch. current(): the stored
 // record now, when it can change under the root.
-export function createGitHubRoot(record, { token = () => null, fetch: fetcher, patch, save = async () => {}, files: working = async () => ({}), current = null, perMinute = CREATIONS_PER_MINUTE } = {}) {
+export function createGitHubRoot(record, { token = () => null, fetch: fetcher, patch, save = async () => {}, files: working = async () => ({}), current = null, perMinute = CREATIONS_PER_MINUTE, sleep, now } = {}) {
   let state = record;
   let client = null, clientToken;
   const github = () => {
@@ -702,8 +708,242 @@ export function createGitHubRoot(record, { token = () => null, fetch: fetcher, p
       kind: "github", present: async () => true,
       status: fresh(status), diff: fresh(diff), log: fresh(log), branch: fresh(branch), commit: fresh(commit), push: fresh(push), openPullRequest: fresh(openPullRequest),
       pull: async () => { throw new Error("git pull isn't supported on a GitHub project yet: reconnect the repository to start from its tip."); },
+      ci: Object.fromEntries(Object.entries(createGitHubCI({ client: github, repo: () => state, sleep, now })).map(([k, fn]) => [k, fresh(fn)])),
     },
   };
+}
+
+// #endregion
+
+// #region CI
+
+// What a check run's or a commit status's outcome counts as, as gh pr checks buckets them.
+export function checkBucket({ status = "completed", conclusion = null, state = null } = {}) {
+  if (state) return state === "success" ? "pass" : state === "pending" ? "pending" : "fail"; // a commit status
+  if (status !== "completed") return "pending";
+  if (conclusion === "success") return "pass";
+  if (conclusion === "skipped" || conclusion === "neutral") return "skipping";
+  if (["failure", "cancelled", "timed_out", "action_required", "startup_failure"].includes(conclusion)) return "fail";
+  return "pending"; // stale, or none yet
+}
+
+// The whole: pending while any check is, then failure if any failed, success if any passed, else neutral (none, or
+// all skipped).
+export function checksState(items) {
+  const buckets = items.map(checkBucket);
+  return buckets.includes("pending") ? "pending" : buckets.includes("fail") ? "failure" : buckets.includes("pass") ? "success" : "neutral";
+}
+
+const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
+const STAMP = /^\uFEFF?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z ?/;
+// Lines worth keeping from anywhere in a failed job's log: the runner's errors, TAP's and test runners' failures,
+// assertion messages and the first lines of a stack.
+const MARKER = /##\[error\]|^\s*not ok\b|\bFAIL(ED)?\b|✖|✗|×|\b\w*Error\b:|\bAssertionError\b|\bexpected\b.*\b(to|but|got|received)\b|^\s*(actual|expected):|^\s*[-+] |^\s+at\s/;
+const STEP_START = /^##\[group\]Run |^Post job cleanup\.|^Cleaning up orphan processes/;
+
+// A failed job's log, short: its timestamps and colors gone, the lines with error markers from anywhere, then the
+// tail of the step that failed (the section around the first ##[error]). maxChars bounds the whole.
+export function failedLogExcerpt(text, { maxChars = 8000, tailLines = 40 } = {}) {
+  const lines = String(text ?? "").split(/\r?\n/).map(l => l.replace(STAMP, "").replace(ANSI, "").replace(/\s+$/, ""));
+  const firstError = lines.findIndex(l => l.startsWith("##[error]"));
+  let from = 0, to = lines.length;
+  if (firstError >= 0) {
+    for (let i = firstError; i >= 0; i--) if (/^##\[group\]Run /.test(lines[i])) { from = i; break; }
+    for (let i = firstError + 1; i < lines.length; i++) if (STEP_START.test(lines[i])) { to = i; break; }
+  }
+  // The step's command echo (between its group lines) says nothing a reader needs: keep its first line.
+  const step = lines.slice(from, to);
+  const echoEnd = /^##\[group\]Run /.test(step[0] ?? "") ? step.indexOf("##[endgroup]") : -1;
+  const section = echoEnd > 0 ? [step[0].replace("##[group]", ""), ...step.slice(echoEnd + 1)] : step;
+  const marked = [];
+  let stack = 0;
+  const keep = l => {
+    if (/^\s+at\s/.test(l)) { if (++stack > 3) return; } else stack = 0;
+    if (marked.at(-1) !== l) marked.push(l);
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim() || !MARKER.test(l) || /^##\[(group|endgroup)\]/.test(l)) { stack = 0; continue; }
+    keep(l);
+    // A failed TAP test (node --test): its YAML block says what was expected and where, without the timings.
+    if (/^\s*not ok\b/.test(l) && /^\s*---$/.test(lines[i + 1] ?? "")) {
+      let j = i + 2, kept = 0;
+      for (; j < lines.length && !/^\s*\.\.\.$/.test(lines[j]); j++)
+        if (!/^\s*(duration_ms|type|failureType|exitCode|signal):/.test(lines[j]) && kept++ < 16) keep(lines[j]);
+      i = j;
+    }
+  }
+  // With the failures found, the step's last lines are its summary; without, they are all there is to go on.
+  const found = marked.some(l => !l.startsWith("##[error]"));
+  const tail = section.filter(l => !/^\s*(duration_ms|type):|^# duration_ms/.test(l)).slice(-(found ? Math.min(tailLines, 12) : tailLines));
+  const tailSet = new Set(tail);
+  const markedText = marked.filter(l => !tailSet.has(l)).join("\n").trim();
+  const clipEnd = (s, n) => (s.length <= n ? s : "…\n" + s.slice(s.length - n + 2).replace(/^[^\n]*\n/, ""));
+  const clipStart = (s, n) => (s.length <= n ? s : s.slice(0, n - 2).replace(/\n[^\n]*$/, "") + "\n…");
+  const tailText = tail.join("\n").trim();
+  if (!markedText) return clipEnd(tailText, maxChars);
+  const budget = Math.max(0, maxChars - Math.min(tailText.length, Math.ceil(maxChars * 0.6)) - 1);
+  const head = clipStart(markedText, budget);
+  return head ? `${head}\n${clipEnd(tailText, maxChars - head.length - 1)}` : clipEnd(tailText, maxChars);
+}
+
+const defaultSleep = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
+  const t = setTimeout(() => { signal?.removeEventListener?.("abort", stop); resolve(); }, Math.max(0, ms));
+  const stop = () => { clearTimeout(t); reject(signal.reason ?? new Error("aborted")); };
+  signal?.addEventListener?.("abort", stop, { once: true });
+});
+
+// A repository's CI, read through the REST API (every endpoint here answers cross-origin, and a job's log redirects
+// to storage that does too): check runs and commit statuses for a commit, workflow runs and their jobs, a failed
+// job's log, and waiting for it all to finish. client(): createGitHubClient's; repo(): { owner, repo, branch, base }.
+export function createGitHubCI({ client, repo, sleep = defaultSleep, now = () => Date.now() }) {
+  const path = () => `/repos/${repo().owner}/${repo().repo}`;
+  const get = (p, options) => client().get(path() + p, options);
+  const enc = s => encodeURIComponent(s);
+
+  const hasWorkflows = () => Object.keys(repo().base?.files ?? {}).some(p => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p));
+
+  // The commit a branch is at; with neither, the project's own (the last push, or where it was connected).
+  async function resolveSha({ sha = null, branch = null } = {}) {
+    if (sha) return sha;
+    if (branch) return (await get(`/branches/${enc(branch)}`)).commit.sha;
+    return repo().base.commit;
+  }
+
+  const ids = url => {
+    const m = /\/actions\/runs\/(\d+)(?:\/job\/(\d+))?/.exec(url ?? "");
+    return { runId: m ? +m[1] : null, jobId: m?.[2] ? +m[2] : null };
+  };
+  const toRun = c => ({
+    id: c.id, name: c.name, status: c.status, conclusion: c.conclusion, url: c.html_url || c.details_url,
+    title: c.output?.title ?? "", summary: c.output?.summary ?? "", annotationsCount: c.output?.annotations_count ?? 0, annotations: [],
+    app: c.app?.slug ?? null, startedAt: c.started_at ?? null, completedAt: c.completed_at ?? null, ...ids(c.details_url || c.html_url),
+  });
+
+  async function annotate(runs) {
+    await Promise.all(runs.filter(r => checkBucket(r) === "fail" && r.annotationsCount > 0).map(async r => {
+      const list = await get(`/check-runs/${r.id}/annotations?per_page=50`).catch(() => []);
+      r.annotations = list.map(a => ({ path: a.path, line: a.start_line ?? null, message: a.message, level: a.annotation_level, title: a.title ?? "" }));
+    }));
+    return runs;
+  }
+
+  // { sha, state, total, runs: [{ name, status, conclusion, url, summary, annotations }], statuses: [{ name, state,
+  // description, url }] }: the commit's check runs (annotations for the failed ones) and its combined status.
+  async function checks({ sha = null, branch = null, annotations = true } = {}) {
+    const at = await resolveSha({ sha, branch });
+    const [checkRuns, combined] = await Promise.all([get(`/commits/${at}/check-runs?per_page=100`), get(`/commits/${at}/status`)]);
+    const runs = (checkRuns.check_runs ?? []).map(toRun).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    if (annotations) await annotate(runs);
+    // A commit with no statuses has a combined state of "pending": only the statuses themselves count.
+    const statuses = (combined.statuses ?? []).map(s => ({ name: s.context, state: s.state, description: s.description ?? "", url: s.target_url ?? null }));
+    return { sha: at, state: checksState([...runs, ...statuses]), total: runs.length + statuses.length, runs, statuses };
+  }
+
+  const toWorkflowRun = r => ({
+    id: r.id, name: r.name, title: r.display_title ?? r.head_commit?.message?.split("\n")[0] ?? "", status: r.status, conclusion: r.conclusion,
+    branch: r.head_branch, sha: r.head_sha, event: r.event, url: r.html_url, attempt: r.run_attempt ?? 1,
+    createdAt: r.created_at, updatedAt: r.updated_at, startedAt: r.run_started_at ?? r.created_at,
+  });
+  async function runs({ branch = null, sha = null, limit = 20 } = {}) {
+    const q = new URLSearchParams({ per_page: String(Math.min(100, Math.max(1, limit))) });
+    if (branch) q.set("branch", branch);
+    if (sha) q.set("head_sha", sha);
+    return ((await get(`/actions/runs?${q}`)).workflow_runs ?? []).slice(0, limit).map(toWorkflowRun);
+  }
+  const run = async id => toWorkflowRun(await get(`/actions/runs/${id}`));
+
+  const toJob = j => ({
+    id: j.id, runId: j.run_id, name: j.name, status: j.status, conclusion: j.conclusion, url: j.html_url, startedAt: j.started_at, completedAt: j.completed_at,
+    steps: (j.steps ?? []).map(s => ({ number: s.number, name: s.name, status: s.status, conclusion: s.conclusion })),
+  });
+  const jobs = async runId => ((await get(`/actions/runs/${runId}/jobs?per_page=100`)).jobs ?? []).map(toJob);
+
+  // The failed jobs' logs of a run (or one job's: { job: id }), each as failedLogExcerpt keeps it, under a line
+  // naming the job and the step that failed. A bare id is a run's, else a job's.
+  async function failedLog(target, { maxChars = 8000 } = {}) {
+    let failed;
+    if (target && typeof target === "object" && target.job != null) failed = [toJob(await get(`/actions/jobs/${target.job}`))];
+    else {
+      const id = typeof target === "object" ? target.run : target;
+      try { failed = (await jobs(id)).filter(j => checkBucket(j) === "fail"); }
+      catch (e) {
+        if (e.status !== 404 || typeof target === "object") throw e;
+        failed = [toJob(await get(`/actions/jobs/${id}`))];
+      }
+    }
+    if (!failed.length) return "";
+    const each = Math.max(500, Math.floor(maxChars / failed.length) - 80);
+    const parts = [];
+    for (const j of failed) {
+      const step = j.steps.find(s => s.conclusion === "failure")?.name;
+      const head = `${j.name}${step ? ` › ${step}` : ""} (${j.conclusion ?? j.status})`;
+      let text;
+      try {
+        // 302 to a storage URL that sends Access-Control-Allow-Origin: *; fetch follows it, dropping the token.
+        const response = await client().request("GET", `${path()}/actions/jobs/${j.id}/logs`, undefined, { raw: true, accept: "application/vnd.github+json" });
+        text = failedLogExcerpt(await response.text(), { maxChars: each });
+      } catch (e) {
+        text = e.status === 404 || e.status === 410 ? "(the log isn't available: it may have expired, or the job hasn't finished)" : `(the log couldn't be read: ${e.message})`;
+      }
+      parts.push(`${head}\n${text}`);
+    }
+    const all = parts.join("\n\n");
+    return all.length <= maxChars ? all : all.slice(0, maxChars - 2) + "\n…";
+  }
+
+  // Polls until done(value) or the time is up. The interval stretches while nothing changes (to 60 s) and when the
+  // hour's allowance runs low; a rate-limit answer waits for its reset when that comes before the deadline.
+  async function poll(read, { done, key = v => JSON.stringify(v), timeoutMs, pollMs, onUpdate = null, signal = null }) {
+    const start = now(), deadline = start + timeoutMs;
+    let wait = pollMs, last;
+    for (;;) {
+      let value;
+      try { value = await read(); }
+      catch (e) {
+        if (!(e instanceof RateLimitError) || +e.reset + 1000 > deadline) throw e;
+        await sleep(+e.reset - now() + 1000, signal);
+        continue;
+      }
+      const k = key(value);
+      if (k !== last) { last = k; wait = pollMs; onUpdate?.(value); } else wait = Math.min(Math.max(wait, Math.round(wait * 1.5)), Math.max(pollMs, 60_000));
+      if (done(value, now() - start)) return value;
+      const rate = client().rate?.();
+      if (rate && rate.remaining < 50) wait = Math.max(wait, rate.remaining > 0 ? (+rate.reset - now()) / rate.remaining : +rate.reset - now() + 1000);
+      if (now() + wait > deadline) return { ...value, timedOut: true };
+      await sleep(wait, signal);
+    }
+  }
+
+  // Resolves when no check on the commit is queued or in progress (or, failFast, when one fails), with checks()'s
+  // answer; timedOut: true when the time ran out first. Right after a push GitHub may take a while to register the
+  // checks: on a repository with workflows, none yet keeps waiting for graceMs.
+  async function waitForChecks({ sha = null, branch = null, timeoutMs = 15 * 60_000, pollMs = 10_000, graceMs = 120_000, failFast = false, onUpdate = null, signal = null } = {}) {
+    const at = await resolveSha({ sha, branch });
+    const workflows = hasWorkflows();
+    const result = await poll(() => checks({ sha: at, annotations: false }), {
+      timeoutMs, pollMs, onUpdate, signal,
+      key: c => JSON.stringify([...c.runs.map(r => [r.name, r.status, r.conclusion]), ...c.statuses.map(s => [s.name, s.state])]),
+      done: (c, elapsed) => (c.state !== "pending" && (c.total > 0 || !workflows || elapsed >= graceMs)) || (failFast && [...c.runs, ...c.statuses].some(r => checkBucket(r) === "fail")),
+    });
+    await annotate(result.runs);
+    return result;
+  }
+
+  // Resolves when the workflow run completes, with run()'s answer (timedOut: true when the time ran out first).
+  const waitForRun = (id, { timeoutMs = 15 * 60_000, pollMs = 10_000, onUpdate = null, signal = null } = {}) =>
+    poll(() => run(id), { timeoutMs, pollMs, onUpdate, signal, key: r => `${r.status}:${r.conclusion}`, done: r => r.status === "completed" });
+
+  // The open pull request from a branch (the project's by default), or the one numbered: { number, url, title,
+  // headSha, headRef, state }, or null.
+  async function pullRequest({ number = null, branch = null } = {}) {
+    const pr = number != null ? await get(`/pulls/${number}`)
+      : (await get(`/pulls?head=${enc(`${repo().owner}:${branch ?? repo().branch}`)}&state=open&per_page=1`))[0];
+    return pr ? { number: pr.number, url: pr.html_url, title: pr.title, headSha: pr.head.sha, headRef: pr.head.ref, state: pr.state } : null;
+  }
+
+  return { hasWorkflows, checks, runs, run, jobs, failedLog, waitForChecks, waitForRun, pullRequest };
 }
 
 // #endregion

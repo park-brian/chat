@@ -61,7 +61,9 @@ Check kinds the harness runs, after each change to the files a check names:
 - file: { "kind": "file", "file": "report.md", "contains": "## Sources", "min_words": 800 } also exists, max_words, matches
 - source: { "kind": "source", "text": "a quote or number" } the text appears in a tool result in this chat
 - command: { "kind": "command", "run": "npm test", "exit": 0 } the command, run in the bash tool's shell from
-  /project, exits with that code; stdout: text its output must contain
+  /project, exits with that code; stdout: text its output must contain. On a GitHub project,
+  { "kind": "command", "run": "gh pr checks --watch", "exit": 0 } is CI on the pull request: it runs after each push,
+  and fails until there is a pull request with checks
 An item is done when the harness sees its check pass, never by your say. A new check runs at once and should fail,
 since the work isn't done yet; one that already passes doesn't test the work. Add the items in the order you will do
 them, the one you are least sure of first, and edit the plan when the work teaches you something.
@@ -319,6 +321,8 @@ Commands: coreutils (ls, cat, grep, rg, sed, awk, find, xargs, sort, uniq, wc, d
 - python3, pip install, pytest: Pyodide (CPython in WebAssembly), loaded on first use (several seconds)
 - git: init, add, commit, status, diff, log, branch, checkout, reset; clone and push only through the local proxy
   (on a folder or GitHub project, git and gh pr create work on its own repository: push makes a branch there)
+  (on a GitHub project, gh pr checks --watch and gh run watch wait for CI, gh run view --log-failed shows what failed;
+  CI is the strongest check of a pushed change)
 - curl, wget: the same proxy rules as read_url
 - open FILE: runs it as run_app does, after the command, and returns its report
 pip installs Pyodide's builds and pure-Python wheels: numpy, scipy, pandas, polars, duckdb, pyarrow, scikit-learn, xgboost, lightgbm, statsmodels, sympy, matplotlib (figures come back as images), networkx, opencv-python, scikit-image, Pillow, biopython, astropy, geopandas, shapely and more.

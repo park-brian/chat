@@ -12,6 +12,8 @@ export const SHELL_ROOT = "/project";
 const ROOT_FILES = 5000, ROOT_BYTES = 50e6;
 const DEFAULT_TIMEOUT = 60, PYTHON_TIMEOUT = 300, MAX_TIMEOUT = 600, CHECK_TIMEOUT = 300;
 const PYTHON = /(^|[\s;&|(`])(python3?|pip3?|pytest)(\s|$)/;
+// gh commands that wait for CI: they get the longest timeout unless one is given.
+export const WATCHING = /(^|&&)\s*gh\s+(pr\s+checks\b[^&]*--watch|run\s+watch)\b/;
 
 export const BASH_TOOL_SPEC = {
   name: "bash",
@@ -130,7 +132,7 @@ export function createShellTool({ workspaceFor, runApp }) {
     const r = { stdout: "", stderr: "", exitCode: 0, ms: 0, saved: [], skipped: [], images: [], opens: [], kept: { binary: [] } };
     for (const segment of chain) {
       const began = Date.now();
-      const one = segment.git ? await runProjectGit(ws, segment.words, { state: s, readOnly }) : await exec(ws, context, { ...options, command: segment.text });
+      const one = segment.git ? await runProjectGit(ws, segment.words, { state: s, readOnly, timeoutMs: options.timeoutMs, signal: context.signal ?? null }) : await exec(ws, context, { ...options, command: segment.text });
       r.stdout += one.stdout ?? "";
       r.stderr += one.stderr ?? "";
       r.exitCode = one.exitCode;
@@ -138,6 +140,7 @@ export function createShellTool({ workspaceFor, runApp }) {
       if (one.cwd) r.cwd = one.cwd;
       for (const k of ["saved", "skipped", "images", "opens"]) r[k].push(...(one[k] ?? []));
       r.kept.binary.push(...(one.kept?.binary ?? []));
+      if (one.pushed) r.pushed = one.pushed;
       if (one.exitCode !== 0 || one.killed) break;
     }
     return r;
@@ -158,12 +161,14 @@ export function createShellTool({ workspaceFor, runApp }) {
         if (!command.trim()) return { restarted: true, cwd: SHELL_ROOT };
       }
       if (!command.trim()) return { error: "command is empty: give a bash command, e.g. ls" };
-      const secs = Math.min(MAX_TIMEOUT, Math.max(1, Number(timeout) || (PYTHON.test(command) ? PYTHON_TIMEOUT : DEFAULT_TIMEOUT)));
+      const secs = Math.min(MAX_TIMEOUT, Math.max(1, Number(timeout) || (chain && WATCHING.test(command) ? MAX_TIMEOUT : PYTHON.test(command) ? PYTHON_TIMEOUT : DEFAULT_TIMEOUT)));
       const options = { timeoutMs: secs * 1000, toolUseId: context.toolUseId ?? null, commit: context.shell?.commit, owns: context.shell?.owns };
       const r = chain ? await execChain(ws, context, chain, options) : await exec(ws, context, { command, ...options });
       const out = { stdout: r.stdout ?? "", stderr: r.stderr ?? "", exitCode: r.exitCode, ms: r.ms };
       if (r.cwd && r.cwd !== SHELL_ROOT) out.cwd = r.cwd;
       if (r.saved.length) out.files = r.saved;
+      // The director runs a CI check again after a push (engine.js step).
+      if (r.pushed) out.pushed = r.pushed;
       const notes = [];
       if (r.kept?.binary?.length) notes.push(`Kept in the shell, not in the project's versions (binary): ${r.kept.binary.slice(0, 10).join(", ")}${r.kept.binary.length > 10 ? ", …" : ""}.`);
       if (r.skipped.length) notes.push(context.shell?.commit === false
@@ -190,8 +195,12 @@ export function createShellTool({ workspaceFor, runApp }) {
   // The director's check: { kind: "command", run, exit = 0, stdout? }, run from /project in the run's shell.
   async function runCommandCheck(check, { ws, host, threadId = null, agentId = null, signal = null } = {}) {
     if (!ws?.state?.project) return { result: "fail", evidence: "no project is open, so the command has nothing to run on yet" };
-    if (!host?.shell) return { result: "not run", evidence: "not run: no tab is open to run the shell in" };
-    const r = await exec(ws, { host, threadId, agentId, signal }, { command: check.run, cwd: SHELL_ROOT, keepState: false, timeoutMs: CHECK_TIMEOUT * 1000 });
+    // On a folder or GitHub project, git and gh are the project's own, as in bash: gh pr checks --watch is CI.
+    const chain = projectGitChain(ws, check.run);
+    if (!host?.shell && !(chain && chain.every(s => s.git))) return { result: "not run", evidence: "not run: no tab is open to run the shell in" };
+    const context = { host, threadId, agentId, signal };
+    const options = { cwd: SHELL_ROOT, keepState: false, timeoutMs: (chain && WATCHING.test(check.run) ? MAX_TIMEOUT : CHECK_TIMEOUT) * 1000 };
+    const r = chain ? await execChain(ws, context, chain, options) : await exec(ws, context, { command: check.run, ...options });
     const want = check.exit ?? 0, text = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
     const t = testCounts(text), counts = t ? ` (${t.passed} passed, ${t.failed} failed)` : "";
     const tail = clip(text.trim().split("\n").filter(Boolean).slice(-3).join(" / "), 200);

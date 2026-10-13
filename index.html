@@ -5801,6 +5801,236 @@
           assert(over instanceof P.RateLimitError && /allows 2 content creations a minute and this needs 3/.test(over.message) && budget.calls.every(c => c.method === "GET"), `a push over the allowance is refused before it starts: ${over.message}`);
         }
 
+        // A repository's CI in memory, over fakeGitHub: check runs and statuses that move through ci.script (one entry a
+        // poll of check-runs, the last repeating), workflow runs and jobs, a job log behind a redirect, rate limits.
+        async function fakeCI({ files = { "a.txt": "a" }, script = [[]], statuses = [], prs = [], limitOnce = null } = {}) {
+          const gh = await fakeGitHub({ files });
+          const ci = { polls: 0, script, statuses, prs, limitOnce, rate: null, blob: null, calls: gh.calls };
+          const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
+          const LOG = [
+            "\uFEFF2026-10-13T10:00:00.0000000Z Current runner version: '2.330.0'",
+            "2026-10-13T10:00:01.0000000Z ##[group]Run actions/checkout@v4",
+            "2026-10-13T10:00:01.1000000Z with:",
+            "2026-10-13T10:00:01.2000000Z ##[endgroup]",
+            "2026-10-13T10:00:02.0000000Z Syncing repository: o/r",
+            "2026-10-13T10:00:05.0000000Z ##[group]Run npm test",
+            "2026-10-13T10:00:05.0000000Z npm test",
+            "2026-10-13T10:00:05.0000000Z shell: /usr/bin/bash -e {0}",
+            "2026-10-13T10:00:05.0000000Z ##[endgroup]",
+            "2026-10-13T10:00:06.0000000Z TAP version 13",
+            "2026-10-13T10:00:06.0000000Z ok 1 - parses",
+            "2026-10-13T10:00:06.0000000Z not ok 2 - adds two numbers",
+            "2026-10-13T10:00:06.0000000Z   ---",
+            "2026-10-13T10:00:06.0000000Z   duration_ms: 1.2",
+            "2026-10-13T10:00:06.0000000Z   error: 'Expected values to be strictly equal: 3 !== 4'",
+            "2026-10-13T10:00:06.0000000Z   expected: 4",
+            "2026-10-13T10:00:06.0000000Z   actual: 3",
+            "2026-10-13T10:00:06.0000000Z   ...",
+            "2026-10-13T10:00:06.0000000Z # pass 1",
+            "2026-10-13T10:00:06.0000000Z # fail 1",
+            "2026-10-13T10:00:06.0000000Z \x1b[31m##[error]Process completed with exit code 1.\x1b[0m",
+            "2026-10-13T10:00:07.0000000Z Post job cleanup.",
+          ].join("\n");
+          const run = (id, status, conclusion) => ({ id, name: "test", display_title: "Fix", status, conclusion, head_branch: "agent/x", head_sha: "c1", event: "push", html_url: `https://github.com/o/r/actions/runs/${id}`,
+            created_at: "2026-10-13T10:00:00Z", updated_at: "2026-10-13T10:00:42Z", run_started_at: "2026-10-13T10:00:00Z" });
+          ci.runs = [run(100, "completed", "failure")];
+          ci.fetch = async (url, init = {}) => {
+            const u = new URL(url), method = init.method ?? "GET", p = u.pathname.replace("/repos/o/r", "");
+            if (u.hostname === "blob.example") { ci.blob = { auth: new Headers(init.headers).get("Authorization") }; return new Response(LOG); }
+            const isCI = /^\/(commits\/[^/]+\/(check-runs|status)|check-runs\/|actions\/|pulls\b)/.test(p) && method === "GET";
+            if (!isCI) return gh.fetch(url, init);
+            gh.calls.push({ method, host: u.hostname, path: u.pathname + u.search, auth: new Headers(init.headers).get("Authorization") });
+            const rate = ci.rate ? { "x-ratelimit-remaining": String(ci.rate.remaining), "x-ratelimit-reset": String(Math.floor(ci.rate.reset / 1000)) } : { "x-ratelimit-remaining": "4999", "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600) };
+            if (/check-runs$/.test(p)) {
+              if (ci.limitOnce) { const reset = ci.limitOnce; ci.limitOnce = null; return json({ message: "API rate limit exceeded" }, 403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.floor(reset / 1000)) }); }
+              const runs = ci.script[Math.min(ci.polls++, ci.script.length - 1)];
+              return json({ total_count: runs.length, check_runs: runs }, 200, rate);
+            }
+            if (/\/status$/.test(p)) return json({ state: ci.statuses.some(s => s.state === "failure") ? "failure" : "pending", statuses: ci.statuses }, 200, rate);
+            if (p === "/check-runs/11/annotations") return json([{ path: "test/a.test.js", start_line: 5, message: "Expected 3 to equal 4", annotation_level: "failure" }, { path: ".github", start_line: 1, message: "Node.js 20 is deprecated", annotation_level: "warning" }]);
+            if (p === "/actions/runs") return json({ workflow_runs: ci.runs.filter(r => (!u.searchParams.get("branch") || r.head_branch === u.searchParams.get("branch")) && (!u.searchParams.get("head_sha") || r.head_sha === u.searchParams.get("head_sha"))) });
+            const one = /^\/actions\/runs\/(\d+)$/.exec(p);
+            if (one) return ci.runs.find(r => r.id === +one[1]) ? json(ci.runs.find(r => r.id === +one[1]) ) : json({ message: "Not Found" }, 404);
+            if (/^\/actions\/runs\/\d+\/jobs$/.test(p)) return json({ jobs: [
+              { id: 200, run_id: 100, name: "test", status: "completed", conclusion: "failure", html_url: "https://github.com/o/r/actions/runs/100/job/200", started_at: "2026-10-13T10:00:00Z", completed_at: "2026-10-13T10:00:07Z",
+                steps: [{ number: 1, name: "Set up job", status: "completed", conclusion: "success" }, { number: 2, name: "Run npm test", status: "completed", conclusion: "failure" }, { number: 3, name: "Post", status: "completed", conclusion: "skipped" }] },
+              { id: 201, run_id: 100, name: "lint", status: "completed", conclusion: "success", steps: [] }] });
+            // GitHub answers a job's log with a redirect to storage.
+            if (p === "/actions/jobs/200/logs") return new Response(null, { status: 302, headers: { Location: "https://blob.example/logs/200.txt?sig=x" } });
+            if (p.startsWith("/pulls")) {
+              const n = /^\/pulls\/(\d+)$/.exec(p)?.[1], head = u.searchParams.get("head");
+              const found = ci.prs.filter(pr => (n ? pr.number === +n : `o:${pr.head.ref}` === head));
+              return n ? (found[0] ? json(found[0]) : json({ message: "Not Found" }, 404)) : json(found);
+            }
+            return json({ message: `unexpected CI ${method} ${p}` }, 500);
+          };
+          return ci;
+        }
+        const checkRun = (id, status, conclusion = null, extra = {}) => ({ id, name: extra.name ?? "test", status, conclusion, html_url: `https://github.com/o/r/actions/runs/100/job/${id}`, details_url: `https://github.com/o/r/actions/runs/100/job/${id}`,
+          started_at: "2026-10-13T10:00:00Z", completed_at: status === "completed" ? "2026-10-13T10:00:42Z" : null, output: { title: "", summary: extra.summary ?? "", annotations_count: extra.annotations ?? 0 }, app: { slug: "github-actions" } });
+
+        // Why: a pushed change's strongest check is the repository's CI: the agent has to see it go green or red, and
+        // why, from the browser, without spending GitHub's rate limit
+        async function testGitHubCI() {
+          const { runProjectGit } = await import("./shell/project-git.js");
+          let clock = Date.now();
+          const waits = [];
+          const sleep = async ms => { waits.push(ms); clock += ms; };
+          const rootOf = async (ci, record = null) => P.createGitHubRoot(record ?? await P.connectGitHub({ owner: "o", repo: "r", fetch: ci.fetch }), { fetch: ci.fetch, token: "ci-token", sleep, now: () => clock, files: async () => ({}) });
+
+          // Pending, then success; a commit with no statuses isn't held pending by them.
+          let ci = await fakeCI({ script: [[checkRun(10, "queued")], [checkRun(10, "in_progress")], [checkRun(10, "completed", "success")]] });
+          let root = await rootOf(ci);
+          const seen = [];
+          const green = await root.git.ci.waitForChecks({ sha: "c1", pollMs: 1000, onUpdate: c => seen.push(c.state) });
+          assert(green.state === "success" && !green.timedOut && green.total === 1 && eq(waits, [1000, 1000]) && eq(seen, ["pending", "pending", "success"]), `pending, then success: ${JSON.stringify({ green, waits, seen })}`);
+          assert(green.runs[0].runId === 100 && green.runs[0].jobId === 10 && green.runs[0].url.endsWith("/job/10"), `a check run names its workflow run: ${JSON.stringify(green.runs[0])}`);
+          assert(eq(P.checksState([{ status: "completed", conclusion: "skipped" }]), "neutral") && P.checksState([{ status: "completed", conclusion: "cancelled" }, { status: "completed", conclusion: "success" }]) === "failure"
+            && P.checksState([{ state: "pending" }, { status: "completed", conclusion: "failure" }]) === "pending", "gh's buckets: skipped is neutral, cancelled fails, pending holds the whole");
+
+          // Failure: annotations for the failed check run, the combined status, and the failed job's log behind its redirect.
+          ci = await fakeCI({ script: [[checkRun(11, "completed", "failure", { annotations: 2 }), checkRun(12, "completed", "success", { name: "lint" })]], statuses: [{ context: "ci/deploy", state: "failure", description: "Deploy preview failed", target_url: "https://deploy.example/1" }] });
+          root = await rootOf(ci);
+          const red = await root.git.ci.checks({ sha: "c1" });
+          assert(red.state === "failure" && red.total === 3 && eq(red.runs.map(r => r.name), ["lint", "test"]), `a failure: ${JSON.stringify(red)}`);
+          assert(eq(red.runs[1].annotations[0], { path: "test/a.test.js", line: 5, message: "Expected 3 to equal 4", level: "failure", title: "" }) && !red.runs[0].annotations.length, `annotations, for the failed run only: ${JSON.stringify(red.runs)}`);
+          assert(eq(red.statuses, [{ name: "ci/deploy", state: "failure", description: "Deploy preview failed", url: "https://deploy.example/1" }]), `and the commit's statuses: ${JSON.stringify(red.statuses)}`);
+          assert(ci.calls.filter(c => c.path.includes("/annotations")).length === 1, "annotations are read for the failed run alone");
+          const log = await root.git.ci.failedLog(100);
+          assert(log.startsWith("test › Run npm test (failure)\n") && !log.includes("lint"), `the failed job, named with its failed step: ${log}`);
+          assert(log.includes("not ok 2 - adds two numbers") && log.includes("error: 'Expected values to be strictly equal: 3 !== 4'") && log.includes("expected: 4") && log.includes("##[error]Process completed with exit code 1."), `the failing test and its message: ${log}`);
+          assert(!/\d{4}-\d\d-\d\dT/.test(log) && !log.includes("\x1b") && !log.includes("\uFEFF") && !log.includes("duration_ms") && !log.includes("Syncing repository") && !log.includes("shell: /usr/bin/bash"), `without timestamps, colors, timings, other steps or the command's echo: ${log}`);
+          assert(ci.blob && ci.blob.auth === null && ci.calls.some(c => c.path === "/repos/o/r/actions/jobs/200/logs" && c.auth === "Bearer ci-token"), `the log's redirect is followed, without the token: ${JSON.stringify(ci.blob)}`);
+          assert((await root.git.ci.failedLog(100, { maxChars: 120 })).length <= 120, "maxChars bounds it");
+          const short = P.failedLogExcerpt(Array.from({ length: 300 }, (_, i) => `2026-10-13T10:00:00Z line ${i}`).join("\n") + "\n2026-10-13T10:00:00Z ##[error]boom", { maxChars: 8000 });
+          assert(short.split("\n").length === 40 && short.endsWith("##[error]boom") && short.includes("line 299") && !short.includes("line 250"), `with no failures marked, the failing step's tail: ${short.split("\n").length} lines`);
+
+          // A rate-limit answer waits for its reset; a low allowance stretches the interval.
+          ci = await fakeCI({ script: [[checkRun(10, "in_progress")], [checkRun(10, "completed", "success")]], limitOnce: Date.now() + 30_000 });
+          root = await rootOf(ci);
+          waits.length = 0; clock = Date.now();
+          const after = await root.git.ci.waitForChecks({ sha: "c1", pollMs: 1000 });
+          assert(after.state === "success" && waits[0] > 28_000 && waits[0] <= 32_000 && waits[1] === 1000, `the rate limit's reset is waited for: ${JSON.stringify(waits)}`);
+          ci = await fakeCI({ script: [[checkRun(10, "in_progress")], [checkRun(10, "completed", "success")]] });
+          ci.rate = { remaining: 10, reset: Date.now() + 100_000 };
+          root = await rootOf(ci);
+          waits.length = 0; clock = Date.now();
+          await root.git.ci.waitForChecks({ sha: "c1", pollMs: 1000 });
+          assert(waits.length === 1 && waits[0] > 9000 && waits[0] <= 10_100, `ten requests left for 100 s: a poll every 10 s: ${JSON.stringify(waits)}`);
+          ci = await fakeCI({ script: [[checkRun(10, "in_progress")]] });
+          root = await rootOf(ci);
+          waits.length = 0;
+          const late = await root.git.ci.waitForChecks({ sha: "c1", pollMs: 1000, timeoutMs: 10_000 });
+          assert(late.timedOut && late.state === "pending" && waits.length >= 3 && waits.some(w => w > 1000), `the time runs out, the interval stretching while nothing changes: ${JSON.stringify(waits)}`);
+
+          // No checks yet: on a repository with workflows, waited for (GitHub registers them after a push); without, neutral at once.
+          ci = await fakeCI({ files: { "a.txt": "a", ".github/workflows/test.yml": "on: push" }, script: [[], [], [checkRun(10, "completed", "success")]] });
+          root = await rootOf(ci);
+          waits.length = 0;
+          assert(root.git.ci.hasWorkflows() && (await root.git.ci.waitForChecks({ sha: "c1", pollMs: 1000 })).state === "success" && waits.length === 2, `checks not yet registered are waited for: ${JSON.stringify(waits)}`);
+          ci = await fakeCI({ script: [[]] });
+          root = await rootOf(ci);
+          const none = await root.git.ci.waitForChecks({ sha: "c1", pollMs: 1000 });
+          assert(!root.git.ci.hasWorkflows() && none.state === "neutral" && none.total === 0, `without workflows, no checks is the answer: ${JSON.stringify(none)}`);
+
+          // The shell's gh: exit 0 all passed, 1 any failed (or none reported, or no pull request), 8 pending without --watch.
+          const pr = { number: 7, html_url: "https://github.com/o/r/pull/7", title: "Fix", state: "open", head: { ref: "agent/x", sha: "c1" } };
+          ci = await fakeCI({ files: { "a.txt": "a", ".github/workflows/test.yml": "on: push" }, prs: [pr], script: [[checkRun(11, "in_progress")]] });
+          const record = await P.connectGitHub({ owner: "o", repo: "r", fetch: ci.fetch });
+          root = await rootOf(ci, { ...record, branch: "main" });
+          const ws = { root, git: root.git };
+          const gh = (command, options = {}) => runProjectGit(ws, command.split(" "), { pollMs: 1000, graceMs: 0, ...options });
+          const noPr = await gh("gh pr checks");
+          assert(noPr.exitCode === 1 && /no pull requests found for branch "main"/.test(noPr.stderr), `no pull request: ${JSON.stringify(noPr)}`);
+          await root.git.branch({ name: "agent/x" });
+          const pending = await gh("gh pr checks");
+          assert(pending.exitCode === 8 && pending.stdout.startsWith("Some checks are still pending\n0 failing, 0 successful, 0 skipped, and 1 pending checks\n\n*  test") && pending.stdout.includes("https://github.com/o/r/actions/runs/100/job/11"), `pending: exit 8: ${JSON.stringify(pending)}`);
+          assert((await gh("gh pr checks 7")).exitCode === 8 && (await gh("gh pr checks https://github.com/o/r/pull/7")).exitCode === 8, "a number or a URL names the pull request");
+          const fastNoWatch = await gh("gh pr checks --fail-fast");
+          assert(fastNoWatch.exitCode === 1 && fastNoWatch.stderr.includes("without `--watch`"), `--fail-fast needs --watch, as in gh: ${fastNoWatch.stderr}`);
+          ci.script.push([checkRun(11, "completed", "failure", { annotations: 2 }), checkRun(12, "completed", "success", { name: "lint" })]);
+          const watched = await gh("gh pr checks --watch");
+          assert(watched.exitCode === 1 && watched.stdout.startsWith("Some checks were not successful\n1 failing, 1 successful, 0 skipped, and 0 pending checks\n\nX  test  42s  https://github.com/o/r/actions/runs/100/job/11\n    test/a.test.js:5: Expected 3 to equal 4\n✓  lint"), `--watch waits, then exits 1 on a failure with its annotations: ${JSON.stringify(watched)}`);
+          assert(!watched.stdout.includes("Node.js 20 is deprecated") && watched.stdout.includes("gh run view 100 --log-failed shows the failing log."), `warnings left out; where the log is: ${watched.stdout}`);
+          ci.script = [[checkRun(11, "completed", "success"), checkRun(12, "completed", "skipped", { name: "deploy" })]]; ci.polls = 0; ci.statuses = [];
+          const passed = await gh("gh pr checks --watch");
+          assert(passed.exitCode === 0 && passed.stdout.startsWith("All checks were successful\n0 failing, 1 successful, 1 skipped, and 0 pending checks\n\n✓  test") && passed.stdout.includes("-  deploy"), `all passed: exit 0: ${JSON.stringify(passed)}`);
+          ci.script = [[checkRun(11, "in_progress")]]; ci.polls = 0;
+          const stillPending = await gh("gh pr checks --watch", { timeoutMs: 3000 });
+          assert(stillPending.exitCode === 8 && /Still pending after/.test(stillPending.stdout), `--watch past its time: exit 8: ${JSON.stringify(stillPending)}`);
+          ci.script = [[]]; ci.polls = 0;
+          const noChecks = await gh("gh pr checks");
+          assert(noChecks.exitCode === 1 && noChecks.stderr.includes("no checks reported on the 'agent/x' branch"), `none reported: exit 1, as in gh: ${JSON.stringify(noChecks)}`);
+          ci.script = [[checkRun(11, "completed", "failure", { annotations: 2 })]]; ci.polls = 0;
+          const fast = await gh("gh pr checks --watch --fail-fast");
+          assert(fast.exitCode === 1, "--fail-fast with --watch");
+
+          const list = await gh("gh run list --branch agent/x");
+          assert(list.exitCode === 0 && list.stdout.split("\n")[0].startsWith("STATUS") && /X failure\s+Fix\s+test\s+agent\/x\s+push\s+100\s+42s/.test(list.stdout), `gh run list: ${JSON.stringify(list.stdout)}`);
+          assert((await gh("gh run list --branch other")).stderr === "no runs found\n", "no runs");
+          const view = await gh("gh run view 100");
+          assert(view.exitCode === 0 && view.stdout.startsWith("X agent/x Fix · 100\nTriggered via push, failure in 42s\n\nJOBS\nX test in 7s (ID 200)\n  ✓ Set up job\n  X Run npm test\n✓ lint") && view.stdout.includes("gh run view 100 --log-failed"), `gh run view: ${JSON.stringify(view.stdout)}`);
+          assert((await gh("gh run view 100 --exit-status")).exitCode === 1, "--exit-status: 1 for a failed run");
+          const failedLog = await gh("gh run view 100 --log-failed");
+          assert(failedLog.exitCode === 0 && failedLog.stdout.includes("not ok 2 - adds two numbers"), `gh run view --log-failed: ${failedLog.stdout}`);
+          const watchRun = await gh("gh run watch");
+          assert(watchRun.exitCode === 1 && watchRun.stdout.includes("X agent/x Fix · 100") && watchRun.stdout.includes("had already completed"), `gh run watch: the branch's run; a failure exits 1: ${JSON.stringify(watchRun)}`);
+          ci.runs = [{ ...ci.runs[0], id: 101, status: "in_progress", conclusion: null }];
+          const runs101 = [{ status: "in_progress", conclusion: null }, { status: "completed", conclusion: "success" }];
+          let polled = 0;
+          const realFetch = ci.fetch;
+          ci.fetch = async (url, init) => /\/actions\/runs\/101$/.test(new URL(url).pathname) ? new Response(JSON.stringify({ ...ci.runs[0], ...runs101[Math.min(polled++, 1)] }), { headers: { "Content-Type": "application/json" } }) : realFetch(url, init);
+          root = await rootOf(ci, { ...record, branch: "agent/x" });
+          const watchedRun = await runProjectGit({ root, git: root.git }, ["gh", "run", "watch", "101"], { pollMs: 1000 });
+          assert(watchedRun.exitCode === 0 && polled === 2, `gh run watch waits for the run: ${JSON.stringify(watchedRun)}`);
+          assert((await gh("gh run rerun 100")).stderr.includes("isn't available here: gh pr create, gh pr checks"), "what isn't here says what is");
+
+          // git push says CI started and how to watch it, on a repository with workflows.
+          ci = await fakeCI({ files: { "a.txt": "a", ".github/workflows/test.yml": "on: push" } });
+          let text = "b";
+          root = P.createGitHubRoot(await P.connectGitHub({ owner: "o", repo: "r", fetch: ci.fetch }), { fetch: ci.fetch, token: "ci-push", files: async () => ({ "a.txt": text }) });
+          await root.git.commit({ message: "B" });
+          const pushed = await runProjectGit({ root, git: root.git }, ["git", "push", "origin", "agent/x"], {});
+          assert(pushed.exitCode === 0 && pushed.stdout.includes("CI: the repository has workflows") && pushed.stdout.includes("gh pr checks --watch") && pushed.stdout.includes("gh run watch") && pushed.pushed?.branch === "agent/x", `the push names CI: ${JSON.stringify(pushed)}`);
+          ci = await fakeCI();
+          root = P.createGitHubRoot(await P.connectGitHub({ owner: "o", repo: "r", fetch: ci.fetch }), { fetch: ci.fetch, token: "ci-push2", files: async () => ({ "a.txt": text }) });
+          await root.git.commit({ message: "B" });
+          const plain = await runProjectGit({ root, git: root.git }, ["git", "push", "origin", "agent/x"], {});
+          assert(plain.exitCode === 0 && !plain.stdout.includes("CI:"), `and doesn't on one without: ${JSON.stringify(plain)}`);
+
+          // The director: gh pr checks --watch is a command check like any; red first with no pull request yet, run again
+          // after a push (not after an edit, which CI hasn't seen), done when CI is green.
+          ci = await fakeCI({ files: { "a.txt": "a", ".github/workflows/test.yml": "on: push" }, script: [[checkRun(11, "completed", "success")]] });
+          const realFetch2 = globalThis.fetch, saved = localStorage.getItem("github-config");
+          globalThis.fetch = ci.fetch;
+          localStorage.setItem("github-config", JSON.stringify({ token: "ci-director" }));
+          const ui = createTestUI();
+          try {
+            const ws2 = ui.workspace;
+            await ws2.connectRepository({ owner: "o", repo: "r", agentId: 1 });
+            const threadId = await db.add("threads", { agentId: 1, name: "ci", projectId: ws2.state.project.id, createdAt: Date.now() });
+            const context = { workspace: ws2, agentId: 1, threadId, db };
+            const director = await createDirector({ db, threadId, agentId: 1, tools: ["plan", "bash"] });
+            const added = await director.plan({ goal: "CI green", add: { title: "CI passes", check: { kind: "command", run: "gh pr checks --watch", exit: 0 } } }, context);
+            assert(added.includes("Its check fails now") && added.includes("no pull requests found"), `red first: no pull request, no checks: ${added}`);
+            await ws2.git.branch({ name: "agent/x" });
+            ci.prs.push(pr);
+            const stepWith = result => director.step({ ws: ws2, host: null, start: 0, messages: [
+              { role: "assistant", content: [{ toolUse: { toolUseId: "b", name: "bash", input: { command: "x" } } }] },
+              { role: "user", content: [{ toolResult: { toolUseId: "b", content: [{ json: { result } }] } }] },
+            ] });
+            const polls = ci.polls;
+            await stepWith({ stdout: "", exitCode: 0, files: [{ path: "a.txt", version: 1 }] });
+            assert(ci.polls === polls && director.contract.items[0].status !== "done", "an edit doesn't run the CI check: CI hasn't seen it");
+            await stepWith({ stdout: "To https://github.com/o/r/tree/agent/x", exitCode: 0, pushed: { branch: "agent/x", commit: "c1" } });
+            assert(ci.polls > polls && director.contract.items[0].status === "done", `a push does, and green CI is done: ${JSON.stringify(director.contract.items[0])}`);
+          } finally {
+            ui.cleanup();
+            globalThis.fetch = realFetch2;
+            if (saved == null) localStorage.removeItem("github-config"); else localStorage.setItem("github-config", saved);
+          }
+        }
+
         // Why: the same calls against GitHub itself (npm test -- --net), read-only on a public repository; GITHUB_PAT from .env when set
         async function testGitHubLive() {
           if (!NET) return;
@@ -8107,6 +8337,7 @@ if (window.__HARNESS__?.test) (async () => {
           testFolderRoot,
           testFolderWorkspace,
           testGitHubRoot,
+          testGitHubCI,
           testGitHubLive,
           testRunTestFiles,
           testSweTestFiles,
