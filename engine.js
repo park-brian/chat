@@ -1171,7 +1171,7 @@ function doneNote(done, contract) {
   const next = currentItem(contract), ids = done.map(i => i.id), so = done.length > 1 ? "they are" : "it is";
   const head = `${itemsLabel(ids)}'s check${done.length > 1 ? "s" : ""} passed, so ${so} done (${progressLine(contract)}).`;
   return next ? `${head} Next: item ${next.id}, "${next.title}"; its check: ${describeCheck(next.check)}.`
-    : `${head} Every item is done: compare the work with the goal, then tell the user what was done and what wasn't, in their terms: they don't see the plan's items or checks.`;
+    : `${head} Every item is done: compare the work with the goal, then tell the user what was done and what wasn't, in their terms (they don't see the plan's items or checks). For a fix, say what caused the problem, which files changed, and how you checked it.`;
 }
 
 function resummaryNote(contract) {
@@ -3892,7 +3892,7 @@ async function workspaceFor(context, { create = false } = {}) {
   if (!ws) throw new Error("No workspace is available here.");
   ws.setContext({ threadId: context.threadId, agentId: context.agentId });
   if (!ws.state.project) {
-    if (!create) throw new Error("No project is open yet. Create the app with write_file.");
+    if (!create) throw new Error("No project is open: there are no files yet.");
     await ws.ensureProject({ agentId: context.agentId, threadId: context.threadId });
   }
   return ws;

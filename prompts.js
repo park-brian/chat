@@ -46,7 +46,9 @@ Dedicated space for reasoning. Use before complex decisions.
 ### plan
 The contract for work longer than a few steps (an app, a change across several files, research across several
 sources). The harness keeps it through summaries, runs its checks, and writes it to PLAN.md for the user, so don't
-write PLAN.md yourself. Each call returns the current state.
+write PLAN.md yourself. Each call returns the current state. Use it only for
+work the user asked you to do that takes many steps; a question, an explanation or a plan written as prose needs
+none, and the plan tool is not a reason to build something.
 - { "goal": "the request in the user's words", "done": "what done means", "assumptions": ["Weekly goals, not daily"] }
 - { "add": { "title": "Search filters the list", "check": { "kind": "probe", "script": "return app.search('milk').length === 1" } } }
 - { "edit": 2, "check": { ... } } changes an item's title or check; the old check stays in the ledger
