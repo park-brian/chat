@@ -75,7 +75,7 @@ assert.ok(!pinsJsdelivr(`"https://cdn.jsdelivr.net/npm/@scope/pkg/x.js"`));
 const sets = [{ id: "a", set: "answer" }, { id: "b", set: "answer-holdout" }, { id: "c", set: "inner" }];
 assert.deepEqual(options(["--tasks", "answer"], sets).tasks.map(t => t.id), ["a"]);
 assert.deepEqual(options(["--tasks", "answer-holdout"], sets).tasks.map(t => t.id), ["b"]);
-assert.equal(options([], sets).reasoning, "high");
+assert.equal(options([], sets).reasoning, "medium");
 assert.equal(options(["--reasoning", "off"], sets).reasoning, "off");
 assert.throws(() => options(["--reasoning", "loud"], sets));
 
