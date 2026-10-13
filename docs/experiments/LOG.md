@@ -370,6 +370,17 @@ experiments, each against the noise floor from E5.
 - **Also:** game-ambitious scored 0.94-0.98 in early October and 0.55 here; these two failures account for the
   four lowest runs. A regression check after the fixes will show whether anything else is going on.
 
+### E24 and E12. The E15 fixes, effort, and the shell's first eval (e850add)
+
+- **Changes:** the all-done note no longer declares the goal done; Haiku's max_tokens is 128k; the silent-reply
+  note fires per stop, up to two in a row. The shell, envelope, projects and capture are all on main (8056cdd).
+- **Predictions, before the run:** (E24) game-ambitious and game-arcade back near early October's 0.94-0.98 on
+  Haiku high, with no run ending on an empty reply; effort=medium within noise of high at lower output tokens and
+  time. (E12) on swe, bash is used for running tests or inspecting files in most runs, and swe holds at >= 0.95
+  (E10 level).
+- **Method:** game-ambitious and game-arcade ×3 at high and ×3 at medium; swe ×3. Haiku 5.5.
+- **Result:** running.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
