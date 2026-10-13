@@ -381,6 +381,19 @@ experiments, each against the noise floor from E5.
 - **Method:** game-ambitious and game-arcade ×3 at high and ×3 at medium; swe ×3. Haiku 5.5.
 - **Result:** running.
 
+### E21 (part). GitHub projects against a real repository
+
+- **Setup:** a private sandbox, park-brian/chat-harness-sandbox, seeded with `ms` and its tests (created with the
+  user's go-ahead, 2026-10-13). `tests/github-live.mjs` drives projects.js's GitHub client directly.
+- **Result:** pass. Connect (6 files), read, status shows the change, local commit, push to `main` refused without
+  confirmation, push to `agent/live-…`, the change present on the branch, pull request #1 opened from it, then
+  closed and the branch deleted.
+- **Limits of the check:** it ran in Node, which doesn't enforce CORS; the browser path rests on the research's
+  curl check that api.github.com sends `Access-Control-Allow-Origin: *`. The `.env` fine-grained PAT has no access
+  to the new repository (404), so the run used the gh login's token, passed in the environment and not stored.
+- **Next:** the same flow from the app in a browser (connect in the UI, an agent's change, push, PR), and the
+  swe tier as GitHub projects.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
