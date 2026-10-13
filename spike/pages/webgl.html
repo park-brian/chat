@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebGL scene</title>
+<style>
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #fff; }
+  canvas { display: block; margin: 16px auto; }
+  p { max-width: 700px; margin: 12px auto; }
+</style>
+</head>
+<body>
+<p>An animated WebGL scene (redrawn every frame, no preserveDrawingBuffer):</p>
+<canvas id="live" width="640" height="420" data-check></canvas>
+<p>A WebGL canvas drawn once at load:</p>
+<canvas id="once" width="640" height="300" data-check></canvas>
+<p style="height: 400px">Text below the scenes.</p>
+<script>
+  function setup(canvas) {
+    const gl = canvas.getContext("webgl");
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, "attribute vec2 p; uniform float t; varying vec3 c; void main(){ float s=sin(t), k=cos(t); gl_Position=vec4(p.x*k-p.y*s, p.x*s+p.y*k, 0., 1.); c=vec3(p*.5+.5, .6); }");
+    gl.compileShader(vs);
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, "precision mediump float; varying vec3 c; void main(){ gl_FragColor=vec4(c,1.); }");
+    gl.compileShader(fs);
+    const prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
+    const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, .8, -.7, -.5, .7, -.5]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    const t = gl.getUniformLocation(prog, "t");
+    return time => { gl.clearColor(.1, .12, .2, 1); gl.clear(gl.COLOR_BUFFER_BIT); gl.uniform1f(t, time); gl.drawArrays(gl.TRIANGLES, 0, 3); };
+  }
+  const live = setup(document.getElementById("live")), once = setup(document.getElementById("once"));
+  once(0.4);
+  const t0 = performance.now();
+  requestAnimationFrame(function frame(now) { live((now - t0) / 1500); requestAnimationFrame(frame); });
+</script>
+</body>
+</html>

@@ -301,6 +301,57 @@ experiments, each against the noise floor from E5.
   the harness speaks only on state changes.
 - **Status:** after the shell (E12) lands.
 
+### E23. Seeing a whole page (design: docs/specs/2026-10-13-capture.md)
+
+- **Question:** which full-page capture should `run_app { full: true }` use: scroll and stitch over tab capture,
+  snapdom, HTML-in-Canvas, or our own DOM snapshot (snapshot.js)?
+- **Method:** spike/capture.mjs drives spike/capture.html (a same-origin frame, as the preview is) in Chrome 156
+  (Playwright's chromium-1248, `--enable-blink-features=CanvasDrawElement`, tab capture auto-accepted) at
+  1024x768 on seven pages in spike/pages. Truth: Playwright's `fullPage` screenshot of the same page in the same
+  browser. Score: the share of pixels with no pixel within one of it in the other image within 40/255 (an edge
+  antialiased or chroma-subsampled differently is the same picture), per screen band and per marked region.
+  `--disable-lcd-text` and `--hide-scrollbars` so the truth's subpixel text and scrollbars aren't scored. Median of 3.
+- **Result** (ms, diff share; spike/out/results.md):
+
+  | page | stitch (tiles × ms) | snapshot (ours) | snapdom 3.3.3 | HTML-in-Canvas |
+  | --- | --- | --- | --- | --- |
+  | article, 8612 px (11 screens) | 1018 (12×84), 0 | 13, 0 | 75, 0.669: 100vh hero laid out as the page's height | 58, 0 |
+  | sticky + fixed | 599 (7×86), 0.002 | 3, 0 | 36, 0 | 49, 0 |
+  | lazy images | 1381 (5×252), 0 | 2776, 0 | 2917, 0.251: page cut short | 2837, 0 |
+  | canvas game | 164 (2×79), 0.032 | 65, 0.033 | 72, 0.086 | 86, 0.032 |
+  | WebGL | 154 (2×75), 0.007 | 68, 0.156: once-drawn canvas blank | 88, 0.191: blank | 101, 0.156: blank |
+  | CSS animations | 269 (3×102), 0 | 8, 0.001 | 96, 0.028 | 48, 0 |
+  | form, focus, hover | 284 (3×93), 0 | 4, 0 | 95, 0.046: hover, focus, values lost | 35, 0 |
+
+  The game's and the animated WebGL scene's residue is motion between the truth's moment and the method's, the
+  same for every method. Lazy pages are network-bound (the spike server delays each image 250 ms, uncached).
+- **Findings:**
+  - Hypotheses: stitch is faithful everywhere and the only method that shows a WebGL canvas drawn once without
+    `preserveDrawingBuffer` (toDataURL, drawImage and createImageBitmap all read it back empty). Its 75-102 ms a
+    tile meets the 50-100 ms hypothesis, but half of that is waiting to learn that no new frame is coming: tab
+    capture sends frames only on repaint, and waiting for "the next frame" first cost 500 ms a tile.
+    Stitch's seams came from the capture, not the page: a frame captured before the tile's paint (half-drawn
+    photos, animations a few hundred ms off) until `after` became the paint after the images decoded; and the last
+    tile placed by the page's old height when an image without a size grew it.
+  - Playwright's truth puts a fixed footer at the first screen's bottom, not the page's end. "Hide fixed after the
+    first tile" matches it (0.002); showing bottom-anchored ones in the last tile instead (0.021) does not.
+  - Our snapshot matches HTML-in-Canvas pixel for pixel on every page (they share the frozen clone) at a third to
+    a tenth of the time, and beats snapdom everywhere: snapdom has no vh fix, no hover or focus, and missed lazy
+    images. Getting there needed: 100vh rewritten to the viewport's pixels (a foreignObject's viewport is the whole
+    page), fixed elements placed where the first screen has them, canvases kept as canvases (their selectors) with
+    the frame as a background, lazy images loaded first.
+  - HTML-in-Canvas works behind the flag in Chrome 153-156 and Edge 155; Chrome 156 also takes the renamed
+    `content="drawable"`. A canvas off screen or at opacity 0 paints its children blank (clip-path: inset(50%)
+    works), and removing an iframe from a drawable canvas crashed the renderer, so the surface is kept and reused.
+- **Decision:** `full: true` tries HTML-in-Canvas where the browser has it (as designed; equal to ours here), then
+  stitch while the tab is shared (met the target, real pixels), then snapshot.js; snapdom is not used. Each one
+  that fails hands on to the next.
+- **Revised (integration, 2026-10-13):** HTML-in-Canvas is dropped: it was never more faithful than snapshot.js
+  (the same frozen clone, pixel for pixel) and shares its WebGL blind spot, behind a flag. `full: true` is stitch
+  while the user shares the tab (real pixels, the only method with WebGL), else snapshot.js; a failed stitch
+  hands on to the snapshot. The spike measures those two now.
+- **Next:** whether models stop squeezing content (the spec's "Then").
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.

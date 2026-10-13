@@ -261,6 +261,7 @@
         createShellHost, sandboxResources, serve, SHELL_DB, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, timeAgo,
         toError, toResultValue, unmuteScripts, webSearch, webToolNames,
       } from "./engine.js";
+      import { latestFrame, pagesOf, snapshot, stitch } from "./snapshot.js";
       const REASONING_KEY = "harness.reasoning"; // localStorage: the reasoning level last chosen
       const PANEL_WIDTH_KEY = "harness.panelWidth"; // localStorage: the artifact panel's width in px, once dragged
       // What the host keeps in localStorage beside an app's own data: an app's clear() leaves these.
@@ -1722,7 +1723,7 @@
               <//>
               <${Show} when=${shotUrl}>
                 <img class="tool-shot" src=${shotUrl} alt="App screenshot" />
-                <div class="text-muted">${() => report()?.screenshot?.tier} screenshot${() => report()?.screenshot?.approximate ? " (approximate)" : ""}</div>
+                <div class="text-muted">${() => report()?.screenshot?.tier} screenshot${() => report()?.screenshot?.approximate ? " (approximate)" : ""}${() => report()?.screenshot?.pages ? `, page 1 of ${report().screenshot.pages}` : ""}</div>
               <//>
               <${Show} when=${() => report()?.screenshot?.unchanged}><div class="text-muted">Screenshot ${() => report().screenshot.unchanged}.</div><//>
               <${Show} when=${() => report()?.screenshot?.error}><div class="text-warning">No screenshot: ${() => report().screenshot.error}</div><//>
@@ -3037,12 +3038,20 @@
         await Promise.all(stale.map(r => cache.delete(r)));
       }
 
+      // run_app's full: true, the whole page rather than the viewport (E23, docs/specs/2026-10-13-capture.md): scroll
+      // and stitch while the user shares the tab (real pixels, 75-102 ms a tile, inside the 100 ms target; the only
+      // method that showed a WebGL canvas drawn once), else snapshot.js's DOM render, no permission and 2-70 ms on the
+      // test pages. A stitch that fails hands on to the snapshot. HTML-in-Canvas matched the snapshot pixel for pixel
+      // (it painted the same frozen clone) with the same WebGL blind spot, so it isn't used.
+      const MAX_PAGES = 8;
+      const fullMethods = ({ sharing }) => [...(sharing ? ["stitch"] : []), "snapshot"];
+
       // The host half of a workspace: frames, settle, tests, scripts, capture, screenshots. run() takes a document and
       // answers with its report, both plain data, so the call can cross a port. state is the workspace's store, which
       // the host keeps: the viewport, the live console, the capture, the panel it reveals for a screenshot.
       function createRunner(id, { state, setState, notify, resources }) {
         let previewFrame = null, testFrame = null, scratchFrame = null, phoneFrame = null, surface = null;
-        const capture = { stream: null, track: null, video: null, tier: "none" };
+        const capture = { stream: null, track: null, video: null, frames: null, tier: "none" };
         let lastShot = null;     // { fingerprint, version } of the last screenshot sent to the agent
         let lastLayout = null;   // the layout findings last reported, so the same ones aren't a new note every run
         let liveErrors = [];     // errors the preview logged while the user used it, for the next message
@@ -3430,6 +3439,44 @@
           return { image: null, thumb: null, shot: { error: failures.join("; ") } };
         }
 
+        // The tab's pixels of the frame's viewport, for stitch: from the shared tab, or the preview alone when Element
+        // or Region Capture crops the stream to it.
+        function grabFor(frame) {
+          const { video, frames, tier } = capture;
+          return async after => {
+            await frames.newer(after);
+            const origin = tier === "tab" ? { left: 0, top: 0, width: innerWidth, height: innerHeight } : surface.getBoundingClientRect();
+            const r = frame.getBoundingClientRect(), root = frame.contentDocument.documentElement;
+            if (tier === "tab" && (r.left < 0 || r.top < 0 || r.left + root.clientWidth > innerWidth + 1 || r.top + root.clientHeight > innerHeight + 1)) throw new Error("the preview is not all on screen");
+            const kx = video.videoWidth / origin.width, ky = video.videoHeight / origin.height;
+            return { source: video, sx: (r.left - origin.left + frame.clientLeft) * kx, sy: (r.top - origin.top + frame.clientTop) * ky, sw: root.clientWidth * kx, sh: root.clientHeight * ky };
+          };
+        }
+
+        // The whole page, in pages (see fullMethods). Answers { images, thumb, shot }; each image carries its label.
+        async function takeFullPage(frame, methods = fullMethods({ sharing: capture.track?.readyState === "live" && !!capture.frames })) {
+          const doc = frame.contentDocument, failures = [];
+          if (!doc?.documentElement) return { images: null, thumb: null, shot: { error: "the app has no document" } };
+          for (const method of methods) {
+            try {
+              if (method === "stitch") await reveal();
+              const sheet = method === "stitch" ? await stitch(doc, grabFor(frame)) : await snapshot(doc);
+              const pages = pagesOf(sheet, doc.documentElement.clientHeight), sent = pages.slice(0, MAX_PAGES);
+              const encoded = await Promise.all(sent.map(p => encodeImage(p.canvas, { sw: p.canvas.width, sh: p.canvas.height }, p.canvas.width)));
+              const shot = { tier: method, full: `${sheet.width}x${sheet.height} px in ${pages.length} page${pages.length > 1 ? "s" : ""}, each up to two screens`, pages: pages.length };
+              // Only stitch shows the browser's own pixels; the snapshot renders a frozen copy of the page.
+              if (method !== "stitch") shot.approximate = true;
+              if (pages.length > sent.length) shot.cut = `pages ${sent.length + 1}-${pages.length} not attached: the page is ${sheet.height} px tall`;
+              if (sheet.notes?.length) shot.notes = sheet.notes;
+              if (failures.length) shot.fallbackFrom = failures;
+              return { images: encoded.map((e, i) => ({ ...e.image, label: sent[i].label })), thumb: encoded[0].thumb, shot };
+            } catch (e) {
+              failures.push(`${method}: ${e.message}`);
+            }
+          }
+          return { images: null, thumb: null, shot: { error: failures.join("; ") } };
+        }
+
         const allShots = (previewRun, testRun) => [...testRun.shots, ...(previewRun === testRun ? [] : previewRun.shots)];
 
         // __HARNESS__.screenshot(name): the page as it is at that point, saved to resources for the model to view. The
@@ -3452,7 +3499,7 @@
         // thumb, runLog }; a project closed meanwhile throws { closed: true }. A parked run (a scratch page) is one
         // frame, off the page and tests on, so the preview stays the shown artifact's.
         // files: the rest of the folder, { path: text }, served beside it. signal: the run stops where it is.
-        async function run({ version, doc, files = {}, script = null, screenshot = false, parked = false, signal = null }) {
+        async function run({ version, doc, files = {}, script = null, screenshot = false, full = false, parked = false, signal = null }) {
           signal?.throwIfAborted();
           if (!parked) liveErrors = [];
           const started = performance.now();
@@ -3462,8 +3509,9 @@
           previewFrame ||= createFrame("App preview");
           if (!previewFrame.isConnected) park(previewFrame);
           if (parked) park(scratchFrame ||= createFrame("Scratch run"));
-          const wanted = screenshot === true || (screenshot === "auto" && capture.track?.readyState === "live");
-          const sheet = wanted && isHtml(version.path) && !parked && size[0] > VIEWPORTS.mobile[0] * 1.5;
+          full = full === true && isHtml(version.path);
+          const wanted = full || screenshot === true || (screenshot === "auto" && capture.track?.readyState === "live");
+          const sheet = wanted && !full && isHtml(version.path) && !parked && size[0] > VIEWPORTS.mobile[0] * 1.5;
           if (sheet) park(phoneFrame ||= createFrame("Phone-width view"), VIEWPORTS.mobile);
           const runs = `${RUNS}-${encodeURIComponent(id)}-${parked ? "scratch" : "app"}-`, base = `${runs}${++published}/`;
           const opened = closes;
@@ -3506,7 +3554,9 @@
           const overflow = root ? Math.max(0, root.scrollWidth - root.clientWidth) : 0;
           const layout = isHtml(version.path) && !parked ? layoutChecks(previewRun.frame.contentDocument) : [];
           const phone = isHtml(version.path) && !parked ? await atPhoneWidth(testRun, size, layout) : null;
+          // A full page is pages, not one view: image is then a list, each labelled.
           let { image = null, thumb = null, fingerprint = null, shot = null } = !wanted ? {}
+            : full ? await takeFullPage(parked ? scratchFrame : previewFrame, parked ? fullMethods({ sharing: false }) : undefined).then(f => ({ ...f, image: f.images }))
             : parked ? { ...(await rasterize(scratchFrame)), shot: { tier: "dom", approximate: true } } : await takeScreenshot(previewFrame);
           if (image && phoneRun && !phoneRun.aborted) {
             try {
@@ -3517,10 +3567,11 @@
             }
           }
           // An automatic screenshot that shows nothing new costs tokens and says nothing; name the one it matches instead.
-          if (!parked && screenshot === "auto" && image && sameView(fingerprint, lastShot?.fingerprint)) {
+          // A full page was asked for, so it is always sent, and it isn't the view the next automatic one compares with.
+          if (!full && !parked && screenshot === "auto" && image && sameView(fingerprint, lastShot?.fingerprint)) {
             image = null;
             shot = { ...shot, unchanged: `looks the same as the screenshot of v${lastShot.version}` };
-          } else if (image && !parked) {
+          } else if (image && !parked && !full) {
             lastShot = { fingerprint, version: version.id };
           }
           const found = JSON.stringify([version.path, layout, phone?.layout]), seen = found === lastLayout;
@@ -3555,7 +3606,7 @@
             disableCapture();
             notify('Tab sharing stopped. Click "Share tab" to share it again.');
           });
-          Object.assign(capture, { stream, track, video, tier });
+          Object.assign(capture, { stream, track, video, tier, frames: latestFrame(video) });
           lastShot = null;
           setState("capture", tier);
           rememberCapture("allowed");
@@ -3565,7 +3616,7 @@
         function disableCapture() {
           capture.stream?.getTracks().forEach(t => t.stop());
           capture.video?.remove();
-          Object.assign(capture, { stream: null, track: null, video: null, tier: "none" });
+          Object.assign(capture, { stream: null, track: null, video: null, frames: null, tier: "none" });
           setState("capture", "none");
         }
 
@@ -4847,8 +4898,8 @@
           assert(/^L2: .* has no default export; it exports: .*\bmarked\b/.test(guessed.notes[0]), `a guessed import names the real exports: ${JSON.stringify(guessed.notes)}`);
           const self = await preflight("index.html", await (await fetch(location.pathname)).text());
           assert(!self.errors.length && !self.fixes.length && self.text.length > 100000, `this file passes its own pre-flight: ${JSON.stringify({ ...self, text: undefined })}`);
-          const beside = await missingFiles("index.html", self.text, p => p === "engine.js" ? "" : null);
-          assert(!beside.length, `and the one file it loads is the engine beside it: ${JSON.stringify(beside)}`);
+          const beside = await missingFiles("index.html", self.text, p => ["engine.js", "snapshot.js"].includes(p) ? "" : null);
+          assert(!beside.length, `and the files it loads are the engine and the capture module beside it: ${JSON.stringify(beside)}`);
 
           const ui = createTestUI();
           try {
@@ -5025,6 +5076,102 @@
 
             const history = await listHistory({}, context);
             assert(history.includes(`v${restored.version}*`), "history marks the current version");
+          } finally {
+            ui.cleanup();
+          }
+        }
+
+        // Why: the screenshot showed one screen, so a model squeezed a tall page to fit it; full: true shows the whole page
+        // in pages (E23, docs/specs/2026-10-13-capture.md)
+        async function testFullPage() {
+          const solid = (width, height, color) => { const c = Object.assign(document.createElement("canvas"), { width, height }), x = c.getContext("2d"); x.fillStyle = color; x.fillRect(0, 0, width, height); return c; };
+          const pixel = (c, x, y) => [...c.getContext("2d").getImageData(x, y, 1, 1).data].slice(0, 3).join(",");
+          // Pages: up to two screens tall, split evenly, at most 1024 wide, each with a band naming it.
+          const one = pagesOf({ width: 800, height: 900, strips: [{ top: 0, canvas: solid(800, 900, "#0a0") }] }, 600);
+          assert(one.length === 1 && one[0].canvas.width === 800 && one[0].canvas.height === 924 && one[0].label === "page 1 of 1", `a page under two screens is one page, under a 24 px band: ${one.map(p => [p.canvas.width, p.canvas.height, p.label])}`);
+          assert(pixel(one[0].canvas, 2, 2) === "58,58,58" && pixel(one[0].canvas, 2, 30) === "0,170,0", "the band is above the page, not over it");
+          const three = pagesOf({ width: 800, height: 2500, strips: [{ top: 0, canvas: solid(800, 2500, "#0a0") }] }, 600);
+          assert(eq(three.map(p => [p.top, p.rows, p.label]), [[0, 834, "page 1 of 3"], [834, 834, "page 2 of 3"], [1668, 832, "page 3 of 3"]]), `a tall page splits evenly, none past two screens: ${JSON.stringify(three.map(p => [p.top, p.rows, p.label]))}`);
+          const wide = pagesOf({ width: 2048, height: 1000, strips: [{ top: 0, canvas: solid(2048, 1000, "#0a0") }] }, 800)[0].canvas;
+          assert(wide.width === 1024 && wide.height === 524, `a wide page is scaled to 1024 px, its height with it: ${wide.width}x${wide.height}`);
+          const split = pagesOf({ width: 100, height: 100, strips: [{ top: 0, canvas: solid(100, 50, "#f00") }, { top: 50, canvas: solid(100, 50, "#00f") }] }, 100)[0].canvas;
+          assert(pixel(split, 50, 24 + 25) === "255,0,0" && pixel(split, 50, 24 + 75) === "0,0,255", "a page spans the strips a tall sheet is kept in");
+
+          // Stitch: fixed elements in the first tile only (where Playwright's full-page capture has them), sticky ones in
+          // place, animations paused, and the page put back after. The tab's pixels are a stand-in here.
+          const frame = document.createElement("iframe");
+          frame.style.cssText = "position:fixed;left:-20000px;top:0;width:400px;height:300px;border:0";
+          frame.srcdoc = `<style>body{margin:0} .bar{position:sticky;top:0;height:40px;background:#00f} .foot{position:fixed;bottom:0;left:0;right:0;height:30px;background:#f00}
+            .tall{height:2000px} .spin{width:10px;height:10px;animation:spin 1s linear infinite} @keyframes spin{to{transform:rotate(360deg)}}</style>
+            <div class="bar">bar</div><div class="spin"></div><div class="tall"></div><div class="foot">foot</div>`;
+          document.body.append(frame);
+          try {
+            await new Promise(resolve => frame.onload = resolve);
+            const doc = frame.contentDocument, win = frame.contentWindow;
+            win.scrollTo(0, 100);
+            const tab = solid(400, 300, "#888"), seen = [];
+            const sheet = await stitch(doc, async () => ({ source: tab, sx: 0, sy: 0, sw: 400, sh: 300 }), {
+              onTile: t => seen.push({ top: t.top, rows: t.rows, foot: t.fixed[0]?.shown, bar: win.getComputedStyle(doc.querySelector(".bar")).position, spin: doc.getAnimations()[0].playState }),
+            });
+            assert(sheet.width === 400 && sheet.height === 2050 && seen.length === 7, `one tile a screen, to the bottom: ${sheet.width}x${sheet.height}, ${seen.length} tiles`);
+            assert(eq(seen.map(s => s.top), [0, 300, 600, 900, 1200, 1500, 1750]) && seen.at(-1).rows === 250, `the last tile is the page's last screen: ${JSON.stringify(seen.map(s => [s.top, s.rows]))}`);
+            assert(seen[0].foot && seen.slice(1).every(s => !s.foot), `the fixed footer shows once, in the first tile: ${JSON.stringify(seen.map(s => s.foot))}`);
+            assert(seen.every(s => s.bar === "relative" && s.spin === "paused"), `sticky sits in place and animations pause while it scrolls: ${JSON.stringify(seen[1])}`);
+            assert(win.scrollY === 100 && win.getComputedStyle(doc.querySelector(".bar")).position === "sticky" && win.getComputedStyle(doc.querySelector(".foot")).visibility === "visible" && doc.getAnimations()[0].playState === "running",
+              "and the page is as it was after: scrolled where it was, sticky, the footer shown, animating");
+          } finally {
+            frame.remove();
+          }
+
+          // Which method: stitch while the tab is shared, else our snapshot; no HTML-in-Canvas, no snapdom (E23).
+          assert(eq(fullMethods({ sharing: false }), ["snapshot"]) && eq(fullMethods({ sharing: true }), ["stitch", "snapshot"]), "full: true tries stitch while sharing, then the snapshot");
+          const spec = TOOLS.find(t => t.toolSpec.name === "run_app").toolSpec;
+          assert(spec.inputSchema.json.properties.full?.type === "boolean" && spec.description.includes("The screenshot shows the viewport, one screen; full: true returns the whole page") && spec.description.includes("rather than changing its layout to fit one screen"), `run_app says what each screenshot shows: ${spec.description}`);
+
+          // The tool end to end: a page three screens tall comes back as labelled pages.
+          const ui = createTestUI();
+          try {
+            const context = { workspace: ui.workspace, agentId: 1, threadId: null };
+            const tall = `<!doctype html><style>body{margin:0;font:16px sans-serif} .hero{height:100vh;background:rgb(200,0,0)} .rest{height:200vh;background:rgb(0,0,200)}
+              .foot{position:fixed;bottom:0;left:0;right:0;height:20px;background:rgb(0,200,0)}</style>
+              <div class="hero">hero</div><canvas id="gl" width="40" height="40"></canvas><div class="rest">rest</div><div class="foot">foot</div>
+              <script>document.getElementById("gl").getContext("webgl");
+              if (window.__HARNESS__?.test) { console.log("PASS: loads"); window.TESTS_DONE = { passed: 1, failed: 0 }; }<\/script>`;
+            await writeFile({ path: "index.html", content: tall, screenshot: false }, context);
+            const plain = await runApp({ screenshot: true }, context);
+            assert(plain.__media?.length === 1 && !plain.report.screenshot.pages, "the plain screenshot is still one view");
+            const full = await runApp({ full: true }, context), shot = full.report.screenshot;
+            const [vw, vh] = full.report.viewport.split("x").map(Number), count = Math.ceil((3 * vh + 40) / (2 * vh));
+            assert(shot.tier === "snapshot" && shot.approximate && shot.pages === count && full.__media.length === count, `full: true returns the page in pages: ${JSON.stringify(shot)} (${full.__media?.length} images, viewport ${vw}x${vh})`);
+            assert(full.__media.every((m, i) => m.label === `page ${i + 1} of ${count}` && m.format === "webp"), `each page is labelled: ${full.__media.map(m => m.label)}`);
+            assert(shot.notes?.some(n => n.startsWith("canvas#gl read back empty")), `a WebGL canvas it couldn't read is named, not passed off as blank: ${JSON.stringify(shot.notes)}`);
+            const first = await createImageBitmap(new Blob([full.__media[0].bytes], { type: "image/webp" }));
+            const read = Object.assign(document.createElement("canvas"), { width: first.width, height: first.height }).getContext("2d", { willReadFrequently: true });
+            read.drawImage(first, 0, 0);
+            const k = first.width / vw, at = y => [...read.getImageData(first.width / 3, Math.round(24 + y * k), 1, 1).data].slice(0, 3);
+            const [r1, , b1] = at(vh / 2), [r2, , b2] = at(vh + 80), [, g3] = at(vh - 10);
+            assert(r1 > 150 && b1 < 60 && b2 > 150 && r2 < 60, `100vh is a screen, not the whole page: rgb at mid hero ${at(vh / 2)}, below it ${at(vh + 80)}`);
+            assert(g3 > 150, `the fixed footer is where the first screen has it: ${at(vh - 10)}`);
+            const { content } = await getToolResults([{ toolUse: { toolUseId: "f", name: "run_app", input: { full: true } } }], { run_app: () => full });
+            const kinds = content[0].toolResult.content.map(b => b.json ? "json" : b.image ? "image" : b.text);
+            assert(eq(kinds, ["json", ...full.__media.flatMap((m, i) => [`page ${i + 1} of ${count}`, "image"])]), `each page's label comes before it: ${JSON.stringify(kinds)}`);
+            const [, moved] = prepareMessages([{ role: "assistant", content: [{ toolUse: { toolUseId: "f", name: "run_app", input: { full: true } } }] }, { role: "user", content }], { beside: true });
+            assert(moved.content.filter(b => b.text).map(b => b.text).join("|") === full.__media.map((m, i) => `run_app, page ${i + 1} of ${count}`).join("|"), `a model that sees images beside results gets each page's label with it: ${JSON.stringify(moved.content.map(b => b.text ?? Object.keys(b)[0]))}`);
+
+            // While the tab is shared, stitch goes first; one that fails hands on to the snapshot. The share is a canvas's
+            // stream here, which shows no preview, so stitch either reads it or says why it couldn't.
+            const shared = Object.getOwnPropertyDescriptor(MediaDevices.prototype, "getDisplayMedia");
+            const source = solid(320, 180, "#888");
+            MediaDevices.prototype.getDisplayMedia = async () => source.captureStream(30);
+            try {
+              await ui.workspace.enableCapture();
+              const fell = await runApp({ full: true }, context), s2 = fell.report.screenshot;
+              assert((s2.tier === "stitch" && !s2.approximate) || (s2.tier === "snapshot" && s2.fallbackFrom?.[0]?.startsWith("stitch:") && fell.__media.length === count), `stitch first while sharing, else the snapshot: ${JSON.stringify(s2)}`);
+            } finally {
+              ui.workspace.disableCapture();
+              if (shared) Object.defineProperty(MediaDevices.prototype, "getDisplayMedia", shared); else delete MediaDevices.prototype.getDisplayMedia;
+            }
+            await runApp({ screenshot: false }, context);
           } finally {
             ui.cleanup();
           }
@@ -7952,6 +8099,7 @@ if (window.__HARNESS__?.test) (async () => {
           testWebTools,
           testOutline,
           testWorkspaceToolsLoop,
+          testFullPage,
           testTestScreenshots,
           testArtifactRenderers,
           testFolderProject,
