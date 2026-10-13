@@ -162,6 +162,12 @@ async function run(config = options(process.argv.slice(2))) {
             endpoint: "http://localhost:" + proxy.address().port,
           }),
         );
+      // --net: the page's GitHub test reads with GITHUB_PAT from .env when there is one (it only reads).
+      if (config.net) {
+        try { process.loadEnvFile(path.join(repository, ".env")); } catch {}
+        if (process.env.GITHUB_PAT)
+          await page.addInitScript((token) => { if (window === top) window.__GITHUB_PAT__ = token; }, process.env.GITHUB_PAT);
+      }
       const errors = [];
       page.on("console", (message) => {
         console.log(message.text());

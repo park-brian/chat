@@ -11,6 +11,9 @@ import {
 import {
   STOP_MAX, STEER_MAX, delivered, envelopeGuide, isoLocal, localDate, note, renderTurn, sameClient, steer, timing,
 } from "./envelope.js";
+import {
+  MemoryObserver, connectGitHub, createFolderRoot, createGitHubRoot, isBinaryPath, isMemoryDirectory, liveHandle, storableHandle,
+} from "./projects.js";
 import { BASH_TOOL_SPEC, createShellTool } from "./shell/tool.js";
 // The tab's half, for index.html: it loads only this file.
 export { createShellHost } from "./shell/host.js";
@@ -35,7 +38,7 @@ if (inSharedWorker) {
 // stylesheets name the same URLs; its tests hold them to this table.
 const CDN = Object.fromEntries(Object.entries({
   "@aws-sdk/client-bedrock-runtime": "3.1149.0", "@google/genai": "1.52.0", "@mozilla/readability": "0.6.0", acorn: "8.19.0",
-  bootstrap: "5.3.8", "bootstrap-icons": "1.13.2", diff: "5.2.2", dompurify: "3.4.16", idb: "8.0.4", mammoth: "1.13.0",
+  bootstrap: "5.3.8", "bootstrap-icons": "1.13.2", diff: "5.2.2", dompurify: "3.4.16", idb: "8.0.4", "isomorphic-git": "1.44.2", mammoth: "1.13.0",
   marked: "15.0.12", "modern-screenshot": "4.7.0", "pdfjs-dist": "6.3.289", "solid-js": "1.9.17", tcpipe: "1.0.0",
   turndown: "7.2.4", "turndown-plugin-gfm": "1.0.2",
 }).map(([name, version]) => [name, `https://cdn.jsdelivr.net/npm/${name}@${version}`]));
@@ -532,7 +535,7 @@ const SHELL_DB = DB_NAME + "-shell";
 // blocking: a newer version wants to upgrade; the owner lets go of its work, then this connection closes.
 // blocked: an older version still holds the database open.
 const SCHEMA = { agents: [], threads: ["agentId"], messages: ["agentId", "threadId"], resources: ["agentId", "threadId"], projects: [], versions: ["projectId"] };
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 async function initDB({ blocking = () => {}, blocked = () => {} } = {}) {
   const db = await openDB(DB_NAME, DB_VERSION, {
     upgrade(db) {
@@ -542,6 +545,8 @@ async function initDB({ blocking = () => {}, blocked = () => {} } = {}) {
         for (const index of indexes) store.createIndex(index, index);
       }
       db.createObjectStore("blobs", { keyPath: "hash" });
+      // A root project's files as the harness first read them, before the journal holds them: { key: "projectId:path", hash }.
+      db.createObjectStore("reads", { keyPath: "key" });
     },
     blocked,
     blocking() { blocking(); db.close(); blobCache.clear(); },
@@ -2126,7 +2131,7 @@ export function getGeminiClient(client) {
 // settings with every command, and again when another tab changes them; the latest copy stands in. The proxy sent
 // is the stored one: the worker finds the local proxy itself.
 const FLAGS_KEY = "harness-flags"; // localStorage: { name: value }, the experiment's feature flags
-const SETTING_KEYS = ["aws-config", "google-config", "brave-config", FLAGS_KEY];
+const SETTING_KEYS = ["aws-config", "google-config", "brave-config", "github-config", FLAGS_KEY];
 const settings = { items: {}, proxy: null };
 const setting = key => globalThis.localStorage ? localStorage.getItem(key) : settings.items[key] ?? null;
 const storedJSON = key => { try { return JSON.parse(setting(key) || "null"); } catch { return null; } };
@@ -2136,6 +2141,8 @@ const storedJSON = key => { try { return JSON.parse(setting(key) || "null"); } c
 // envelope=plain: loose text blocks instead of <message>/<metadata> (envelope.js renderTurn). metadata=rich: the
 // contract's state and the file list on every user message and after every step (userMetadata, stepMetadata).
 const flag = (name, fallback = null) => { const value = storedJSON(FLAGS_KEY)?.[name]; return value == null ? fallback : String(value); };
+// The user's GitHub token (Settings), for GitHub projects: a fine-grained one, scoped to the repositories.
+const githubToken = () => storedJSON("github-config")?.token || null;
 const snapshotSettings = () => ({ items: Object.fromEntries(SETTING_KEYS.map(key => [key, setting(key)])), proxy: storedProxyConfig() });
 const applySettings = ({ items, proxy }) => Object.assign(settings, { items, proxy });
 
@@ -2394,7 +2401,7 @@ async function sandboxFiles(command, args = {}, context = {}) {
   const store = resourceStore(context);
   const ws = context.workspace?.state.project ? context.workspace : null;
   const path = normalizePath(args.path ?? "").replace(/\/+$/, "");
-  const inWorkspace = p => !!ws && p in ws.state.files;
+  const inWorkspace = p => !!ws && (p in ws.state.files || !!ws.root?.has(p));
   const paths = async (prefix = "") => {
     const all = new Set((await store.all()).map(r => r.path));
     if (ws) for (const p of await ws.listFiles()) all.add(p);
@@ -3280,21 +3287,10 @@ function toResultValue(value) {
   }
 }
 
-async function fileHandle(dir, path, create = false) {
-  const parts = path.split("/");
-  const name = parts.pop();
-  for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
-  return dir.getFileHandle(name, { create });
-}
-
-async function listFolder(dir, prefix = "", out = []) {
-  for await (const [name, handle] of dir.entries()) {
-    if (out.length >= 200) break;
-    if (handle.kind === "file") out.push(prefix + name);
-    else if (!/^(\.git|node_modules|\.artifacts)$/.test(name) && prefix.split("/").length < 3) await listFolder(handle, prefix + name + "/", out);
-  }
-  return out;
-}
+// isomorphic-git, for a folder project's git, loaded the first time one asks.
+const loadGit = () => import(`${CDN["isomorphic-git"]}/+esm`);
+// A run serves the root's files beside the journal's, up to these: a bigger project serves the files it touched.
+const ROOT_RUN_FILES = 2000, ROOT_RUN_BYTES = 20_000_000;
 
 // One per App. Owns the open project, its runner, and the run queue.
 // Read-modify-commit sections on one project run one at a time, in whichever workspace, tab or worker holds it.
@@ -3308,7 +3304,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   const view = project => (branch && project ? { ...project, heads: project.branches?.[branch]?.heads ?? project.heads } : project);
   const id = crypto.randomUUID().slice(0, 8);
   const [state, setState] = createStore({
-    project: null,    // { id, agentId, name, entry, heads: { path: versionId }, dirHandle? }
+    project: null,    // { id, agentId, name, entry, heads: { path: versionId }, root? } (root: see projects.js)
     files: {},        // path -> current text
     report: null,     // last run report of the shown artifact
     running: false,
@@ -3321,15 +3317,14 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     selected: null,   // file open in the Code tab; defaults to the shown artifact
     preview: null,    // { versionId, path, text } while an older version is shown
     capture: "none",  // element | region | tab | none
-    folder: null,     // { name, status: connected | permission }
+    root: null,       // a folder or GitHub root: { kind, name, status: connected | permission | missing, files, git, branch… }
     versions: [],     // newest first
     notice: null,
     captureChoice: globalThis.localStorage?.getItem(CAPTURE_CHOICE_KEY) ?? null, // allowed | dismissed | null
   });
   let context = {};
   let runQueue = Promise.resolve();
-  let folder = null, stopWatching = null, syncing = false, noticeTimer = null;
-  const diskSeen = new Map();
+  let root = null, stopWatching = null, noticeTimer = null;
   const runner = host || !frames ? null : frames(id, {
     state, setState,
     notify: message => notify(message),
@@ -3427,8 +3422,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     // A scratch page runs off screen: the preview, its logs, and its report stay the shown artifact's.
     const scratch = isScratch(version.path);
     // The page runs in its folder: the project's other files, served beside it.
-    const files = Object.fromEntries(await Promise.all(Object.entries(project.heads).filter(([p]) => p !== version.path)
-      .map(async ([p, id]) => [p, await getBlob(db, (await db.get("versions", id)).hash)])));
+    const files = await servedFiles(project, version.path);
     const missing = isHtml(version.path) ? await missingFiles(version.path, content, p => files[p] ?? null) : [];
     if (missing.length) return { report: { version: version.id, path: version.path, ok: false, errors: missing, notes: ["Not run: the page loads files the workspace doesn't have."] } };
     setState({ running: true, ...(!scratch && { logs: [], preview: isHead ? null : { versionId: version.id, path: version.path, text: content } }) });
@@ -3448,13 +3442,30 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     }
   }
 
+  // What a run serves: the journal's files, over the root's (read on first use, within ROOT_RUN_FILES and
+  // ROOT_RUN_BYTES), all but except.
+  async function servedFiles(project, except = null) {
+    const files = {};
+    if (root) {
+      let bytes = 0;
+      for (const path of root.list().slice(0, ROOT_RUN_FILES)) {
+        if (path in project.heads || path === except || isBinaryPath(path)) continue;
+        const text = await root.read(path).catch(() => null);
+        if (text == null) continue;
+        if ((bytes += text.length) > ROOT_RUN_BYTES) break;
+        files[path] = text;
+      }
+    }
+    for (const [path, id] of Object.entries(project.heads)) if (path !== except) files[path] = await getBlob(db, (await db.get("versions", id)).hash);
+    return files;
+  }
+
   // Test files run off screen, in a page of their own at the top of the folder; the preview and its report stay the
   // shown artifact's.
   async function runTests({ files: tests, path }, signal) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
-    const files = Object.fromEntries(await Promise.all(Object.entries(project.heads)
-      .map(async ([p, id]) => [p, await getBlob(db, (await db.get("versions", id)).hash)])));
+    const files = await servedFiles(project);
     // A file that imports one the workspace hasn't got fails without a run, which would only say "failed to fetch".
     const missing = [], broken = [];
     for (const file of tests) {
@@ -3540,27 +3551,30 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   async function open(projectId, { run: preview = true } = {}) {
     const project = view(await db.get("projects", +projectId));
     if (!project) return null;
-    detachFolder();
+    detachRoot();
     runner?.reset();
     setState({ project, report: null, preview: null, logs: [], runLog: [], selected: null, focus: false });
     await loadFiles();
     await refreshVersions();
-    if (project.dirHandle && !branch) await reconnect(project.dirHandle, false).catch(e => notify(e.message));
+    if (project.root && project.root.kind !== "workspace") await attachRoot().catch(e => notify(e.message));
     if (headless) return state.project;
-    setState("panel", !!shownPath() && globalThis.innerWidth >= 992);
+    // A folder or a repository with nothing to show opens on its files.
+    setState({ panel: (!!shownPath() || !!state.root) && globalThis.innerWidth >= 992, ...(state.root && !shownPath() && { tab: "project" }) });
     if (shownPath() && preview) refresh();
     return state.project;
   }
 
   function close() {
-    detachFolder();
+    detachRoot();
     setState({ project: null, files: {}, report: null, preview: null, versions: [], logs: [], runLog: [], panel: false, focus: false, selected: null });
     runner?.blank();
   }
 
-  async function createProject({ agentId = 1, name = "Untitled", entry = "index.html", content = null } = {}) {
+  // root: { kind: "folder", handle } or a GitHub record (projects.js connectGitHub); none is a workspace project.
+  async function createProject({ agentId = 1, name = "Untitled", entry = "index.html", content = null, root: record = null } = {}) {
     const now = Date.now();
-    const projectId = await db.add("projects", { agentId, name, entry, heads: {}, createdAt: now, updatedAt: now });
+    const stored = record?.kind === "folder" ? { kind: "folder", name: record.handle.name, handle: storableHandle(record.handle) } : record;
+    const projectId = await db.add("projects", { agentId, name, entry, heads: {}, ...(stored && { root: stored }), createdAt: now, updatedAt: now });
     await open(projectId);
     if (content != null) {
       await exclusive(() => commit(entry, content, { source: "user" }));
@@ -3590,9 +3604,21 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     const headId = state.project.heads[path];
     const head = headId ? await db.get("versions", headId) : null;
     if (head?.hash === hash) return { version: head, changed: false, before: text };
-    const before = head ? await getBlob(db, head.hash) : null;
+    let before = head ? await getBlob(db, head.hash) : null, parentId = headId ?? null;
+    // A root's file the journal doesn't hold yet starts its history as it was: the root's copy, which the write
+    // replaces, or for a change from the disk, the copy the harness last read.
+    if (!head && root) {
+      const seen = meta.source === "disk" && (await db.get("reads", readKey(path)));
+      const base = meta.source === "disk" ? seen && (await getBlob(db, seen.hash)) : await root.read(path).catch(() => null);
+      if (base != null && base !== text) {
+        const baseVersion = { projectId: state.project.id, path, parentId: null, hash: await putBlob(db, base), size: base.length, lines: countLines(base), source: "base", threadId: null, toolUseId: null, restoredFrom: null, createdAt: Date.now(), report: null, branch };
+        parentId = baseVersion.id = await db.add("versions", baseVersion);
+        before = base;
+        setState("versions", versions => [baseVersion, ...versions].slice(0, 200));
+      }
+    }
     const version = {
-      projectId: state.project.id, path, parentId: headId ?? null, hash, size: text.length, lines: countLines(text),
+      projectId: state.project.id, path, parentId, hash, size: text.length, lines: countLines(text),
       source: meta.source || "agent", threadId: meta.threadId ?? context.threadId ?? null, toolUseId: meta.toolUseId ?? null,
       restoredFrom: meta.restoredFrom ?? null, createdAt: Date.now(), report: null, branch,
     };
@@ -3601,16 +3627,38 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     await saveProject({ heads: { ...unwrap(state.project.heads), [path]: version.id } }, { quiet: !!host && meta.source !== "disk" });
     setState("files", path, text);
     setState("versions", versions => [version, ...versions].slice(0, 200));
-    if (meta.source !== "disk") await writeToFolder(path, text);
+    if (meta.source !== "disk" && meta.source !== "base") await writeRoot(path, text);
     return { version, changed: true, before };
   }
 
-  // A file goes from the heads; its versions stay in the history. Call it inside exclusive, as commit.
+  // A file goes from the heads; its versions stay in the history. Call it inside exclusive, as commit. On a folder
+  // project it goes from the disk too, as commit's writes do.
   async function remove(path) {
     path = normalizePath(path);
     if (!state.project || !(path in state.project.heads)) return false;
     const { [path]: _, ...heads } = unwrap(state.project.heads);
     await saveProject({ heads }, { quiet: !!host });
+    setState("files", path, undefined);
+    if (root && !branch) await root.remove(path).catch(e => notify(`Could not remove ${path} from ${root.name}: ${e.message}`));
+    return true;
+  }
+
+  // A root's file into the journal, as the root has it (to run it, or show it): its version, or null if there is none.
+  function adopt(path) {
+    path = normalizePath(path);
+    return exclusive(async () => {
+      if (state.project.heads[path]) return db.get("versions", state.project.heads[path]);
+      const text = await readFile(path);
+      return text == null ? null : (await commit(path, text, { source: "base" })).version;
+    });
+  }
+
+  // A file the disk no longer has leaves the journal's heads (its versions stay, for restore).
+  async function drop(path) {
+    if (!(path in state.project.heads)) return false;
+    const heads = { ...unwrap(state.project.heads) };
+    delete heads[path];
+    await saveProject({ heads });
     setState("files", path, undefined);
     return true;
   }
@@ -3623,7 +3671,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     await exclusive(async () => {
       await saveProject({ heads: { ...heads } });
       await loadFiles();
-      for (const path of Object.keys(heads)) if (heads[path] !== current[path]) await writeToFolder(path, state.files[path]);
+      for (const path of Object.keys(heads)) if (heads[path] !== current[path]) await writeRoot(path, state.files[path]);
     });
     if (shownPath()) refresh();
     return true;
@@ -3641,7 +3689,8 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     const block = body => body + used;
     if (parentHeads === null) {
       const paths = Object.keys(heads).sort();
-      if (!paths.length) return null;
+      const where = describeRootForAgent();
+      if (!paths.length) return where ? block(where) : null;
       const lines = [];
       for (const path of paths) {
         const v = await db.get("versions", heads[path]);
@@ -3649,30 +3698,35 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
         lines.push(`- ${path} v${v.id}, ${v.lines} lines${shown}`);
       }
       const last = state.report ? `\nLast run of v${state.report.version}: ${summarizeReport(state.report)}` : "";
-      return block(`Artifacts in this chat:\n${lines.join("\n")}${last}`);
+      return block(`${where ? where + "\n" : ""}Artifacts in this chat:\n${lines.join("\n")}${last}`);
     }
     const changed = [...new Set([...Object.keys(heads), ...Object.keys(parentHeads)])].filter(p => heads[p] !== parentHeads[p]).sort();
     if (!changed.length) return used ? block("No file changes since your last turn.") : null;
     const parts = [];
     for (const path of changed) {
-      const from = parentHeads[path] ? await db.get("versions", parentHeads[path]) : null;
+      let from = parentHeads[path] ? await db.get("versions", parentHeads[path]) : null;
       const to = heads[path] ? await db.get("versions", heads[path]) : null;
+      // A root's file the journal took in with this change: compared with the file as the harness first read it.
+      if (!from && to?.parentId) from = await db.get("versions", to.parentId).then(v => (v?.source === "base" ? v : null));
+      // One taken in as it was (to run it) is no change.
+      if (!from && to?.source === "base") continue;
       const a = from ? await getBlob(db, from.hash) : "", b = to ? await getBlob(db, to.hash) : "";
       const label = `${path}: ${from ? "v" + from.id : "new"} → ${to ? `v${to.id} (${to.source})` : "removed"}`;
       const patch = createTwoFilesPatch(path, path, a, b, from ? `v${from.id}` : "", to ? `v${to.id}` : "", { context: 2 });
       parts.push(label + "\n" + truncate(patch.split("\n").slice(2).join("\n"), 4000));
     }
+    if (!parts.length) return used ? block("No file changes since your last turn.") : null;
     return block(`Files changed outside your edits since your last turn:\n${parts.join("\n\n")}`);
   }
 
   async function readFile(path) {
     path = normalizePath(path || shownPath() || state.project?.entry);
     if (path in state.files) return state.files[path];
-    if (folder) {
-      const disk = await readDisk(path);
-      if (disk) return disk.text;
-    }
-    return null;
+    if (!root) return null;
+    const text = await root.read(path).catch(() => null);
+    // Remembered as last read, so a change the user makes on disk later shows as a change from it.
+    if (text != null) await db.put("reads", { key: readKey(path), hash: await putBlob(db, text), createdAt: Date.now() });
+    return text;
   }
 
   async function readVersion(versionId) {
@@ -3685,7 +3739,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
 
   async function listFiles(prefix = "") {
     const paths = new Set(Object.keys(state.files));
-    if (folder) for (const path of await listFolder(folder)) paths.add(path);
+    if (root) for (const path of root.list()) paths.add(path);
     return [...paths].filter(p => p.startsWith(prefix)).sort();
   }
 
@@ -3714,101 +3768,167 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     return version;
   }
 
-  async function readDisk(path) {
-    try {
-      const file = await (await fileHandle(folder, path)).getFile();
-      diskSeen.set(path, file.lastModified);
-      return { text: await file.text(), lastModified: file.lastModified };
-    } catch {
-      return null;
-    }
-  }
+  // #region Roots: a folder or a repository under the journal (projects.js)
+  const readKey = path => `${state.project.id}:${path}`;
 
-  async function writeToFolder(path, text) {
-    if (!folder || text == null) return;
+  async function writeRoot(path, text) {
+    if (!root || branch || text == null) return;
     try {
-      const handle = await fileHandle(folder, path, true);
-      const writable = await handle.createWritable();
-      await writable.write(text);
-      await writable.close();
-      diskSeen.set(path, (await handle.getFile()).lastModified);
+      await root.write(path, text);
     } catch (e) {
-      notify(`Could not write ${path} to the folder: ${e.message}`);
+      notify(`Could not write ${path} to ${root.name}: ${e.message}`);
     }
   }
 
-  async function openFolder() {
-    if (!state.project) throw new Error("Create or open an app first.");
-    if (!window.showDirectoryPicker) throw new Error("This browser cannot open local folders.");
-    const handle = await window.showDirectoryPicker({ id: "chat-harness", mode: "readwrite" });
-    await saveProject({ dirHandle: handle });
-    await attachFolder(handle);
+  // The root as the panel shows it.
+  async function describeRoot() {
+    if (!root) return null;
+    if (root.kind === "folder") return { kind: "folder", name: root.name, status: "connected", files: root.list().length, large: root.large.length, git: await root.git.present() };
+    const r = unwrap(state.project.root) ?? root.record;
+    return { kind: "github", name: root.name, status: "connected", files: root.list().length, git: true, branch: r.branch, from: r.from, defaultBranch: r.defaultBranch,
+      base: r.base.commit, commits: r.commits.length, truncated: !!r.base.truncated, pullRequest: r.pullRequest ?? null };
+  }
+  const showRoot = async () => setState("root", await describeRoot());
+
+  // What the agent is told about the root in a chat's first message.
+  function describeRootForAgent() {
+    const r = state.root;
+    if (!r) return null;
+    if (r.status !== "connected") return `This project is the folder "${r.name}" on the user's disk, but ${r.status === "permission" ? "this session may not read it until the user clicks Reconnect in the panel" : "this browser can't reach it"}: only the files below are here.`;
+    if (r.kind === "folder") return `This project is the folder "${r.name}" on the user's disk: ${r.files} files${r.git ? ", a git repository" : ""}. Your writes go to the disk at once; the user's own edits there come back as changes.`;
+    return `This project is the GitHub repository ${r.name} at ${r.base.slice(0, 7)} on ${r.from}: ${r.files} files. Your writes stay here until pushed to a branch (the default branch, ${r.defaultBranch}, only with the user's yes).`;
   }
 
-  async function reconnect(handle = state.project?.dirHandle, ask = true) {
-    if (!handle) return;
+  // Connects the project's root: a folder needs the user's permission, which Chrome remembers when they allow it on
+  // every visit; ask (a click) asks for it. mirror: the journal's files the folder lacks are written out (an app
+  // saved to a new folder); otherwise a file the disk lost leaves the heads. Either way the disk wins.
+  async function attachRoot({ ask = false, mirror = false } = {}) {
+    detachRoot();
+    const record = unwrap(state.project?.root);
+    if (!record || record.kind === "workspace") return null;
+    if (record.kind === "github") {
+      root = createGitHubRoot(record, {
+        token: githubToken, patch: createTwoFilesPatch, files: async () => ({ ...unwrap(state.files) }), current: () => unwrap(state.project?.root),
+        save: async changes => { await saveProject({ root: { ...unwrap(state.project.root), ...changes } }); },
+      });
+      await showRoot();
+      return root;
+    }
+    const handle = liveHandle(record.handle);
+    if (!handle) { setState("root", { kind: "folder", name: record.name, status: "missing" }); return null; }
     const mode = { mode: "readwrite" };
-    let permission = await handle.queryPermission?.(mode);
+    let permission = (await handle.queryPermission?.(mode)) ?? "granted";
     if (permission !== "granted" && ask) permission = await handle.requestPermission(mode);
-    if (permission === "granted") return attachFolder(handle);
-    setState("folder", { name: handle.name, status: "permission" });
+    if (permission !== "granted") { setState("root", { kind: "folder", name: handle.name, status: "permission" }); return null; }
+    root = createFolderRoot(handle, { git: { load: loadGit, patch: createTwoFilesPatch }, Observer: isMemoryDirectory(handle) ? MemoryObserver : globalThis.FileSystemObserver });
+    await root.ready();
+    await showRoot();
+    if (branch) return root;
+    // What changed while nobody watched: the journal's files, and the ones the harness had read.
+    const changes = [];
+    for (const path of Object.keys(state.files)) {
+      if (root.has(path)) changes.push({ path, type: "modified" });
+      else if (mirror) await writeRoot(path, state.files[path]);
+      else changes.push({ path, type: "removed" });
+    }
+    const prefix = state.project.id + ":";
+    for (const key of await db.getAllKeys("reads", IDBKeyRange.bound(prefix, prefix + "\uffff"))) {
+      const path = key.slice(prefix.length);
+      if (!(path in state.files) && root.has(path)) changes.push({ path, type: "modified" });
+    }
+    await onRootChanges(changes);
+    const unlisten = root.watch(changes => onRootChanges(changes).catch(e => notify(`Folder sync failed: ${e.message}`)));
+    stopWatching = () => { unlisten(); root?.unwatch(); };
+    return root;
   }
 
-  // The folder's copy wins when the two differ; files the folder lacks are written out.
-  async function attachFolder(handle) {
-    detachFolder();
-    folder = handle;
-    setState("folder", { name: handle.name, status: "connected" });
-    let entryChanged = false;
-    for (const path of new Set([...Object.keys(state.files), state.project.entry])) {
-      const disk = await readDisk(path);
-      if (!disk) await writeToFolder(path, state.files[path]);
-      else if (disk.text !== state.files[path]) {
-        await exclusive(() => commit(path, disk.text, { source: "disk" }));
-        if (path === shownPath()) entryChanged = true;
-      }
-    }
-    const sync = () => syncFromDisk().catch(e => notify(`Folder sync failed: ${e.message}`));
-    if ("FileSystemObserver" in window) {
-      const observer = new FileSystemObserver(() => sync());
-      observer.observe(handle, { recursive: true }).catch(() => {});
-      stopWatching = () => observer.disconnect();
-    } else {
-      const timer = setInterval(() => document.visibilityState === "visible" && sync(), 1500);
-      stopWatching = () => clearInterval(timer);
-    }
-    if (entryChanged) refresh();
-  }
-
-  async function syncFromDisk() {
-    if (!folder || syncing || !state.project) return;
-    syncing = true;
-    try {
-      let entryChanged = false;
-      for (const path of Object.keys(state.files)) {
-        const handle = await fileHandle(folder, path).catch(() => null);
-        if (!handle) continue;
-        const file = await handle.getFile();
-        if (diskSeen.get(path) === file.lastModified) continue;
-        diskSeen.set(path, file.lastModified);
-        const text = await file.text();
-        if (text === state.files[path]) continue;
-        const { changed } = await exclusive(() => commit(path, text, { source: "disk" }));
-        if (changed && path === shownPath()) entryChanged = true;
-      }
-      if (entryChanged) refresh();
-    } finally {
-      syncing = false;
-    }
-  }
-
-  function detachFolder() {
+  function detachRoot() {
     stopWatching?.();
     stopWatching = null;
-    folder = null;
-    diskSeen.clear();
-    setState("folder", null);
+    root?.unwatch();
+    root = null;
+    setState("root", null);
   }
+
+  // The user's edits on disk: a file the journal holds, or one the harness has read, gets a version from the disk
+  // (the disk wins); a file nobody has read is read fresh when it is. One the disk lost leaves the heads.
+  async function onRootChanges(changes) {
+    if (!state.project || !root) return;
+    let shown = false;
+    for (const { path, type } of changes) {
+      if (type === "removed") {
+        if (path in state.files && (await exclusive(() => drop(path))) && path === shownPath()) shown = true;
+        continue;
+      }
+      if (!(path in state.files)) {
+        const seen = await db.get("reads", readKey(path));
+        if (!seen) continue;
+      }
+      const text = await root.read(path).catch(() => null);
+      if (text == null) continue;
+      const { changed } = await exclusive(async () => {
+        if (path in state.files ? state.files[path] === text : await db.get("reads", readKey(path)).then(async r => !r || (await getBlob(db, r.hash)) === text)) return { changed: false };
+        return commit(path, text, { source: "disk" });
+      });
+      if (changed && path === shownPath()) shown = true;
+    }
+    if (changes.length) await showRoot();
+    if (shown && !headless) refresh();
+  }
+
+  // Saves the open project to a folder the user picks: its files are written there, and it becomes a folder project.
+  async function openFolder({ handle = null } = {}) {
+    if (!state.project) return openFolderProject({ handle });
+    handle ??= await pickFolder();
+    await saveProject({ root: { kind: "folder", name: handle.name, handle: storableHandle(handle) } });
+    await attachRoot({ mirror: true });
+  }
+
+  async function pickFolder() {
+    if (!globalThis.showDirectoryPicker) throw new Error("This browser can't open local folders (Chrome and Edge can): connect a GitHub repository instead.");
+    return globalThis.showDirectoryPicker({ id: "chat-harness", mode: "readwrite" });
+  }
+
+  // A folder on disk as a new project: its files are listed at once, read when first needed.
+  async function openFolderProject({ handle = null, agentId = context.agentId ?? 1 } = {}) {
+    handle ??= await pickFolder();
+    const project = await createProject({ agentId, name: handle.name, root: { kind: "folder", handle } });
+    if (state.root?.status === "connected" && state.root.files === 0) notify(`${handle.name} has no files the project lists (dependencies, build output and .gitignore'd files are left out).`);
+    return project;
+  }
+
+  // A GitHub repository's branch as a new project: its tree is listed, its files fetched when first needed.
+  async function connectRepository({ owner, repo, branch: name = null, agentId = context.agentId ?? 1 } = {}) {
+    const record = await connectGitHub({ owner, repo, branch: name, token: githubToken() });
+    const project = await createProject({ agentId, name: `${owner}/${repo}`, root: record });
+    if (record.base.truncated) notify(`${owner}/${repo} is too big for one listing: GitHub truncated its tree.`);
+    return project;
+  }
+
+  // One click re-grants a folder Chrome forgot (or remembers, with "Allow on every visit").
+  const reconnect = () => attachRoot({ ask: true });
+
+  async function rescan() {
+    if (!root) return [];
+    const { changes } = await root.scan();
+    await onRootChanges(changes);
+    await showRoot();
+    return changes;
+  }
+
+  // git on the project, for the shell's git and gh commands: a folder's own repository (isomorphic-git), or the
+  // connected GitHub branch. status, diff, log, branch, commit; push and openPullRequest for GitHub only.
+  const NO_GIT = "This project has no git: open a folder (with a .git) or connect a GitHub repository.";
+  const git = Object.fromEntries(["status", "diff", "log", "branch", "commit", "push", "pull", "openPullRequest", "init"].map(name => [name, async (args = {}) => {
+    if (!root) throw new Error(state.root?.status === "permission" ? `${state.root.name} needs your permission again: click Reconnect.` : NO_GIT);
+    const fn = root.git?.[name];
+    if (!fn) throw new Error(`git ${name} isn't available on a ${root.kind} project.`);
+    // GitHub's commits and pushes read the working copy and write the root's record: one at a time, from the database.
+    const result = root.kind === "github" && name !== "status" && name !== "diff" && name !== "log" ? await exclusive(() => fn(args)) : await fn(args);
+    if (["commit", "push", "branch", "openPullRequest", "init"].includes(name)) await showRoot();
+    return result;
+  }]));
+  // #endregion
 
   async function captureView() {
     if (!shownPath()) throw new Error("Nothing is shown yet.");
@@ -3818,7 +3938,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   function dispose() {
     channel.close();
     runner?.dispose();
-    detachFolder();
+    detachRoot();
     clearTimeout(noticeTimer);
   }
 
@@ -3831,7 +3951,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     rename: name => saveProject({ name }),
     mountPreview: runner?.mountPreview, enableCapture: runner?.enableCapture, disableCapture: runner?.disableCapture,
     liveErrors: () => runner?.liveErrors() ?? [],
-    openFolder, reconnect, dispose,
+    openFolder, openFolderProject, connectRepository, reconnect, rescan, adopt, git, get root() { return root; }, dispose,
     branch, branchOf: name => createWorkspace(db, { host, frames, branch: name }),
   };
 }
@@ -4465,11 +4585,15 @@ async function runApp({ path, version, viewport, script, screenshot = true } = {
     const ws = await workspaceFor(context);
     if (viewport && viewport !== "fit" && !Object.hasOwn(VIEWPORTS, viewport)) viewport = null;
     // A test file, a folder or a glob runs its tests as `node --test` would.
-    const tests = path && version == null && !isHtml(path) ? testFiles(path, ws.state.project.heads) : null;
+    // A folder's or repository's files count as the journal's.
+    const known = ws.root ? { ...Object.fromEntries((await ws.listFiles()).map(p => [p, true])), ...ws.state.project.heads } : ws.state.project.heads;
+    const tests = path && version == null && !isHtml(path) ? testFiles(path, known) : null;
     if (tests && !tests.length) return { error: `No test files in ${normalizePath(path) || "the project"}: a folder runs its *.test.js, *.test.mjs and test*.js files. Name a file to run another.` };
     if (tests) return { report: (await ws.run({ tests: { files: tests, path: normalizePath(path) }, signal: context.signal })).report };
-    // A version names its own file, a variant's on its branch too; path picks the current one.
-    const head = path && version == null && ws.state.project.heads[normalizePath(path)];
+    // A version names its own file, a variant's on its branch too; path picks the current one. A root's file the
+    // journal doesn't hold yet comes in as the root has it.
+    let head = path && version == null && ws.state.project.heads[normalizePath(path)];
+    if (path && version == null && !head && ws.root?.has(normalizePath(path))) head = (await ws.adopt(normalizePath(path)))?.id;
     if (path && version == null && !head) return { error: await missingFile(ws, normalizePath(path), context) };
     const { report, image } = await ws.run({ versionId: version ?? head ?? null, script: script || null, screenshot, viewport, signal: context.signal });
     return withMedia({ report }, image);
