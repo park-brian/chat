@@ -54,12 +54,18 @@ const [{ openDB }, { createTwoFilesPatch, diffLines }, { createStore, produce, r
 const fill = (template, values) => template.replace(/\{(\w+)\}/g, (match, name) => values[name] ?? match);
 
 // Assembled per request: the agent's own prompt and memories, then how this harness works, for the tools it has.
-function systemPrompt(persona, { tools = [], memories = null } = {}) {
+// The date is the day the request is built, so the cached prefix changes once a day.
+function systemPrompt(persona, { tools = [], memories = null, modelId = null } = {}) {
   const guide = TOOL_DOCUMENTATION.split(/\n(?=### )/).filter(part => !part.startsWith("### ") || tools.includes(part.match(/^### (\w+)/)[1]));
   const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && HARNESS_DOCUMENTATION;
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
-  const environment = fill(ENVIRONMENT, { fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT });
+  const cutoff = MODELS.find(m => m.id === modelId)?.cutoff;
+  const environment = fill(ENVIRONMENT, {
+    fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT,
+    today: new Date().toLocaleDateString("en-CA"),
+    cutoff: cutoff ? ` What you know comes from data up to ${cutoff}.` : "",
+  });
   return [persona, memories, environment, WORKING, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
 }
 
@@ -90,6 +96,26 @@ const FORK_REFUSES = ["task", "edit_file", "write_file", "restore"];
 const VARIANT_REFUSES = ["task"];
 const PATH_PROPERTY = { type: "string", description: "File path, e.g. index.html, notes.md, logo.svg. Defaults to the shown artifact." };
 const SCREENSHOT_PROPERTY = { type: "boolean", description: "true forces a screenshot, false skips it. By default one is attached when the user lets you see the page and it changed." };
+// The harness runs test, probe, file and source checks itself; the other kinds are named so a plan can hold them.
+const CHECK_KINDS = ["test", "probe", "file", "source", "compute", "consistency", "judge", "user"];
+const HARNESS_CHECKS = ["test", "probe", "file", "source"];
+const CHECK_SCHEMA = {
+  type: "object",
+  description: "How the harness tells the item is done",
+  properties: {
+    kind: { type: "string", enum: CHECK_KINDS, description: "test, probe, file and source are run by the harness" },
+    file: { type: "string", description: "test, probe: the page to run (default: the shown one), or a test file it runs. file: the file to check" },
+    name: { type: "string", description: "test: the name of a test that must be among those passing" },
+    script: { type: "string", description: "probe: JS run in the page after it settles, true when the item is done, e.g. return app.items().length === 3" },
+    exists: { type: "boolean", description: "file: false checks that it is gone (default true)" },
+    contains: { type: "string", description: "file: text it must contain" },
+    matches: { type: "string", description: "file: a regular expression it must match" },
+    min_words: { type: "integer", description: "file: at least this many words" },
+    max_words: { type: "integer", description: "file: at most this many words" },
+    text: { type: "string", description: "source: a quote or number that must appear in a tool result in this chat. Other kinds: what to check" },
+  },
+  required: ["kind"],
+};
 
 const CAPTURE_CHOICE_KEY = "harness.capture"; // localStorage: allowed | dismissed
 const PROXY_CONFIG_KEY = "proxy-config"; // localStorage: one CORS proxy for every agent
@@ -106,7 +132,7 @@ const CLAUDE_BUDGET = { levels: ["off", "low", "medium", "high"], reasoning: lev
 const GPT_6 = { window: 1_050_000, levels: ["off", "low", "medium", "high", "xhigh", "max"], reasoning: effort => ({ reasoning: { effort } }), off: { reasoning: { effort: "none" } } };
 const MODELS = [
   { id: "global.anthropic.claude-fable-5-1", label: "Fable 5.1", group: "AWS Bedrock", ...CLAUDE_5 },
-  { id: "global.anthropic.claude-opus-5-5", label: "Opus 5.5", group: "AWS Bedrock", ...CLAUDE_5 },
+  { id: "global.anthropic.claude-opus-5-5", label: "Opus 5.5", group: "AWS Bedrock", ...CLAUDE_5, cutoff: "June 2026" },
   { id: "global.anthropic.claude-sonnet-5-5", label: "Sonnet 5.5", group: "AWS Bedrock", ...CLAUDE_5 },
   { id: "global.anthropic.claude-haiku-5-5", label: "Haiku 5.5", group: "AWS Bedrock", ...CLAUDE_5, context: 100_000, levels: ["off", ...CLAUDE_5.levels], off: { thinking: { type: "disabled" } } },
   // Bedrock's OpenAI models take no cache points and no documents. They see a tool result's image only beside it,
@@ -190,6 +216,31 @@ const TOOLS = [
             thought: { type: "string", description: "Your detailed thought process, analysis, or reasoning steps." },
           },
           required: ["thought"],
+        },
+      },
+    },
+  },
+  {
+    // The contract is the run's, kept by its director; a sub-agent reports to its caller instead.
+    fn: (input, context) => context.director ? context.director.plan(input, context) : { error: "The plan is the main agent's. Report what you found in your final message instead." },
+    toolSpec: {
+      name: "plan",
+      description: "The contract for long work, kept by the harness: the goal, assumptions, items each with a check the harness runs, notes with their sources, and questions for the user. Returns the current state. An item is done when the harness sees its check pass. The harness writes PLAN.md from it.",
+      inputSchema: {
+        json: {
+          type: "object",
+          properties: {
+            goal: { type: "string", description: "The user's request in their words" },
+            done: { type: "string", description: "What done means" },
+            assumptions: { type: "array", items: { type: "string" }, description: "What you decided without asking, each one the user can correct" },
+            add: { type: "object", description: "One item: { title, check }", properties: { title: { type: "string" }, check: CHECK_SCHEMA } },
+            edit: { type: "integer", description: "The id of an item to change, with title or check; its old check stays in the ledger" },
+            title: { type: "string", description: "With edit: the item's new title" },
+            check: { ...CHECK_SCHEMA, description: "With edit: the item's new check" },
+            note: { type: "string", description: "A fact learned, or a decision and its reason" },
+            source: { type: "string", description: "With note: the URL or file it came from" },
+            ask: { type: "string", description: "A question only the user can answer" },
+          },
         },
       },
     },
@@ -477,7 +528,7 @@ async function initDB({ blocking = () => {}, blocked = () => {} } = {}) {
 async function ensureDefaultAgent(db) {
   const tx = db.transaction(["agents", "resources"], "readwrite");
   if (await tx.objectStore("agents").get(1)) return;
-  tx.objectStore("agents").put({ id: 1, name: "default", systemPrompt: DEFAULT_PROMPT, tools: ["code", "think", "editor", "mcp", "task"], mcpServers: [], resources: [] });
+  tx.objectStore("agents").put({ id: 1, name: "default", systemPrompt: DEFAULT_PROMPT, tools: ["code", "think", "plan", "editor", "mcp", "task"], mcpServers: [], resources: [] });
   tx.objectStore("resources").add({ agentId: 1, path: "skills/frontend-design.md", content: FRONTEND_SKILL, createdAt: Date.now() });
   await tx.done;
 }
@@ -900,6 +951,454 @@ function silentReply(messages) {
   return "Your reply ended with no text and no tool call. Go on with the work, or answer.";
 }
 
+// The director (docs/specs/2026-10-12-director.md). Long work gets a contract: the goal, items each with a check the
+// harness runs, a ledger of what each check showed, notes with sources, questions for the user. The model makes the
+// judgments; the harness keeps the books, so an item is done when its check passes, never on the model's word. A
+// table of rules reads the contract and the run, and says one short thing at the tail of the request when it applies.
+// Why: cheap models follow the instruction just before they act, and feedback better than rules. A plan-file rule in
+// the prompt changed nothing; the same rule injected after the eighth call worked in 3 of 3 runs.
+
+const STALL_STEPS = 6; // steps with no check turning green before the director says so
+const LONG_REQUEST = 100; // words: a request this long is work, not a question
+const NOTES_AT = 0.8; // share of the way to a summary at which the model is told to write its notes
+const LEDGER_KEPT = 300;
+
+const emptyContract = () => ({ goal: "", done: "", assumptions: [], items: [], ledger: [], notes: [], questions: [] });
+const clip = (text, n) => (text = String(text ?? ""), text.length > n ? text.slice(0, n - 1) + "…" : text);
+const andList = xs => xs.length < 2 ? String(xs[0] ?? "") : `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}`;
+const itemsLabel = ids => `${ids.length > 1 ? "Items" : "Item"} ${andList(ids)}`;
+const squash = text => String(text ?? "").toLowerCase().replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, " ").trim();
+const runnable = item => HARNESS_CHECKS.includes(item.check?.kind);
+// The item to work on: the first not done whose check the harness can run, else the first not done.
+const currentItem = contract => contract.items.find(i => i.status !== "done" && runnable(i)) ?? contract.items.find(i => i.status !== "done") ?? null;
+const lastEntry = (contract, item) => contract.ledger.findLast(e => e.itemId === item.id && e.result !== "replaced");
+function progressLine(contract) {
+  const done = contract.items.filter(i => i.status === "done").length;
+  const green = contract.items.filter(i => lastEntry(contract, i)?.result === "pass").length;
+  return `${done} of ${contract.items.length} items done, ${green} check${green === 1 ? "" : "s"} green`;
+}
+
+function describeCheck(c) {
+  if (!c) return "none";
+  switch (c.kind) {
+    case "test": return `the tests in ${c.file || "the shown page"} pass${c.name ? `, "${clip(c.name, 80)}" among them` : ""}`;
+    case "probe": return `\`${clip(c.script, 120)}\` returns true in ${c.file || "the shown page"}`;
+    case "file": {
+      const parts = c.exists === false ? ["is gone"] : ["exists"];
+      if (c.contains != null) parts.push(`contains "${clip(c.contains, 60)}"`);
+      if (c.matches) parts.push(`matches /${clip(c.matches, 60)}/`);
+      if (c.min_words) parts.push(`has at least ${c.min_words} words`);
+      if (c.max_words) parts.push(`has at most ${c.max_words} words`);
+      return `${c.file} ${andList(parts)}`;
+    }
+    case "source": return `"${clip(c.text, 80)}" appears in a tool result`;
+    default: return `${c.kind}: ${clip(c.text ?? "", 80)}`;
+  }
+}
+
+// A check as the plan keeps it, or a reason it can't be one.
+function toCheck(c) {
+  if (!c || typeof c !== "object") return { error: `needs a check: { "kind": "${HARNESS_CHECKS.join('" | "')}", ... }` };
+  if (!CHECK_KINDS.includes(c.kind)) return { error: `has a check of unknown kind "${c.kind}": the harness runs ${andList(HARNESS_CHECKS)}` };
+  if (c.kind === "probe" && !String(c.script ?? "").trim()) return { error: "has a probe check without a script" };
+  if (c.kind === "file" && !c.file) return { error: "has a file check without a file" };
+  if (c.kind === "source" && !String(c.text ?? "").trim()) return { error: "has a source check without the text to find" };
+  if (c.matches) try { new RegExp(c.matches, "m"); } catch (e) { return { error: `has a pattern that doesn't parse: ${e.message}` }; }
+  const fields = ["kind", "file", "name", "script", "exists", "contains", "matches", "min_words", "max_words", "text"];
+  return { check: Object.fromEntries(fields.filter(k => c[k] != null).map(k => [k, k === "file" ? normalizePath(c[k]) : c[k]])) };
+}
+
+// The strings in every tool result of this chat but the plan's own, with the call that returned each.
+function toolTexts(messages) {
+  const calls = new Map(messages.flatMap(m => (m.content ?? []).filter(b => b?.toolUse).map(b => [b.toolUse.toolUseId, b.toolUse])));
+  const strings = (v, out) => { if (typeof v === "string") out.push(v); else if (v && typeof v === "object" && !ArrayBuffer.isView(v)) Object.values(v).forEach(x => strings(x, out)); return out; };
+  return messages.flatMap(m => (m.content ?? []).filter(b => b?.toolResult).map(b => ({ call: calls.get(b.toolResult.toolUseId), parts: b.toolResult.content ?? [] })))
+    .filter(r => r.call?.name !== "plan")
+    .map(({ call, parts }) => ({ call, text: squash(parts.flatMap(p => strings(p.text ?? p.json, [])).join("\n")) }));
+}
+
+const pass = evidence => ({ result: "pass", evidence }), fail = evidence => ({ result: "fail", evidence });
+
+function fileCheck(c, text) {
+  if (text == null) return c.exists === false ? pass(`${c.file} is gone`) : fail(`${c.file} doesn't exist`);
+  if (c.exists === false) return fail(`${c.file} exists`);
+  const words = text.split(/\s+/).filter(Boolean).length;
+  if (c.contains != null && !text.includes(String(c.contains))) return fail(`${c.file} doesn't contain "${clip(c.contains, 60)}"`);
+  if (c.matches && !new RegExp(c.matches, "m").test(text)) return fail(`${c.file} doesn't match /${clip(c.matches, 60)}/`);
+  if (c.min_words && words < c.min_words) return fail(`${c.file} has ${words} words, fewer than ${c.min_words}`);
+  if (c.max_words && words > c.max_words) return fail(`${c.file} has ${words} words, more than ${c.max_words}`);
+  return pass(`${c.file}: ${words} words`);
+}
+
+function sourceCheck(c, messages) {
+  const want = squash(c.text);
+  const hit = toolTexts(messages).find(t => t.text.includes(want));
+  if (!hit) return fail("not in any tool result in this chat");
+  const where = hit.call && [hit.call.name, hit.call.input?.url ?? hit.call.input?.path ?? hit.call.input?.query].filter(Boolean).join(" ");
+  return pass(`found in ${clip(where || "a tool result", 160)}`);
+}
+
+// A page and its tests, run fresh unless this step's results already ran its current version.
+async function pageReport(ws, page, { script = null, fresh = [], signal } = {}) {
+  const head = ws.state.project.heads[page];
+  const ran = !script && fresh.findLast(r => r.path === page && r.version === head);
+  return ran || (await ws.run({ versionId: head, script, screenshot: false, signal })).report;
+}
+
+async function testCheck(c, ws, fresh, signal) {
+  if (!ws?.state?.project) return fail("no project is open, so nothing can be tested yet");
+  const file = c.file ? normalizePath(c.file) : null;
+  if (file && !ws.state.project.heads[file]) return fail(`${file} doesn't exist`);
+  const page = file && isHtml(file) ? file : ws.shownPath();
+  if (!page || !isHtml(page)) return fail("no page runs tests: the project shows no HTML page");
+  const report = await pageReport(ws, page, { fresh, signal });
+  const t = report.tests;
+  if (!t) return fail(`${page}: ${clip(report.notes?.[0] ?? report.errors?.[0] ?? "no in-file tests ran", 160)}`);
+  if (t.failed) return fail(`${page}: ${t.passed} passed, ${t.failed} failed${t.failures?.length ? `: ${clip(t.failures.slice(0, 2).join("; "), 200)}` : ""}`);
+  if (!t.passed) return fail(`${page}: no test passed`);
+  if (c.name && !(t.passes ?? []).some(n => squash(n).includes(squash(c.name)))) return fail(`${page}: ${t.passed} passed, none named "${clip(c.name, 60)}"`);
+  return pass(`${page}: ${t.passed} passed`);
+}
+
+async function probeCheck(c, ws, signal) {
+  if (!ws?.state?.project) return fail("no project is open, so there is no page to probe yet");
+  const page = c.file ? normalizePath(c.file) : ws.shownPath();
+  if (!page || !ws.state.project.heads[page]) return fail(`${page ?? "the page"} doesn't exist yet`);
+  // An expression is a probe too.
+  const script = /\breturn\b/.test(c.script) ? c.script : `return (${c.script.trim().replace(/;+$/, "")});`;
+  const report = await pageReport(ws, page, { script, signal });
+  if (report.scriptError) return fail(`${page}: the script threw: ${clip(report.scriptError, 200)}`);
+  if (!("result" in report)) return fail(`${page}: ${clip(report.notes?.[0] ?? report.errors?.[0] ?? "the page did not run", 160)}`);
+  return report.result === true ? pass(`${page}: returned true`) : fail(`${page}: returned ${clip(JSON.stringify(report.result) ?? "undefined", 120)}`);
+}
+
+// { result: pass | fail | "not run", evidence }. A check that throws fails, with the reason as its evidence.
+async function runCheck(check, { ws = null, messages = [], fresh = [], signal = null } = {}) {
+  try {
+    switch (check.kind) {
+      case "file": return fileCheck(check, ws?.readFile ? await ws.readFile(check.file) : null);
+      case "source": return sourceCheck(check, messages);
+      case "test": return await testCheck(check, ws, fresh, signal);
+      case "probe": return await probeCheck(check, ws, signal);
+      default: return { result: "not run", evidence: `not run by the harness yet: it runs ${andList(HARNESS_CHECKS)} checks, so this item stays open` };
+    }
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    return fail(`the check could not run: ${clip(e?.message || e, 200)}`);
+  }
+}
+
+// Whether a change to path is a reason to run the check again.
+function watches(check, path) {
+  if (isPlanFile(path)) return false;
+  if (check.kind === "file") return check.file === path;
+  if (check.kind === "test" || check.kind === "probe") return !isScratch(path) || check.file === path;
+  return false;
+}
+
+// What the plan tool returns: the contract in a few lines.
+function contractState(contract) {
+  const current = currentItem(contract);
+  const last = current && lastEntry(contract, current);
+  const shown = contract.items.length <= 12 ? contract.items : contract.items.filter(i => i.status !== "done").slice(0, 6);
+  const open = contract.questions.filter(q => q.answer == null);
+  return [
+    contract.goal ? `Goal: ${contract.goal}` : "Goal: not set yet; plan({ goal, done, assumptions }) sets it.",
+    contract.done && `Done means: ${contract.done}`,
+    contract.assumptions.length && `Assumptions: ${contract.assumptions.join("; ")}`,
+    contract.items.length ? `Items: ${progressLine(contract)}.` : "Items: none yet; plan({ add: { title, check } }) adds one.",
+    ...shown.map(i => `${i.id}. [${i.status}${i.weak ? ", check passed before the work" : ""}] ${i.title}`),
+    current && `Current: item ${current.id}; check: ${describeCheck(current.check)}${last ? `; last run: ${last.result}, ${last.evidence}` : ""}.`,
+    contract.notes.length && `Notes: ${contract.notes.length}.`,
+    open.length && `Open questions: ${open.map(q => q.text).join(" / ")}`,
+  ].filter(Boolean).join("\n");
+}
+
+// PLAN.md, written by the harness from the contract, for the user and for later chats on the project.
+function renderPlan(contract) {
+  const state = i => {
+    const e = lastEntry(contract, i);
+    return i.status === "done" ? "passed" : i.weak ? "check passed before the work" : e?.result === "fail" ? `failing: ${e.evidence}` : e?.result === "not run" ? "not run by the harness" : "open";
+  };
+  const lines = ["# Plan", "", "Kept by the harness from the agent's plan tool; edits here are overwritten.", ""];
+  if (contract.goal) lines.push(`Goal: ${contract.goal}`, "");
+  if (contract.done) lines.push(`Done means: ${contract.done}`, "");
+  if (contract.assumptions.length) lines.push("## Assumptions", ...contract.assumptions.map(a => `- ${a}`), "");
+  if (contract.items.length) lines.push("## Items", `${progressLine(contract)}.`, "",
+    ...contract.items.map(i => `- [${i.status === "done" ? "x" : " "}] ${i.id}. ${i.title}. Check: ${describeCheck(i.check)} (${state(i)})`), "");
+  if (contract.notes.length) lines.push("## Notes", ...contract.notes.map(n => `- ${n.text}${n.source ? ` (${n.source})` : ""}`), "");
+  if (contract.questions.length) lines.push("## Questions", ...contract.questions.map(q => `- ${q.text}${q.answer != null ? ` Answer: ${clip(q.answer, 300)}` : " (open)"}`), "");
+  if (contract.ledger.length) lines.push("## Ledger", ...contract.ledger.slice(-20).map(e => `- ${new Date(e.at).toISOString().slice(0, 16).replace("T", " ")} item ${e.itemId}: ${e.result}, ${e.evidence}`), "");
+  return lines.join("\n");
+}
+
+// The notes that bear on an item: those naming its file or a word of its title, else the latest.
+function relevantNotes(contract, item, most = 5) {
+  const words = item ? [item.check?.file, ...item.title.toLowerCase().split(/\W+/).filter(w => w.length > 4)].filter(Boolean) : [];
+  const near = contract.notes.filter(n => words.some(w => `${n.text} ${n.source}`.toLowerCase().includes(String(w).toLowerCase())));
+  return (near.length ? near : contract.notes).slice(-most);
+}
+
+// A test result the final reply claims and nothing in the chat shows, or null.
+// Why: "17 passed" with no report saying so was the commonest failure on swe.
+const COUNT_CLAIM = /(?<!\b(?:item|step|part|phase|version|v|of)\s?)\b(\d+)(?:\s*(?:\/|of)\s*\d+)?\s+(?:[a-z-]+\s+)?(?:(?:tests?|checks?|specs?)\s+)?(?:(?:all|now)\s+)?pass(?:ed|ing|es)?\b/i;
+const ALL_CLAIM = /(?<!\bnot\s)\b(?:all|every)\s+(?:of\s+)?(?:the\s+)?(?:\d+\s+)?(?:[a-z-]+\s+)?(?:tests?|checks?)\s+(?:now\s+)?pass|(?<!\bnot\s(?:all\s)?(?:the\s)?)\btests?\s+(?:all\s+|now\s+)*pass(?:es|ed|ing)?\b/i;
+function contradictedClaim(messages) {
+  const last = messages.at(-1);
+  if (last?.role !== "assistant") return null;
+  const said = (last.content ?? []).filter(c => typeof c?.text === "string").map(c => c.text).join("\n");
+  const count = COUNT_CLAIM.exec(said), all = !count && ALL_CLAIM.exec(said);
+  if (!count && !all) return null;
+  const report = messages.flatMap(m => (m.content ?? []).map(c => resultOf(c)?.report)).filter(r => r?.tests && !isScratch(r.path ?? "")).at(-1);
+  const texts = toolTexts(messages).map(t => t.text);
+  const ran = report && `the last run of ${report.path} shows ${summarizeReport(report)}`;
+  let fact = null;
+  if (count) {
+    const n = count[1], shown = new RegExp(`\\b${n}\\s+(?:[a-z-]+\\s+)?(?:tests?\\s+)?pass|\\bpass(?:ed|es|ing)?\\W{0,3}${n}\\b`);
+    if (report?.tests.passed !== +n && !texts.some(t => shown.test(t))) fact = ran || `no run report or tool result in this chat shows ${n} passing`;
+  } else if (report?.tests.failed) fact = ran;
+  else if (!report && !texts.some(t => /\bpass(?:ed|es|ing)?\b/.test(t))) fact = "no run report or tool result in this chat shows a test run";
+  return fact && `Your reply says "${clip((count ?? all)[0].trim(), 80)}", but ${fact}. Correct the reply, since the user reads it as checked.`;
+}
+
+function openItemsNote(contract, asked) {
+  const open = contract.items.filter(i => i.status !== "done" && runnable(i));
+  if (!open.length || asked) return null;
+  const [first] = open;
+  return `${itemsLabel(open.map(i => i.id))} ${open.length > 1 ? "are" : "is"} open, and the harness counts an item done only when its check passes. Continue with item ${first.id}, "${first.title}" (check: ${describeCheck(first.check)}), or say why the work stops here.`;
+}
+
+function doneNote(done, contract) {
+  const next = currentItem(contract), ids = done.map(i => i.id), so = done.length > 1 ? "they are" : "it is";
+  const head = `${itemsLabel(ids)}'s check${done.length > 1 ? "s" : ""} passed, so ${so} done (${progressLine(contract)}).`;
+  return next ? `${head} Next: item ${next.id}, "${next.title}"; its check: ${describeCheck(next.check)}.`
+    : `${head} Every item is done: compare the work with the goal, then report what was done and what wasn't.`;
+}
+
+function resummaryNote(contract) {
+  if (!contract.goal && !contract.items.length) return null;
+  const done = contract.items.filter(i => i.status === "done").map(i => i.id), current = currentItem(contract);
+  const notes = relevantNotes(contract, current).map(n => clip(n.text, 200) + (n.source ? ` (${n.source})` : "")).join("; ");
+  return [
+    "A summary replaced older messages; the contract still holds.",
+    contract.goal && `Goal: ${contract.goal.replace(/\.?$/, ".")}`,
+    contract.items.length && `Done: ${done.length ? `${done.length > 1 ? "items" : "item"} ${andList(done)}` : "nothing yet"}.`,
+    current ? `Current: item ${current.id}, "${current.title}"; check: ${describeCheck(current.check)}.` : contract.items.length && "Every item is done.",
+    notes && `Notes: ${notes}.`,
+  ].filter(Boolean).join(" ");
+}
+
+const GOAL_NOTE = "This is long work, so the harness keeps a contract for it that outlasts summaries. Before more work, state the goal in the user's words, your assumptions, and what done means with plan({ goal, assumptions, done }).";
+const ITEMS_NOTE = "The goal is set and the plan has no items. Add the steps with plan({ add: { title, check } }), each with a check the harness can run (test, probe, file or source), so it can tell when each one is done.";
+
+// Each rule: when it is read (at a step's results, when the model stops, after a summary), how often it may speak
+// (once a turn, at every event, or once between summaries), and what it says. A stop takes one note at a time. The
+// first six are the reminders the loop had before the director; their conditions are unchanged.
+const DIRECTOR_RULES = [
+  { id: "polished", at: "step", every: "turn", note: s => polishedTake(s.messages, s.start) },
+  // Past the size threshold with no goal. An agent without the plan tool is told to keep a plan file instead.
+  { id: "goal", at: "step", every: "turn", note: s => s.has("plan") ? s.sized && !s.contract.goal && GOAL_NOTE
+    : s.has("write_file") && s.ws && unplannedTask(s.messages, s.start, s.files, s.shown) },
+  { id: "items", at: "step", every: "turn", note: s => s.contract.goal && !s.contract.items.length && ITEMS_NOTE },
+  { id: "red", at: "step", every: "event", note: s => s.events.red.map(i => `Item ${i.id}'s check already passes before any work, so it can't show the item gets done. Change it with plan({ edit: ${i.id}, check }) to one that fails now and passes once the item is done.`) },
+  { id: "regressed", at: "step", every: "event", note: s => s.events.regressed.map(({ item, evidence }) => `Item ${item.id}'s check passed before and fails now (${evidence}), so the item is open again. A change since it passed broke it: fix that before going on.`) },
+  { id: "done", at: "step", every: "event", note: s => s.events.done.length && doneNote(s.events.done, s.contract) },
+  // A test's failures are in the run report already; the other kinds say nothing unless the harness does.
+  { id: "failed", at: "step", every: "event", note: s => s.events.failed.filter(({ item }) => item.check.kind !== "test").map(({ item, evidence }) => `Item ${item.id}'s check ran after this change and fails: ${evidence}.`) },
+  { id: "same", at: "step", every: "event", note: s => s.events.same.map(({ item, evidence }) => `Item ${item.id}'s check failed twice the same way (${evidence}), so the approach isn't working yet. Read the code and the error again before the next edit, or split the item with plan({ edit }) and plan({ add }).`) },
+  { id: "stalled", at: "step", every: "event", note: s => s.idle && s.idle % STALL_STEPS === 0 && s.current && runnable(s.current) && `No check has passed in ${s.idle} steps, and item ${s.current.id}, "${s.current.title}", is still open. Change the approach, split the item, or ask the user.` },
+  { id: "budget", at: "step", every: "summary", note: s => s.has("plan") && s.used >= s.summaryAt * NOTES_AT && `The context is at ${Math.round(s.used / 1000)}k tokens, near the ${Math.round(s.summaryAt / 1000)}k at which older messages are summarized and earlier tool results cleared. Write what you learned to notes now with plan({ note, source }), then keep working: the summary and the notes carry the work on.` },
+  { id: "silent", at: "stop", every: "turn", note: s => silentReply(s.messages) },
+  { id: "failing", at: "stop", every: "turn", note: s => failingReport(s.messages.slice(s.start)) },
+  { id: "untested", at: "stop", every: "turn", note: s => untestedChange(s.messages, s.start) },
+  { id: "unadopted", at: "stop", every: "turn", note: s => unadoptedVariants(s.messages, s.start) },
+  // Only after work: a turn that called no tool is an answer, and its words about tests are about tests in general.
+  { id: "claim", at: "stop", every: "turn", note: s => s.calls && contradictedClaim(s.messages) },
+  { id: "open", at: "stop", every: "turn", note: s => s.calls && openItemsNote(s.contract, s.asked) },
+  { id: "summary", at: "summary", every: "event", note: s => resummaryNote(s.contract) },
+];
+
+// One per run (a turn): the thread's contract, the rules, and what they have said. messages: the run's messages as
+// they stand. tools: the names of the tools the run has.
+async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = DIRECTOR_RULES } = {}) {
+  const thread = threadId != null ? await db.get("threads", threadId) : null;
+  const contract = { ...emptyContract(), ...structuredClone(thread?.contract ?? {}) };
+  const has = name => tools.includes(name);
+  const reminded = new Set(), seen = new Set();
+  let pending = [], idle = 0, asked = false, dirty = false, workspace = null;
+  let queue = Promise.resolve();
+  const serial = fn => { const p = queue.then(fn); queue = p.catch(() => {}); return p; };
+
+  // A new message from the user answers the questions left open.
+  const typed = !resume && messages()[start - 1]?.content?.find(c => typeof c?.text === "string" && !c.harness)?.text;
+  if (typed && contract.questions.some(q => q.answer == null)) {
+    for (const q of contract.questions) q.answer ??= clip(typed, 1000);
+    dirty = true;
+  }
+
+  async function save() {
+    if (!dirty) return;
+    dirty = false;
+    if (contract.ledger.length > LEDGER_KEPT) contract.ledger.splice(0, contract.ledger.length - LEDGER_KEPT);
+    if (threadId != null) {
+      // Read and written in one transaction, so a write to the thread beside it isn't undone.
+      const tx = db.transaction("threads", "readwrite");
+      const row = await tx.store.get(threadId);
+      if (row) await tx.store.put({ ...row, contract: structuredClone(contract) });
+      await tx.done;
+    }
+    const ws = workspace;
+    if (!ws?.commit || (!contract.goal && !contract.items.length)) return;
+    try {
+      ws.setContext?.({ threadId, agentId });
+      if (!ws.state.project) await ws.ensureProject({ agentId, threadId });
+      const text = renderPlan(contract);
+      if (ws.state.files["PLAN.md"] !== text) await ws.exclusive(() => ws.commit("PLAN.md", text, { source: "harness" }));
+    } catch (e) {
+      console.warn("PLAN.md was not written:", e);
+    }
+  }
+
+  // A check's run goes in the ledger and moves its item. after: why it ran (add, change, step, milestone).
+  function record(item, { result, evidence }, after, events) {
+    const before = lastEntry(contract, item), at = Date.now();
+    // A source check runs every step; only a new result is worth an entry.
+    if (after === "step" && before?.result === result && before.evidence === evidence) return;
+    const lastChange = contract.ledger.findLast(e => e.itemId === item.id && e.after === "change");
+    contract.ledger.push({ itemId: item.id, check: item.check, result, evidence, at, after });
+    dirty = true;
+    if (result === "not run" || after === "add") return;
+    if (result === "pass") {
+      if (item.status === "done" || item.weak) return;
+      item.status = "done";
+      item.history.push({ at, status: "done" });
+      events.done.push(item);
+    } else if (item.status === "done") {
+      item.status = "failing";
+      item.history.push({ at, status: "failing", why: "regression" });
+      events.regressed.push({ item, evidence });
+    } else if (after === "change") {
+      if (item.status !== "failing") item.history.push({ at, status: "failing" });
+      item.status = "failing";
+      const key = `${item.id}:${evidence}`;
+      if (lastChange?.result === "fail" && lastChange.evidence === evidence) { if (!seen.has(key)) events.same.push({ item, evidence }); seen.add(key); }
+      else events.failed.push({ item, evidence });
+    }
+  }
+
+  // Red first: a check runs once when it is set, and one that already passes is not a check of the work.
+  async function redFirst(item, env) {
+    const outcome = await runCheck(item.check, env);
+    record(item, outcome, "add", null);
+    if (outcome.result === "pass") { item.weak = true; pending.push(item); return `Its check already passes (${outcome.evidence}), so it can't show the item gets done: change it with plan({ edit: ${item.id}, check }).`; }
+    return outcome.result === "fail" ? `Its check fails now (${outcome.evidence}), as it should before the work.` : `Its check is ${outcome.evidence}.`;
+  }
+
+  function plan(input, context = {}) {
+    return serial(async () => {
+      if (!input || typeof input !== "object" || Array.isArray(input)) return { error: "plan takes an object: { goal }, { add }, { edit }, { note } or { ask }." };
+      workspace = context.workspace ?? workspace;
+      const env = { ws: workspace, messages: messages(), signal: context.signal };
+      const said = [];
+      const statusGiven = "status" in input || [input.add].flat().some(a => a && "status" in a) || (input.check && "status" in input.check);
+      if (statusGiven) said.push("Status is the harness's: an item is done when its check passes, so the status given was ignored.");
+      for (const key of ["goal", "done"]) if (typeof input[key] === "string" && input[key].trim()) { contract[key] = input[key].trim(); dirty = true; }
+      if (input.assumptions != null) { contract.assumptions = [input.assumptions].flat().map(String).map(a => a.trim()).filter(Boolean); dirty = true; }
+      for (const add of [input.add ?? []].flat()) {
+        const title = String(add?.title ?? "").trim();
+        const { check, error } = toCheck(add?.check);
+        if (!title || error) { said.push(`Not added: ${title ? `"${clip(title, 60)}" ${error}` : "an item needs a title and a check"}.`); continue; }
+        const item = { id: Math.max(0, ...contract.items.map(i => i.id)) + 1, title, check, status: "open", history: [{ at: Date.now(), status: "open", why: "added" }] };
+        contract.items.push(item);
+        dirty = true;
+        said.push(`Added item ${item.id}. ${runnable(item) ? await redFirst(item, env) : `Its check is ${(await runCheck(check, env)).evidence}.`}`);
+      }
+      if (input.edit != null) {
+        const item = contract.items.find(i => i.id === +input.edit);
+        if (!item) said.push(`There is no item ${input.edit}; the items are ${andList(contract.items.map(i => i.id)) || "none yet"}.`);
+        else {
+          if (typeof input.title === "string" && input.title.trim()) { item.title = input.title.trim(); dirty = true; }
+          if (input.check != null) {
+            const { check, error } = toCheck(input.check);
+            if (error) said.push(`Item ${item.id} kept its check: the new one ${error}.`);
+            else {
+              const at = Date.now();
+              contract.ledger.push({ itemId: item.id, check: item.check, result: "replaced", evidence: "the check was changed", at, after: "edit" });
+              item.history.push({ at, status: "open", why: "check changed", check: item.check });
+              Object.assign(item, { check, status: "open", weak: false });
+              dirty = true;
+              said.push(`Item ${item.id}'s check changed. ${runnable(item) ? await redFirst(item, env) : ""}`.trim());
+            }
+          }
+        }
+      }
+      if (typeof input.note === "string" && input.note.trim()) { contract.notes.push({ text: input.note.trim(), source: String(input.source ?? "").trim(), at: Date.now() }); dirty = true; }
+      if (typeof input.ask === "string" && input.ask.trim()) { contract.questions.push({ text: input.ask.trim() }); asked = true; dirty = true; }
+      await save();
+      return [...said, contractState(contract)].join("\n");
+    });
+  }
+
+  const stateFor = (messages, startAt, extra = {}) => {
+    const calls = messages.slice(startAt).flatMap(m => m.content ?? []).filter(c => c?.toolUse && c.toolUse.name !== "think").length;
+    const words = String(typed || "").split(/\s+/).filter(Boolean).length;
+    const usage = messages.findLast(m => m.role === "assistant" && m.usage)?.usage ?? {};
+    return {
+      messages, start: startAt, calls, contract, has, idle, asked: asked && contract.questions.some(q => q.answer == null), current: currentItem(contract),
+      sized: calls >= PLAN_AFTER || (words >= LONG_REQUEST && !/\?\s*$/.test(typed.trim())),
+      used: (usage.inputTokens || 0) + (usage.cacheReadInputTokens || 0) + (usage.cacheWriteInputTokens || 0),
+      summaryAt: modelInfo(modelId).context * COMPACT_AT,
+      events: { red: [], done: [], regressed: [], failed: [], same: [] },
+      ...extra,
+    };
+  };
+
+  function fire(at, s) {
+    const notes = [];
+    for (const rule of rules.filter(r => r.at === at)) {
+      if (rule.every !== "event" && reminded.has(rule.id)) continue;
+      const said = [rule.note(s)].flat().filter(Boolean);
+      if (!said.length) continue;
+      if (rule.every !== "event") reminded.add(rule.id);
+      notes.push(...said);
+      if (at === "stop") break;
+    }
+    return notes;
+  }
+
+  // After a step's results: run the checks the step bears on, then the rules. Returns the notes to append.
+  function step({ messages: all, start: startAt = start, ws = null, signal = null }) {
+    return serial(async () => {
+      workspace = ws ?? workspace;
+      const results = (all.at(-1)?.content ?? []).map(resultOf).filter(r => r && typeof r === "object");
+      const changed = new Set(results.filter(r => r.version != null && r.path).map(r => normalizePath(r.path)));
+      const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal };
+      const s = stateFor(all, startAt, { ws: workspace, files: Object.keys(workspace?.state?.files ?? {}), shown: workspace?.shownPath?.() ?? null });
+      s.events.red = pending.splice(0);
+      for (const item of contract.items.filter(i => i.status !== "done" && runnable(i))) {
+        if (item.check.kind === "source") record(item, await runCheck(item.check, env), "step", s.events);
+        else if ([...changed].some(p => watches(item.check, p))) record(item, await runCheck(item.check, env), "change", s.events);
+      }
+      // A milestone: every check that passed before runs again, and one that fails reopens its item.
+      if (s.events.done.length) for (const item of contract.items.filter(i => i.status === "done" && !s.events.done.includes(i)))
+        record(item, await runCheck(item.check, env), "milestone", s.events);
+      idle = s.events.done.length || !contract.items.some(i => i.status !== "done" && runnable(i)) ? 0 : idle + 1;
+      Object.assign(s, { idle, current: currentItem(contract) });
+      await save();
+      return fire("step", s);
+    });
+  }
+
+  return {
+    contract, plan, step,
+    // The note for a model that stopped, or null; one at a time, each once a turn.
+    stop: ({ messages: all, start: startAt = start }) => fire("stop", stateFor(all, startAt))[0] ?? null,
+    // The note after a summary ran: the contract, re-injected. The context-budget note may speak again.
+    summarized: () => { reminded.delete("budget"); return fire("summary", stateFor(messages(), start))[0] ?? null; },
+    save: () => serial(save),
+  };
+}
+
 // workspace: the run's workspace, or a function that finds it each turn, since the chat's project can open in
 // the panel or close there while the run goes on.
 // resume: pick up a run whose tab closed, from the last message it saved.
@@ -917,23 +1416,32 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   let parentId = lastMessageId;
   let streaming = null;
   const start = store.messages.length;
-  const reminded = new Set();
+  let director = null;
+  // The director's notes ride after the results, each a block of its own: the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
-    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor };
+    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director };
     const results = await getToolResults(store.messages.at(-1).content, toolMap, context);
-    // Reworking a chosen take is noticed while it happens, once per turn, since the turn may not end before the user's patience.
-    const polished = !reminded.has("polished") && polishedTake([...store.messages, results], start);
-    if (polished) { reminded.add("polished"); results.content.push({ text: polished, harness: true }); }
-    // A long turn without a plan is told so while it runs, once: its end may be too late for the plan to help.
-    const unplanned = ws && toolMap.write_file && !reminded.has("unplanned") && unplannedTask(store.messages, start, Object.keys(ws.state?.files ?? {}), ws.shownPath?.());
-    if (unplanned) { reminded.add("unplanned"); results.content.push({ text: unplanned, harness: true }); }
+    for (const text of await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal })) results.content.push({ text, harness: true });
     return push({ ...results, parentId: callsId, createdAt: Date.now() });
+  };
+  // A note for a message not yet sent goes on it, before the user's own words: the user's request stays last.
+  const amendLast = async text => {
+    const i = store.messages.length - 1, last = store.messages[i];
+    if (last?.role !== "user" || last.id == null) return;
+    const content = unwrap(last.content);
+    const typed = content.some(c => c?.toolResult) ? -1 : content.findIndex(c => typeof c?.text === "string" && !c.harness);
+    const at = typed < 0 ? content.length : typed;
+    const next = [...content.slice(0, at), { text, harness: true }, ...content.slice(at)];
+    setStore("messages", i, "content", next);
+    const row = await db.get("messages", last.id);
+    if (row?.threadId === params.threadId) await db.put("messages", { ...row, content: next });
   };
 
   try {
     // Resolved here so a missing key becomes an error reply instead of a stuck request.
     if (typeof client === "function") client = await client();
+    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume });
     const thread = await db.get("threads", params.threadId);
     let summary = thread?.summary ?? null;
     let memories = thread?.memories ?? null;
@@ -954,7 +1462,11 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
         setStore("activeLeafId", await push({ role: "assistant", content: [note], parentId, createdAt: Date.now() }));
         break;
       }
+      const before = summary;
       summary = await compactHistory(store, client, db, params.threadId, summary, memories, signal);
+      // Why: cheap models lose the thread after a summary; the goal and the current item come back with it.
+      const restated = summary !== before && director.summarized();
+      if (restated) await amendLast(restated);
       const request = { ...unwrap(store), summary, memories, messages: store.messages.map(({ id, role, modelId, content }) => ({ id, role, modelId, content: unwrap(content) })) };
       const output = await watchedSend(client, getConverseCommand(request), signal);
 
@@ -978,12 +1490,9 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
 
       // Calls run whatever the stop reason says: a stream can close without one, and an unanswered call ends the turn.
       if (!store.messages.at(-1).content.some(c => c?.toolUse)) {
-        // Stopping silent, on a failing report, on a change with no test, or with variants' work left on their branches
-        // gets one reminder each per turn; then the model's word stands.
-        const reminder = [["silent", () => silentReply(store.messages)], ["failing", () => failingReport(store.messages.slice(start))], ["untested", () => untestedChange(store.messages, start)], ["unadopted", () => unadoptedVariants(store.messages, start)]].find(([kind, note]) => !reminded.has(kind) && note());
-        if (!reminder) break;
-        reminded.add(reminder[0]);
-        const note = reminder[1]();
+        // Each stop rule speaks once a turn; then the model's word stands.
+        const note = director.stop({ messages: unwrap(store.messages), start });
+        if (!note) break;
         parentId = await push({ role: "user", content: [{ text: note, harness: true }], parentId, createdAt: Date.now() });
         continue;
       }
@@ -1025,7 +1534,7 @@ function getConverseCommand(config) {
   const model = modelInfo(config.modelId);
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
   const tools = config.tools.map(({ toolSpec }) => ({ toolSpec }));
-  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories });
+  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId });
   return {
     modelId: config.modelId,
     messages: prepareMessages(config.messages, { documents: model.documents, beside: model.beside, cache: model.cache, summary: config.summary, tail: config.tail, modelId: config.modelId }),
@@ -1066,6 +1575,13 @@ function prepareMessages(messages, { documents = true, beside = false, cache = f
         return { reasoningContent: { ...block.reasoningContent, reasoningText: { ...block.reasoningContent.reasoningText, text: "" } } };
       if (!block?.toolResult) return block;
       let parts = block.toolResult.content;
+      // The names of passing tests are for the harness's checks; the model has the counts.
+      if (parts.some(c => c.json?.result?.report?.tests?.passes)) parts = parts.map(c => {
+        const passes = c.json?.result?.report?.tests?.passes;
+        if (!passes) return c;
+        const { passes: _, ...tests } = c.json.result.report.tests;
+        return { ...c, json: { ...c.json, result: { ...c.json.result, report: { ...c.json.result.report, tests } } } };
+      });
       // Old images and documents are the bulk of a request; the model can view them again.
       if (i <= oldImages) parts = parts.map(c => (c.image ? { text: "[image omitted]" } : c.document ? { text: `[${c.document.name} omitted]` } : c));
       if (!documents) parts = parts.map(c => (c.document ? unread(c.document.name) : c));
@@ -3722,9 +4238,9 @@ if (inSharedWorker) {
 // #endregion
 
 export {
-  CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
-  PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, countLines, countRepeats,
-  createWorkspace, editFile, editor, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
+  CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
+  PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
+  countLines, countRepeats, createDirector, createWorkspace, describeCheck, editFile, editor, renderPlan, runCheck, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
   getConverseClient, getConverseCommand, getProxyConfig, getToolResults, initDB, inspectArgs, isHtml, isLocalHost,
   isPlanFile, isRenderable, isScratch, listHistory, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
   ownedTools, parseJSON, parsePatch, plainError, polishedTake, preflight, prepareMessages, processStreamChunk,

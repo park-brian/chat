@@ -204,7 +204,9 @@ export default [
     check: run => {
       const report = Object.entries(run.files ?? {}).find(([p]) => /^\/?report\.md$/i.test(p))?.[1] ?? "";
       const cited = urls(report), read = cited.filter(u => seen(run, u));
-      const plan = writes(run, /^(PLAN|SPEC)\.md$/i), saved = writes(run, /^report\.md$/i);
+      // A goal given to the plan tool is a plan too: the harness writes PLAN.md from it.
+      const planned = [writes(run, /^(PLAN|SPEC)\.md$/i), run.calls.findIndex(c => c.name === "plan" && c.input?.goal)].filter(i => i >= 0);
+      const plan = planned.length ? Math.min(...planned) : -1, saved = writes(run, /^report\.md$/i);
       const aspects = [/build/i, /templat/i, /island|hydrat|interactiv|component/i, /host|deploy/i, /communit|maintain|release|contributor/i].filter(re => re.test(report)).length;
       return [
         [report.length > 0, "saved report.md"],
