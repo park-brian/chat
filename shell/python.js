@@ -93,7 +93,7 @@ async function boot() {
   const { loadPyodide } = await import(PYODIDE + "pyodide.mjs");
   py = await loadPyodide({ indexURL: PYODIDE, env: { HOME: "/home/user", MPLBACKEND: "module://shell_mpl_backend" } });
   const td = new TextDecoder();
-  const writer = fd => ({ write: buf => { out[fd] += td.decode(buf, { stream: true }); return buf.length; } });
+  const writer = fd => ({ write: buf => { const text = td.decode(buf, { stream: true }); out[fd] += text; liveWrite(fd, text); return buf.length; } });
   py.setStdout(writer(1));
   py.setStderr(writer(2));
   py.FS.mkdirTree("/lib/shell");
@@ -196,6 +196,20 @@ async function quiet(fn) {
   finally { out[1] = out[1].slice(0, mark) + out[1].slice(mark).split("\n").filter(l => !NOISE.test(l)).join("\n"); }
 }
 
+// What the program prints as it runs, for the user's card (shell/host.js): Python holds the thread, so it goes out
+// by time, at most every 100 ms, as it writes. The result's own output replaces it.
+let liveId = null, liveAt = 0, liveOut = { 1: "", 2: "" };
+function liveWrite(fd, text) {
+  if (liveId == null) return;
+  liveOut[fd] += text;
+  if (performance.now() - liveAt >= 100) flushLive();
+}
+function flushLive() {
+  liveAt = performance.now();
+  if (liveOut[1] || liveOut[2]) postMessage({ id: liveId, progress: { ...(liveOut[1] && { stdout: liveOut[1] }), ...(liveOut[2] && { stderr: liveOut[2] }) } });
+  liveOut = { 1: "", 2: "" };
+}
+
 let queue = Promise.resolve();
 onmessage = ({ data }) => {
   queue = queue.then(() => handle(data));
@@ -211,6 +225,8 @@ async function handle({ id, job, reinstall = [] }) {
       await micropip.install.callKwargs(py.toPy(reinstall), { keep_going: true }).then(() => installed.push(...reinstall), () => {});
     }
     out = { 1: "", 2: "" };
+    liveId = id;
+    liveOut = { 1: "", 2: "" };
     syncIn(job.files, job.roots);
     let code = 0;
     if (job.op === "pip") code = await quiet(() => pip(job));
@@ -231,8 +247,10 @@ async function handle({ id, job, reinstall = [] }) {
       backend.shown.clear();
     }
     for (const [kind, p, bytes] of changed) if (kind === "f" && IMAGE.test(p) && bytes.length <= IMAGE_MAX) images.push({ format: p.split(".").pop().toLowerCase().replace("jpg", "jpeg"), bytes, name: p.split("/").pop().replace(/\.\w+$/, "") });
+    liveId = null;
     postMessage({ id, code, stdout: out[1], stderr: out[2], changed, images: images.slice(0, 4), installed: [...installed], bootMs, ms: Math.round(performance.now() - t0) });
   } catch (e) {
+    liveId = null;
     postMessage({ id, code: 1, stdout: out[1], stderr: out[2] + String(e?.message ?? e) + "\n", changed: [], images: [], bootMs });
   }
 }

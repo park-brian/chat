@@ -67,6 +67,23 @@ let store = null, project = 0, deadline = Infinity, outputs = 0;
 let images = [], opens = [];
 const remaining = () => Math.max(0, deadline - Date.now());
 
+// What a long command prints as it runs (node's and Python's output), for the card the user watches: sent to the tab
+// at most every 100 ms. Only a view: the result's own stdout and stderr, after pipes and redirects, replace it.
+const LIVE_MS = 100;
+let live = { stdout: "", stderr: "" }, liveTimer = null;
+export function liveOutput(fd, text) {
+  if (!text) return;
+  live[fd === 2 ? "stderr" : "stdout"] += text;
+  liveTimer ??= setTimeout(flushLive, LIVE_MS);
+}
+function flushLive() {
+  clearTimeout(liveTimer);
+  liveTimer = null;
+  const out = Object.fromEntries(Object.entries(live).filter(([, t]) => t));
+  live = { stdout: "", stderr: "" };
+  if (Object.keys(out).length) postMessage({ progress: out });
+}
+
 // --- calls to the tab: fetch (through the app's proxy rules) and python ------------------------------------------------
 let bridges = 0;
 const waiting = new Map();
@@ -137,7 +154,7 @@ export async function runNode(job, ctx) {
     const timer = setTimeout(() => { stderr += `node: killed after ${Math.round(timeout / 100) / 10} s (timeout)\n`; end(124); }, timeout);
     ctx.signal?.addEventListener("abort", () => { stderr += "node: stopped\n"; end(130); }, { once: true });
     s.worker.onmessage = async ({ data }) => {
-      if (data.type === "out") data.fd === 1 ? (stdout += data.text) : (stderr += data.text);
+      if (data.type === "out") { data.fd === 1 ? (stdout += data.text) : (stderr += data.text); liveOutput(data.fd, data.text); }
       else if (data.type === "exit") end(data.code, data.changed);
       else if (data.type === "fetch") {
         const value = await bridge("fetch", { request: data.request }).catch(e => ({ error: String(e?.message ?? e) }));
@@ -462,6 +479,9 @@ async function exec({ command, cwd = ROOT, env = null, delta = null, timeoutMs =
   try { r = await makeBash(timeoutMs).exec(command, { cwd, env: { ...env, PWD: cwd }, replaceEnv: true }); }
   catch (e) { r = result("", `bash: ${e?.message ?? e}\n`, 1); }
   const ms = Math.round(performance.now() - t0);
+  clearTimeout(liveTimer);
+  liveTimer = null;
+  live = { stdout: "", stderr: "" };
   const after = r.env ? { ...r.env } : { ...env, PWD: cwd };
   const { changed, kept } = await collect();
   const stdout = r.stdoutKind === "bytes" ? textOrBytes(bytesOf(r.stdout)).stdout : r.stdout;

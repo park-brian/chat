@@ -23,6 +23,7 @@ export function createShellHost({ fetch: fetchVia = fetch, dbName = "chat-shell"
       worker.onerror = e => { e.preventDefault?.(); const error = new Error(`The shell failed to start: ${e.message || "its script didn't load"}`); reject(error); kill(sh, error); };
       worker.onmessage = ({ data }) => {
         if (data.ready) return resolve();
+        if (data.progress) return sh.progress?.(data.progress);
         if ("bridge" in data) return answer(sh, data);
         const call = sh.calls.get(data.id);
         sh.calls.delete(data.id);
@@ -71,7 +72,11 @@ export function createShellHost({ fetch: fetchVia = fetch, dbName = "chat-shell"
     let p = pythons.get(projectId);
     if (p) return p;
     p = { worker: new Worker(PYTHON_WORKER, { type: "module" }), calls: new Map(), seq: 0, booted: false, timer: null, projectId };
-    p.worker.onmessage = ({ data }) => { p.calls.get(data.id)?.(data); p.calls.delete(data.id); };
+    p.worker.onmessage = ({ data }) => {
+      if (data.progress) return p.progress?.(data.progress);
+      p.calls.get(data.id)?.(data);
+      p.calls.delete(data.id);
+    };
     p.worker.onerror = e => { e.preventDefault?.(); for (const done of p.calls.values()) done({ code: 1, stdout: "", stderr: `python3: ${e.message || "Pyodide failed to load"}\n`, changed: [] }); killPython(p); };
     pythons.set(projectId, p);
     return p;
@@ -95,7 +100,9 @@ export function createShellHost({ fetch: fetchVia = fetch, dbName = "chat-shell"
         const secs = Math.round(timeoutMs / 100) / 10;
         killPython(p, { code: 124, stdout: "", stderr: `python3: killed after ${secs} s (timeout); Python starts again on the next command\n`, changed: [] });
       }, timeoutMs);
-      p.calls.set(id, value => { clearTimeout(timer); resolve(value); });
+      p.calls.set(id, value => { clearTimeout(timer); p.progress = null; resolve(value); });
+      // What it prints as it runs goes to the command's card, as node's does.
+      p.progress = sh.progress;
       sh.python = { p, id };
       p.worker.postMessage({ id, job, reinstall });
     });
@@ -107,7 +114,8 @@ export function createShellHost({ fetch: fetchVia = fetch, dbName = "chat-shell"
 
   // exec: { key, projectId, shellId, command, cwd, env, timeoutMs, delta, seed }. A shell the engine doesn't know
   // (none, or another than it last saw) needs the project's files: without seed, the answer is { unseeded: true }.
-  async function call(args, { signal } = {}) {
+  // progress({ stdout?, stderr? }): what the command prints as it runs, every 100 ms at most; the answer replaces it.
+  async function call(args, { signal, progress = null } = {}) {
     if (args.op === "restart") {
       const sh = shells.get(args.key);
       if (sh) kill(sh, new Error("The shell restarted."));
@@ -129,6 +137,7 @@ export function createShellHost({ fetch: fetchVia = fetch, dbName = "chat-shell"
       await request(sh, "seed", { files: args.seed, projectId: args.projectId, dbName });
     }
     const timeoutMs = args.timeoutMs ?? 60_000;
+    sh.progress = progress;
     const work = request(sh, "exec", { command: args.command, cwd: args.cwd, env: args.env, delta: args.delta, timeoutMs }).then(value => ({ value }), error => ({ error }));
     let timer, onAbort;
     const stopped = new Promise(resolve => {
@@ -137,6 +146,7 @@ export function createShellHost({ fetch: fetchVia = fetch, dbName = "chat-shell"
       signal?.addEventListener("abort", onAbort, { once: true });
     });
     const outcome = await Promise.race([work, stopped]);
+    sh.progress = null;
     clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
     const ms = Math.round(performance.now() - t0);

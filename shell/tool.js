@@ -88,7 +88,8 @@ export function createShellTool({ workspaceFor, runApp }) {
         heads = { ...journal, ...Object.fromEntries(Object.keys(extra).map(p => [p, "root"])) };
         files = { ...ws.state.files, ...extra };
       }
-      return host.shell(full ? { ...base, shellId: null, seed: textFiles(heads, files) } : { ...base, shellId: s.shellId, delta: deltaOf(s.known, heads, files) }, { signal: context.signal });
+      // context.progress: what the command prints as it runs, to the card the user watches (the engine's).
+      return host.shell(full ? { ...base, shellId: null, seed: textFiles(heads, files) } : { ...base, shellId: s.shellId, delta: deltaOf(s.known, heads, files) }, { signal: context.signal, progress: context.progress ?? null });
     };
     let reply;
     try {

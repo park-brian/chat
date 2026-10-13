@@ -202,6 +202,11 @@ function setSubagent(toolUseId, entry) {
   subagentListeners.forEach(fn => fn(toolUseId));
   return entry;
 }
+// What a running call has to show before its result (a command's output as it prints, a run's step), by its
+// toolUseId: reportProgress(toolUseId, { stdout?, stderr?, status? }). The engine sends it on as tool.progress.
+const progressListeners = new Set();
+const reportProgress = (toolUseId, update) => progressListeners.forEach(fn => fn(toolUseId, update));
+
 // The answer a tool result block carries.
 // One delivered later (subagents=async) rides a note of the director's channel, and counts as its task's result
 // once delivered (a capped copy is only the log's).
@@ -613,6 +618,26 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
   };
   subagentListeners.add(watchSubagents);
 
+  // A call's progress goes out every 100ms at most: the output printed since the last event, and the latest status.
+  // threadId: the run the call is in, for the tabs that show it (a sub-agent's call goes to its lead's chat).
+  const progress = new Map(); // toolUseId -> { stdout, stderr, status }
+  let progressTimer = null;
+  const PROGRESS_MS = 100;
+  const onProgress = (toolUseId, { stdout = "", stderr = "", status } = {}) => {
+    if (!toolUseId) return;
+    const p = progress.get(toolUseId) ?? { stdout: "", stderr: "" };
+    p.stdout += stdout;
+    p.stderr += stderr;
+    if (status !== undefined) p.status = status;
+    progress.set(toolUseId, p);
+    progressTimer ??= setTimeout(() => {
+      progressTimer = null;
+      for (const [toolUseId, p] of progress) emit({ type: "tool.progress", toolUseId, ...(p.stdout && { stdout: p.stdout }), ...(p.stderr && { stderr: p.stderr }), ...(p.status !== undefined && { status: p.status }) });
+      progress.clear();
+    }, PROGRESS_MS);
+  };
+  progressListeners.add(onProgress);
+
   let recovered = recover();
   async function recover() {
     for (const thread of await db.getAll("threads")) {
@@ -772,7 +797,7 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
     recover: () => (recovered = recovered.then(recover).catch(e => console.error(e))),
     stop: threadId => runs.get(threadId)?.controller.abort(),
     on: fn => { listeners.add(fn); return () => listeners.delete(fn); },
-    dispose: () => { for (const run of runs.values()) run.controller.abort(); listeners.clear(); subagentListeners.delete(watchSubagents); clearTimeout(subagentTimer); },
+    dispose: () => { for (const run of runs.values()) run.controller.abort(); listeners.clear(); subagentListeners.delete(watchSubagents); progressListeners.delete(onProgress); clearTimeout(subagentTimer); clearTimeout(progressTimer); },
   };
 }
 
@@ -807,7 +832,7 @@ function createWorkspaces(db, host) {
 // A call a tab took with it when it closed goes to the next.
 // Bump when a command, event, or host call changes. The worker's URL carries it and DB_VERSION, so a page of
 // another version gets a worker of its own; hello checks it too.
-const PROTOCOL = 5;
+const PROTOCOL = 6;
 let served = null;
 function serve(port) {
   const starting = served ??= startEngine();
@@ -845,7 +870,8 @@ async function startEngine() {
   }
   // A run's stop reaches the tab doing its work. The call leaves that tab's list first, so a tab that closes
   // meanwhile doesn't hand it on.
-  const ask = method => (args, { signal } = {}) => new Promise((resolve, reject) => {
+  // progress: the tab's reports on the call as it works (a command's output), before its answer.
+  const ask = method => (args, { signal, progress = null } = {}) => new Promise((resolve, reject) => {
     signal?.throwIfAborted();
     const cancel = () => {
       call.tab?.calls.delete(call.id);
@@ -853,7 +879,7 @@ async function startEngine() {
       reject(signal.reason);
     };
     const settle = fn => value => { signal?.removeEventListener("abort", cancel); fn(value); };
-    const call = { id: ++calls, method, args, threadId: args.threadId, resolve: settle(resolve), reject: settle(reject), tab: null };
+    const call = { id: ++calls, method, args, threadId: args.threadId, resolve: settle(resolve), reject: settle(reject), progress, tab: null };
     signal?.addEventListener("abort", cancel, { once: true });
     dispatch(call);
   });
@@ -900,6 +926,8 @@ async function startEngine() {
       } else if (data.type === "view") {
         // A view or an answer before hello has no tab to go to.
         if (tab) Object.assign(tab, { visible: data.visible, threadId: data.threadId });
+      } else if (data.type === "progress") {
+        tab?.calls.get(data.id)?.progress?.(data.value);
       } else if (data.type === "answer") {
         const call = tab?.calls.get(data.id);
         tab?.calls.delete(data.id);
@@ -2948,7 +2976,7 @@ async function getToolResults(toolUseContent, tools, context = {}) {
           const fn = Object.hasOwn(tools ?? {}, name) ? tools[name] : null;
           if (!fn) return { toolResult: { toolUseId, content: [{ json: { result: { error: `Unknown tool: ${name}` } } }] } };
           // Pass toolUseId in context for task tool to use
-          const output = await fn(input, { ...context, toolUseId });
+          const output = await fn(input, { ...context, toolUseId, progress: update => reportProgress(toolUseId, update) });
           if (!output?.__media) return { toolResult: { toolUseId, content: [{ json: { result: output } }] } };
           const { __media: media, ...result } = output;
           // A file with a label (a full page's "page 2 of 4") comes after it, so the model reads which one it sees.
@@ -3389,27 +3417,28 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   // announce: tell the other workspaces on the project, for a run the engine asked for.
   // signal: a run its caller stopped doesn't start, or stops where it is.
   // tests: { files, path }, test files to run as `node --test` would (see testFiles), reported as path.
-  function run({ versionId = null, script = null, screenshot = false, full = false, viewport = null, announce = false, signal = null, tests = null } = {}) {
-    if (host) return hostRun({ versionId, script, screenshot, full, viewport, tests }, signal);
+  // progress({ status }): the run's steps as it goes, for the card of the call that asked for it.
+  function run({ versionId = null, script = null, screenshot = false, full = false, viewport = null, announce = false, signal = null, tests = null, progress = null } = {}) {
+    if (host) return hostRun({ versionId, script, screenshot, full, viewport, tests }, signal, progress);
     if (viewport) setState("viewport", viewport);
     return enqueueRun(async () => {
       signal?.throwIfAborted();
       if (tests) return runTests(tests, signal);
-      const result = await runNow({ versionId, script, screenshot, full, signal });
+      const result = await runNow({ versionId, script, screenshot, full, signal, progress });
       if (announce) channel.postMessage({ projectId: state.project.id, ran: true });
       return result;
     });
   }
 
-  async function hostRun(args, signal) {
+  async function hostRun(args, signal, progress = null) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
-    if (args.tests) return host.run({ tests: args.tests, path: null, projectId: project.id, branch, threadId: context.threadId ?? null, agentId: context.agentId ?? null }, { signal });
+    if (args.tests) return host.run({ tests: args.tests, path: null, projectId: project.id, branch, threadId: context.threadId ?? null, agentId: context.agentId ?? null }, { signal, progress });
     const shown = shownPath(project);
     const versionId = args.versionId ?? (shown && project.heads[shown]);
     if (!versionId) throw new Error("Nothing to show yet. Create an artifact with write_file.");
     const path = (await db.get("versions", +versionId))?.path ?? null;
-    const result = await host.run({ ...args, versionId: +versionId, path, projectId: project.id, branch, threadId: context.threadId ?? null, agentId: context.agentId ?? null }, { signal });
+    const result = await host.run({ ...args, versionId: +versionId, path, projectId: project.id, branch, threadId: context.threadId ?? null, agentId: context.agentId ?? null }, { signal, progress });
     if (state.project?.id === project.id && project.heads[path] === +versionId && !isScratch(path)) setState("report", { ...result.report });
     return result;
   }
@@ -3417,7 +3446,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   const refresh = () => run().catch(e => e.closed || notify(e.message));
 
   // The runner answers with the report; the version keeps it, as the shown artifact's latest.
-  async function runNow({ versionId, script, screenshot, full, signal }) {
+  async function runNow({ versionId, script, screenshot, full, signal, progress = null }) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
     const shown = shownPath(project);
@@ -3437,7 +3466,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     if (missing.length) return { report: { version: version.id, path: version.path, ok: false, errors: missing, notes: ["Not run: the page loads files the workspace doesn't have."] } };
     setState({ running: true, ...(!scratch && { logs: [], preview: isHead ? null : { versionId: version.id, path: version.path, text: content } }) });
     try {
-      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, full, parked: scratch, signal });
+      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, full, parked: scratch, signal, progress });
       if (!scratch) setState("runLog", runLog);
       if (isHead) {
         const stored = { ...report, thumb: thumb || version.report?.thumb || null };
@@ -4599,13 +4628,18 @@ async function runApp({ path, version, viewport, script, screenshot = true, full
     const known = ws.root ? { ...Object.fromEntries((await ws.listFiles()).map(p => [p, true])), ...ws.state.project.heads } : ws.state.project.heads;
     const tests = path && version == null && !isHtml(path) ? testFiles(path, known) : null;
     if (tests && !tests.length) return { error: `No test files in ${normalizePath(path) || "the project"}: a folder runs its *.test.js, *.test.mjs and test*.js files. Name a file to run another.` };
-    if (tests) return { report: (await ws.run({ tests: { files: tests, path: normalizePath(path) }, signal: context.signal })).report };
+    const progress = context.progress ?? null;
+    if (tests) {
+      progress?.({ status: `running ${tests.length} test file${tests.length === 1 ? "" : "s"}…` });
+      return { report: (await ws.run({ tests: { files: tests, path: normalizePath(path) }, signal: context.signal, progress })).report };
+    }
     // A version names its own file, a variant's on its branch too; path picks the current one. A root's file the
     // journal doesn't hold yet comes in as the root has it.
     let head = path && version == null && ws.state.project.heads[normalizePath(path)];
     if (path && version == null && !head && ws.root?.has(normalizePath(path))) head = (await ws.adopt(normalizePath(path)))?.id;
     if (path && version == null && !head) return { error: await missingFile(ws, normalizePath(path), context) };
-    const { report, image } = await ws.run({ versionId: version ?? head ?? null, script: script || null, screenshot, full: full === true, viewport, signal: context.signal });
+    progress?.({ status: "loading the page…" });
+    const { report, image } = await ws.run({ versionId: version ?? head ?? null, script: script || null, screenshot, full: full === true, viewport, signal: context.signal, progress });
     return withMedia({ report }, ...[image].flat());
   });
 }
