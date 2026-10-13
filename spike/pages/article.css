@@ -1,0 +1,3 @@
+/* A linked sheet with a url() the DOM-to-image methods must inline. */
+.pull { font-style: italic; color: #634; background-image: url("../img/texture.svg"); background-size: 40px 40px; }
+h2 { color: #345; border-bottom: 2px solid #ddd; }

@@ -162,6 +162,12 @@ async function run(config = options(process.argv.slice(2))) {
             endpoint: "http://localhost:" + proxy.address().port,
           }),
         );
+      // --net: the page's GitHub test reads with GITHUB_PAT from .env when there is one (it only reads).
+      if (config.net) {
+        try { process.loadEnvFile(path.join(repository, ".env")); } catch {}
+        if (process.env.GITHUB_PAT)
+          await page.addInitScript((token) => { if (window === top) window.__GITHUB_PAT__ = token; }, process.env.GITHUB_PAT);
+      }
       const errors = [];
       page.on("console", (message) => {
         console.log(message.text());
@@ -239,8 +245,9 @@ async function run(config = options(process.argv.slice(2))) {
           );
           continue;
         }
-        // index.html's suite takes about two minutes on this machine; the limit is for a suite that hangs.
-        await page.waitForFunction(() => window.TESTS_DONE, null, { timeout: 180000 });
+        // index.html's suite takes about two and a half minutes on this machine (the shell's tests, Python's first boot
+        // among them, take about 50 s); the limit is for a suite that hangs.
+        await page.waitForFunction(() => window.TESTS_DONE, null, { timeout: 300000 });
         const result = await page.evaluate(() => window.TESTS_DONE);
         if (
           typeof result !== "object" ||
@@ -284,8 +291,8 @@ async function run(config = options(process.argv.slice(2))) {
           },
         );
         console.log(report);
-        // The engine a page imports, and the prompts it imports, are covered by the same tests.
-        for (const module of ["engine.js", "prompts.js"]) {
+        // The engine a page imports, the prompts it imports, and its capture module are covered by the same tests.
+        for (const module of ["engine.js", "prompts.js", "envelope.js", "snapshot.js"]) {
           const moduleEntry = coverage.find((item) =>
             isCoverageEntryForTarget(item, new URL(module, pageUrl)),
           );

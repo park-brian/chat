@@ -14,6 +14,7 @@ import TASKS from "./evals/tasks.js";
 import { judge, judgedChecks } from "./evals/judge.js";
 import { mannered } from "./evals/style.js";
 import { simulate } from "./evals/user.js";
+import { steeredCounts } from "./envelope.js";
 
 const MODELS = {
   fable: "global.anthropic.claude-fable-5-1",
@@ -43,7 +44,7 @@ const LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
 // Feature flags, so an ablation needs no code change: the app reads them from localStorage "harness-flags" (engine.js
 // flag()). Each is a no-op at its default; rule.<id>=off silences one rule of engine.js's rule tables.
-export const FLAGS = { director: ["on", "off"], effort: LEVELS, "plan.where": ["inject", "prompt"], noProjectError: ["new", "old"], context: "tokens", subagents: ["blocking", "async"] };
+export const FLAGS = { director: ["on", "off"], effort: LEVELS, "plan.where": ["inject", "prompt"], noProjectError: ["new", "old"], context: "tokens", subagents: ["blocking", "async"], envelope: ["xml", "plain"], metadata: ["minimal", "rich"] };
 // The rule ids, read from engine.js's tables ({ id: "...", at: ... }), so a new rule needs no change here.
 export const ruleIds = (source = readFileSync(path.join(root, "engine.js"), "utf8")) => [...new Set([...source.matchAll(/\{ id: "([\w-]+)", at: "/g)].map(m => m[1]))];
 export function parseFlags(text, rules = null) {
@@ -245,7 +246,7 @@ async function send(page, text, modelId, reasoning, timeout = TURN_TIMEOUT) {
   await loading("false");
 }
 
-function metrics(messages, subagents, ms, forkTurns = []) {
+export function metrics(messages, subagents, ms, forkTurns = []) {
   const forkUsage = forkTurns.map(m => m.usage).filter(Boolean);
   const forkSum = key => forkUsage.reduce((total, u) => total + (u[key] || 0), 0);
   const forkInput = forkSum("inputTokens") + forkSum("cacheReadInputTokens") + forkSum("cacheWriteInputTokens");
@@ -283,11 +284,14 @@ function metrics(messages, subagents, ms, forkTurns = []) {
     variants: calls.filter(c => c.name === "task" && c.input?.type === "variant").length,
     forkCacheHit: forkInput ? +(forkSum("cacheReadInputTokens") / forkInput).toFixed(2) : 0,
     seconds: Math.round(ms / 1000),
+    // The director's notes by rule (envelope.js steer): delivered, and capped (logged, not sent).
+    steered: steeredCounts(messages).delivered,
+    capped: steeredCounts(messages).capped,
   };
 }
 
 // A readable transcript: text, reasoning, calls, and reports; screenshots saved beside it.
-async function transcript(messages, dir) {
+export async function transcript(messages, dir) {
   const out = [];
   let shot = 0;
   const clip = (s, n = 1500) => (s.length > n ? s.slice(0, n) + ` …(${s.length} chars)` : s);
@@ -295,6 +299,9 @@ async function transcript(messages, dir) {
     out.push(`\n## ${m.role}${m.usage ? ` · in ${m.usage.inputTokens + (m.usage.cacheReadInputTokens || 0) + (m.usage.cacheWriteInputTokens || 0)} (cached ${m.usage.cacheReadInputTokens || 0}) out ${m.usage.outputTokens}` : ""}\n`);
     for (const b of m.content) {
       if (b.text) out.push(b.harness ? "```\n" + clip(b.text, 800) + "\n```" : b.text);
+      // What the harness told the model: the message's metadata, and each note with its rule, step, and whether it went.
+      if (b.metadata) out.push("```metadata\n" + clip(Object.entries(b.metadata).map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n"), 800) + "\n```");
+      if (b.instruction) out.push(`> **director** \`${b.instruction.rule}\` step ${b.instruction.step ?? "-"}, ${b.instruction.status}: ${clip(b.instruction.text, 800)}`);
       if (b.reasoningContent?.reasoningText?.text) out.push("> " + clip(b.reasoningContent.reasoningText.text, 1200).replaceAll("\n", "\n> "));
       if (b.toolUse) out.push(`**→ ${b.toolUse.name}** \`${b.toolUse.toolUseId.slice(-6)}\`\n\`\`\`json\n${clip(JSON.stringify(b.toolUse.input, null, 1), 3000)}\n\`\`\``);
       if (b.image) out.push(`[attached image]`);
@@ -303,7 +310,7 @@ async function transcript(messages, dir) {
           const file = `shot-${++shot}.${c.image.format}`;
           await writeFile(path.join(dir, file), Buffer.from(c.image.source.bytes.base64, "base64"));
           out.push(`![screenshot](${file})`);
-        } else out.push(`**← ${b.toolResult.toolUseId.slice(-6)}**\n\`\`\`json\n${clip(JSON.stringify(c.json ?? c.text, null, 1), 2500)}\n\`\`\``);
+        } else out.push(`**← ${b.toolResult.toolUseId.slice(-6)}**${b.timing ? ` ${b.timing.started}–${b.timing.ended}, ${b.timing.ms} ms` : ""}\n\`\`\`json\n${clip(JSON.stringify(c.json ?? c.text, null, 1), 2500)}\n\`\`\``);
       }
     }
   }
@@ -328,6 +335,7 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       "aws-config": JSON.stringify({ region: process.env.AWS_REGION || "us-east-1", credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY, ...(process.env.AWS_SESSION_TOKEN && { sessionToken: process.env.AWS_SESSION_TOKEN }) } }),
       "google-config": JSON.stringify({ apiKey: process.env.GEMINI_API_KEY }),
       "brave-config": JSON.stringify({ apiKey: process.env.BRAVE_SEARCH_API_KEY }),
+      "github-config": JSON.stringify({ token: process.env.GITHUB_PAT }),
       "proxy-config": JSON.stringify({ endpoint: proxyUrl }),
       "harness-flags": JSON.stringify(flags),
     });
@@ -507,7 +515,7 @@ async function main() {
   const persona = o.system && (await readFile(o.system, "utf8"));
   // The page and its own modules, read once; a module that doesn't exist yet is left to the server.
   const app = {};
-  for (const file of ["index.html", "engine.js", "prompts.js"]) {
+  for (const file of ["index.html", "engine.js", "prompts.js", "envelope.js", "projects.js", "snapshot.js", "node-test.js", ...["tool", "host", "worker", "node", "python", "npm", "git", "project-git", "archive", "store"].map(f => `shell/${f}.js`)]) {
     const text = await readFile(path.join(root, file), "utf8").catch(e => (e.code === "ENOENT" ? null : Promise.reject(e)));
     if (text !== null) app["/" + file] = [file.endsWith(".html") ? "text/html; charset=utf-8" : "text/javascript; charset=utf-8", text];
   }

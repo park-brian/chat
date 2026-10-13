@@ -5,9 +5,18 @@
 // #region 1. IMPORTS & DEFINITIONS
 import {
   DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FETCH_DIRECT, FETCH_PROXIED, FORK_BRIEF, FRONTEND_SKILL,
-  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SUMMARY_PROMPT,
-  TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
+  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
+  SUMMARY_PROMPT, TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
+import {
+  STOP_MAX, STEER_MAX, delivered, envelopeGuide, isoLocal, localDate, note, renderTurn, sameClient, steer, timing,
+} from "./envelope.js";
+import {
+  MemoryObserver, connectGitHub, createFolderRoot, createGitHubRoot, isBinaryPath, isMemoryDirectory, liveHandle, storableHandle,
+} from "./projects.js";
+import { BASH_TOOL_SPEC, createShellTool } from "./shell/tool.js";
+// The tab's half, for index.html: it loads only this file.
+export { createShellHost } from "./shell/host.js";
 
 // A SharedWorker's console is its own; what the engine logs, and what it throws, goes to the tabs' consoles too. The
 // first tab connects while the imports below are still loading: its port waits for the engine.
@@ -29,7 +38,7 @@ if (inSharedWorker) {
 // stylesheets name the same URLs; its tests hold them to this table.
 const CDN = Object.fromEntries(Object.entries({
   "@aws-sdk/client-bedrock-runtime": "3.1149.0", "@google/genai": "1.52.0", "@mozilla/readability": "0.6.0", acorn: "8.19.0",
-  bootstrap: "5.3.8", "bootstrap-icons": "1.13.2", diff: "5.2.2", dompurify: "3.4.16", idb: "8.0.4", mammoth: "1.13.0",
+  bootstrap: "5.3.8", "bootstrap-icons": "1.13.2", diff: "5.2.2", dompurify: "3.4.16", idb: "8.0.4", "isomorphic-git": "1.44.2", mammoth: "1.13.0",
   marked: "15.0.12", "modern-screenshot": "4.7.0", "pdfjs-dist": "6.3.289", "solid-js": "1.9.17", tcpipe: "1.0.0",
   turndown: "7.2.4", "turndown-plugin-gfm": "1.0.2",
 }).map(([name, version]) => [name, `https://cdn.jsdelivr.net/npm/${name}@${version}`]));
@@ -53,23 +62,28 @@ const [{ openDB }, { createTwoFilesPatch, diffLines }, { createStore, produce, r
 // A prompt's {name} placeholders, filled. Values go in as they are: none is read as a replacement pattern.
 const fill = (template, values) => template.replace(/\{(\w+)\}/g, (match, name) => values[name] ?? match);
 
-// Assembled per request: the agent's own prompt and memories, then how this harness works, for the tools it has.
-// The date is the day the request is built, so the cached prefix changes once a day.
-function systemPrompt(persona, { tools = [], memories = null, modelId = null } = {}) {
+// Assembled per request, and the same for the whole conversation: the agent's own prompt and memories, then how
+// this harness works, for the tools it has. started: the day the conversation began (the thread's, taken once, like
+// its memories), so the cached prefix never changes; a later day travels in each message's timestamp
+// (docs/specs/2026-10-13-envelope.md). Haiku answers a changed system prompt with thinking sent back with a 400.
+function systemPrompt(persona, { tools = [], memories = null, modelId = null, started = null } = {}) {
+  const changes = flag("envelope", "xml") === "xml" ? "<changes> block" : "<workspace> block";
   const guide = TOOL_DOCUMENTATION.split(/\n(?=### )/).filter(part => !part.startsWith("### ") || tools.includes(part.match(/^### (\w+)/)[1]))
     // subagents=async: the task section says how results come back.
     .map(part => part.startsWith("### task") && flag("subagents") === "async" ? part.trimEnd() + "\n" + TASK_ASYNC : part);
-  const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && HARNESS_DOCUMENTATION;
+  const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && fill(HARNESS_DOCUMENTATION, { changes });
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
   const cutoff = MODELS.find(m => m.id === modelId)?.cutoff;
   const environment = fill(ENVIRONMENT, {
     fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT,
-    today: new Date().toLocaleDateString("en-CA"),
+    started: started ?? localDate(Date.now()),
     cutoff: cutoff ? ` What you know comes from data up to ${cutoff}.` : "",
+    shell: tools.includes("bash") ? SHELL_PRESENT : SHELL_ABSENT,
   });
-  const working = WORKING + (planInPrompt(tools) ?? "");
-  return [persona, memories, environment, working, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
+  const working = fill(WORKING, { changes }) + (planInPrompt(tools) ?? "");
+  const envelope = envelopeGuide({ envelope: flag("envelope", "xml"), metadata: flag("metadata", "minimal") });
+  return [persona, memories, environment, envelope, working, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
 }
 
 // /memories/ as the conversation found it. Taken once per thread: the prompt stays byte-stable for the cache,
@@ -93,20 +107,23 @@ const PATCH_FORMAT = "<<<<<<< SEARCH\nexact lines from the file\n=======\nthe li
 const SEARCH_MARK = /^\s*<{5,9}\s*(SEARCH)?\s*$/i, DIVIDER_MARK = /^\s*={5,9}\s*$/, REPLACE_MARK = /^\s*>{5,9}\s*(REPLACE)?\s*(ALL)?\s*$/i;
 
 // Tools every agent gets, independent of its saved tool list.
-const WORKSPACE_TOOL_NAMES = ["view_file", "edit_file", "write_file", "run_app", "history", "diff", "restore"];
+const WORKSPACE_TOOL_NAMES = ["view_file", "edit_file", "write_file", "run_app", "bash", "history", "diff", "restore"];
 // A fork reads and reports; changes and further sub-agents stay with the caller.
 const FORK_REFUSES = ["task", "edit_file", "write_file", "restore"];
 const VARIANT_REFUSES = ["task"];
 const PATH_PROPERTY = { type: "string", description: "File path, e.g. index.html, notes.md, logo.svg. Defaults to the shown artifact." };
 const SCREENSHOT_PROPERTY = { type: "boolean", description: "true forces a screenshot, false skips it. By default one is attached when the user lets you see the page and it changed." };
-// The harness runs test, probe, file and source checks itself; the other kinds are named so a plan can hold them.
-const CHECK_KINDS = ["test", "probe", "file", "source", "compute", "consistency", "judge", "user"];
-const HARNESS_CHECKS = ["test", "probe", "file", "source"];
+// The harness runs test, probe, file, source and command checks itself; the other kinds are named so a plan can hold them.
+const CHECK_KINDS = ["test", "probe", "file", "source", "command", "compute", "consistency", "judge", "user"];
+const HARNESS_CHECKS = ["test", "probe", "file", "source", "command"];
 const CHECK_SCHEMA = {
   type: "object",
   description: "How the harness tells the item is done",
   properties: {
-    kind: { type: "string", enum: CHECK_KINDS, description: "test, probe, file and source are run by the harness" },
+    kind: { type: "string", enum: CHECK_KINDS, description: "test, probe, file, source and command are run by the harness" },
+    run: { type: "string", description: "command: the bash command to run from /project, e.g. npm test" },
+    exit: { type: "integer", description: "command: the exit code it must return (default 0)" },
+    stdout: { type: "string", description: "command: text its output must contain" },
     file: { type: "string", description: "test, probe: the page to run (default: the shown one), or a test file it runs. file: the file to check" },
     name: { type: "string", description: "test: the name of a test that must be among those passing" },
     script: { type: "string", description: "probe: JS run in the page after it settles, true when the item is done, e.g. return app.items().length === 3" },
@@ -185,8 +202,10 @@ function setSubagent(toolUseId, entry) {
   return entry;
 }
 // The answer a tool result block carries.
-// One delivered later (subagents=async) rides a harness block of its own, and counts as its task's result.
-const resultOf = block => block?.toolResult?.content?.[0]?.json?.result ?? block?.subagent?.result;
+// One delivered later (subagents=async) rides a note of the director's channel, and counts as its task's result
+// once delivered (a capped copy is only the log's).
+const resultOf = block => block?.toolResult?.content?.[0]?.json?.result
+  ?? (block?.instruction?.status === "delivered" ? block.instruction.data?.subagent?.result : undefined);
 
 const TOOLS = [
   {
@@ -436,7 +455,7 @@ Examples:
     fn: runApp,
     toolSpec: {
       name: "run_app",
-      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included. There is no Node.js, npm or shell here: on a test file or folder (test/index.test.js, test/), it runs the tests as node --test would (node:test, node:assert and the common runners work) and returns pass and fail counts.",
+      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included. The screenshot shows the viewport, one screen; full: true returns the whole page, top to bottom, as pages (each up to two screens tall, labelled page N of M). A page taller than the screen is fine: look at it with full: true rather than changing its layout to fit one screen. On a test file or folder (test/index.test.js, test/), it runs the tests as node --test would (node:test, node:assert and the common runners work) and returns pass and fail counts.",
       inputSchema: {
         json: {
           type: "object",
@@ -445,12 +464,15 @@ Examples:
             version: { type: "integer", description: "Version id to run instead of the current file, such as one a variant returned" },
             viewport: { type: "string", enum: ["fit", "desktop", "tablet", "mobile"], description: "Preview size. Wider than a phone, the screenshot has a phone's width beside it" },
             script: { type: "string", description: "Async function body run in the app page, e.g. document.querySelector('button').click(); return document.title" },
-            screenshot: { type: "boolean", description: "Attach a screenshot (default true; approximate when the user has not shared the tab)" },
+            screenshot: { type: "boolean", description: "Attach a screenshot of the viewport, what fits on one screen (default true; approximate when the user has not shared the tab)" },
+            full: { type: "boolean", description: "Attach the whole page instead, scrolled top to bottom, as labelled pages up to two screens tall each" },
           },
         },
       },
     },
   },
+  // The shell runs in a tab (shell/host.js); shell/tool.js keeps the sessions and commits what commands change.
+  { fn: (input, context) => shellTool.bash(input, context), toolSpec: BASH_TOOL_SPEC },
   {
     fn: listHistory,
     toolSpec: {
@@ -502,15 +524,19 @@ Examples:
   },
 ];
 
+const shellTool = createShellTool({ workspaceFor: (...a) => workspaceFor(...a), runApp: (...a) => runApp(...a) });
+
 // A copy of this app run as an artifact (the chat, worked on in the chat) keeps a database of its own: its tests
 // would otherwise write over the chats of the app it runs in.
 const DB_NAME = /\/__ws\//.test(globalThis.location?.pathname ?? "") ? "chat-workspace" : "chat";
+// The shell's own store, beside it: node_modules, .git, binary files (shell/store.js).
+const SHELL_DB = DB_NAME + "-shell";
 
 // One schema, no migrations: a database made by any other version starts over empty.
 // blocking: a newer version wants to upgrade; the owner lets go of its work, then this connection closes.
 // blocked: an older version still holds the database open.
 const SCHEMA = { agents: [], threads: ["agentId"], messages: ["agentId", "threadId"], resources: ["agentId", "threadId"], projects: [], versions: ["projectId"] };
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 async function initDB({ blocking = () => {}, blocked = () => {} } = {}) {
   const db = await openDB(DB_NAME, DB_VERSION, {
     upgrade(db) {
@@ -520,6 +546,8 @@ async function initDB({ blocking = () => {}, blocked = () => {} } = {}) {
         for (const index of indexes) store.createIndex(index, index);
       }
       db.createObjectStore("blobs", { keyPath: "hash" });
+      // A root project's files as the harness first read them, before the journal holds them: { key: "projectId:path", hash }.
+      db.createObjectStore("reads", { keyPath: "key" });
     },
     blocked,
     blocking() { blocking(); db.close(); blobCache.clear(); },
@@ -666,7 +694,8 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
 
   // Starts a run and answers once its user message is saved: { threadId, done }, or null while that chat runs.
   // leafId is the message the reply follows; forkFromId, a message to retry or edit, which then branches.
-  async function send({ agentId = 1, threadId = null, projectId = null, leafId = null, forkFromId = null, text, files = [], modelId, reasoningMode, liveErrors = [] }) {
+  // client: the page's screen and locale ({ device, viewport, tz, locale }), announced to the model when it changes.
+  async function send({ agentId = 1, threadId = null, projectId = null, leafId = null, forkFromId = null, text, files = [], modelId, reasoningMode, liveErrors = [], client: screen = null }) {
     await recovered;
     if (threadId && runs.has(threadId)) return null;
     const name = text.trim().replace(/\s+/g, " ").slice(0, 60) || "Untitled";
@@ -690,8 +719,12 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
       const notice = await ws?.describeChanges(parentHeads, liveErrors);
       // A retry or edit keeps the original's attachments.
       const kept = forked ? forked.content.filter(c => c.image || c.document) : [];
+      const keptFiles = forked?.content.find(c => c.metadata)?.metadata.attachments ?? [];
       const [typed, ...attached] = await getMessageContent(text, files);
-      const content = [...(notice ? [{ text: notice, harness: true }] : []), typed, ...kept, ...attached];
+      const thread = await db.get("threads", threadId);
+      const metadata = userMetadata({ thread, client: screen, files, kept: keptFiles, changes: notice, ws });
+      if (metadata.client) await db.put("threads", { ...thread, client: metadata.client });
+      const content = [typed, ...kept, ...attached, { metadata }];
       const userMessage = { role: "user", content, parentId, createdAt: Date.now() };
       userMessage.id = await db.add("messages", { ...userMessage, agentId, threadId, heads: workspaces ? await projectHeads(db, threadId) : null });
 
@@ -773,7 +806,7 @@ function createWorkspaces(db, host) {
 // A call a tab took with it when it closed goes to the next.
 // Bump when a command, event, or host call changes. The worker's URL carries it and DB_VERSION, so a page of
 // another version gets a worker of its own; hello checks it too.
-const PROTOCOL = 4;
+const PROTOCOL = 5;
 let served = null;
 function serve(port) {
   const starting = served ??= startEngine();
@@ -827,6 +860,7 @@ async function startEngine() {
     run: ask("run"),
     code: ask("code"),
     readUrl: ask("readUrl"),
+    shell: ask("shell"),
     release: (projectId, branch = null) => tabs.forEach(t => t.port.postMessage({ type: "release", projectId, branch })),
   };
   const workspaces = createWorkspaces(db, host);
@@ -996,6 +1030,7 @@ function describeCheck(c) {
       return `${c.file} ${andList(parts)}`;
     }
     case "source": return `"${clip(c.text, 80)}" appears in a tool result`;
+    case "command": return `\`${clip(c.run, 100)}\` exits ${c.exit ?? 0}${c.stdout != null ? ` with "${clip(c.stdout, 60)}" in its output` : ""}`;
     default: return `${c.kind}: ${clip(c.text ?? "", 80)}`;
   }
 }
@@ -1007,9 +1042,11 @@ function toCheck(c) {
   if (c.kind === "probe" && !String(c.script ?? "").trim()) return { error: "has a probe check without a script" };
   if (c.kind === "file" && !c.file) return { error: "has a file check without a file" };
   if (c.kind === "source" && !String(c.text ?? "").trim()) return { error: "has a source check without the text to find" };
+  if (c.kind === "command" && !String(c.run ?? "").trim()) return { error: 'has a command check without the command: { "kind": "command", "run": "npm test", "exit": 0 }' };
+  if (c.kind === "command" && c.exit != null && !Number.isInteger(+c.exit)) return { error: "has a command check whose exit isn't a number" };
   if (c.matches) try { new RegExp(c.matches, "m"); } catch (e) { return { error: `has a pattern that doesn't parse: ${e.message}` }; }
-  const fields = ["kind", "file", "name", "script", "exists", "contains", "matches", "min_words", "max_words", "text"];
-  return { check: Object.fromEntries(fields.filter(k => c[k] != null).map(k => [k, k === "file" ? normalizePath(c[k]) : c[k]])) };
+  const fields = ["kind", "file", "name", "script", "exists", "contains", "matches", "min_words", "max_words", "text", "run", "exit", "stdout"];
+  return { check: Object.fromEntries(fields.filter(k => c[k] != null).map(k => [k, k === "file" ? normalizePath(c[k]) : k === "exit" ? +c[k] : c[k]])) };
 }
 
 // The strings in every tool result of this chat but the plan's own, with the call that returned each.
@@ -1080,13 +1117,15 @@ async function probeCheck(c, ws, signal) {
 }
 
 // { result: pass | fail | "not run", evidence }. A check that throws fails, with the reason as its evidence.
-async function runCheck(check, { ws = null, messages = [], fresh = [], signal = null } = {}) {
+// host and threadId: for a command check, the tab that runs the shell, and the run whose shell it is.
+async function runCheck(check, { ws = null, messages = [], fresh = [], signal = null, host = null, threadId = null } = {}) {
   try {
     switch (check.kind) {
       case "file": return fileCheck(check, ws?.readFile ? await ws.readFile(check.file) : null);
       case "source": return sourceCheck(check, messages);
       case "test": return await testCheck(check, ws, fresh, signal);
       case "probe": return await probeCheck(check, ws, signal);
+      case "command": return await shellTool.runCommandCheck(check, { ws, host, threadId, signal });
       default: return { result: "not run", evidence: `not run by the harness yet: it runs ${andList(HARNESS_CHECKS)} checks, so this item stays open` };
     }
   } catch (e) {
@@ -1099,7 +1138,7 @@ async function runCheck(check, { ws = null, messages = [], fresh = [], signal = 
 function watches(check, path) {
   if (isPlanFile(path)) return false;
   if (check.kind === "file") return check.file === path;
-  if (check.kind === "test" || check.kind === "probe") return !isScratch(path) || check.file === path;
+  if (check.kind === "test" || check.kind === "probe" || check.kind === "command") return !isScratch(path) || check.file === path;
   return false;
 }
 
@@ -1198,7 +1237,7 @@ function resummaryNote(contract) {
 }
 
 const GOAL_NOTE = "This is long work, so the harness keeps a contract for it that outlasts summaries. Before more work, state the goal in the user's words, your assumptions, and what done means with plan({ goal, assumptions, done }).";
-const ITEMS_NOTE = "The goal is set and the plan has no items. Add the steps with plan({ add: { title, check } }), each with a check the harness can run (test, probe, file or source), so it can tell when each one is done.";
+const ITEMS_NOTE = "The goal is set and the plan has no items. Add the steps with plan({ add: { title, check } }), each with a check the harness can run (test, probe, file, source or command), so it can tell when each one is done.";
 
 // Each rule: when it is read (at a step's results, when the model stops, after a summary), how often it may speak
 // (once a turn, at every event, or once between summaries), and what it says. A stop takes one note at a time. The
@@ -1234,12 +1273,22 @@ const PRE_DIRECTOR_RULES = [
   { id: "unplanned", at: "step", every: "turn", note: s => s.has("write_file") && s.ws && unplannedTask(s.messages, s.start, s.files, s.shown) },
   ...["silent", "failing", "untested", "unadopted"].map(ruleOf),
 ];
+// Notes of the harness's own, read with or without the director. "turn": read once when the user's message arrives.
+// date: the system prompt keeps the day the conversation started, so a message on a later day says so once.
+const CHANNEL_RULES = [
+  { id: "date", at: "turn", every: "turn", note: s => newDayNote(s.messages, s.start, s.started) },
+];
+function newDayNote(messages, start, started) {
+  const days = messages.slice(0, start).filter(m => m.role === "user").map(m => m.content?.find(b => b?.metadata?.timestamp)?.metadata.timestamp.slice(0, 10)).filter(Boolean);
+  const today = days.at(-1), before = days.at(-2) ?? started;
+  return today && before && today > before ? `The user's date is now ${today}, a later day than ${before}: the date in the system prompt is the day this conversation started.` : null;
+}
 // The plan-keeping note, said after PLAN_AFTER calls: the director's goal note, or, with no plan tool, the plan file.
 const PLAN_RULES = ["goal", "unplanned"];
 // The rules a run reads, by the flags: director=off, rule.<id>=off, and plan.where=prompt (the plan note is in the
 // system prompt instead, so it isn't injected too).
 function activeRules() {
-  const rules = flag("director") === "off" ? PRE_DIRECTOR_RULES : DIRECTOR_RULES;
+  const rules = [...(flag("director") === "off" ? PRE_DIRECTOR_RULES : DIRECTOR_RULES), ...CHANNEL_RULES];
   return rules.filter(r => flag("rule." + r.id) !== "off" && !(flag("plan.where") === "prompt" && PLAN_RULES.includes(r.id)));
 }
 // plan.where=prompt (E7): the note the plan rule would inject, in WORKING instead, said for when it applies.
@@ -1251,13 +1300,13 @@ function planInPrompt(tools) {
 }
 
 // One per run (a turn): the thread's contract, the rules, and what they have said. messages: the run's messages as
-// they stand. tools: the names of the tools the run has.
-async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules() } = {}) {
+// they stand. tools: the names of the tools the run has. started: the day the conversation started.
+async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules(), started = null } = {}) {
   const thread = threadId != null ? await db.get("threads", threadId) : null;
   const contract = { ...emptyContract(), ...structuredClone(thread?.contract ?? {}) };
   const has = name => tools.includes(name);
   const reminded = new Set(), seen = new Set();
-  let pending = [], idle = 0, asked = false, dirty = false, workspace = null;
+  let pending = [], idle = 0, asked = false, dirty = false, workspace = null, host = null;
   const sources = new Set();
   let queue = Promise.resolve();
   const serial = fn => { const p = queue.then(fn); queue = p.catch(() => {}); return p; };
@@ -1332,7 +1381,8 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
     return serial(async () => {
       if (!input || typeof input !== "object" || Array.isArray(input)) return { error: "plan takes an object: { goal }, { add }, { edit }, { note } or { ask }." };
       workspace = context.workspace ?? workspace;
-      const env = { ws: workspace, messages: messages(), signal: context.signal };
+      host = context.host ?? host;
+      const env = { ws: workspace, messages: messages(), signal: context.signal, host, threadId };
       const said = [];
       const statusGiven = "status" in input || [input.add].flat().some(a => a && "status" in a) || (input.check && "status" in input.check);
       if (statusGiven) said.push("Status is the harness's: an item is done when its check passes, so the status given was ignored.");
@@ -1387,26 +1437,33 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
     };
   };
 
-  function fire(at, s) {
-    const notes = [];
+  // The rules read at this point, through the one channel (envelope.js steer): their notes and any delivered from
+  // outside (deliver), ranked and capped. Returns the blocks to put on the message, capped ones included, logged. A
+  // rule counts as having spoken only when its note was delivered. A delivered-in note (a result) that was capped
+  // waits for the next step: unlike advice, it is the only copy.
+  let delivering = [];
+  function fire(at, s, { step: n = null, max = STEER_MAX } = {}) {
+    const queued = at === "step" || at === "stop" || at === "deliver" ? delivering.splice(0) : [];
+    const candidates = [...queued];
     for (const rule of rules.filter(r => r.at === at)) {
       if (rule.every !== "event" && reminded.has(rule.id)) continue;
-      const said = [rule.note(s)].flat().filter(Boolean);
-      if (!said.length) continue;
-      if (rule.every !== "event") reminded.add(rule.id);
-      notes.push(...said);
-      if (at === "stop") break;
+      candidates.push(...[rule.note(s)].flat().filter(Boolean).map(text => note(rule.id, text)));
     }
-    return notes;
+    const blocks = steer(candidates, { step: n, max });
+    for (const b of delivered(blocks)) reminded.add(b.instruction.rule);
+    delivering.push(...queued.filter(q => blocks.some(b => b.instruction.status === "capped" && b.instruction.rule === q.rule && b.instruction.text === q.text)));
+    return blocks;
   }
 
-  // After a step's results: run the checks the step bears on, then the rules. Returns the notes to append.
-  function step({ messages: all, start: startAt = start, ws = null, signal = null }) {
+  // After a step's results: run the checks the step bears on, then the rules. Returns the note blocks to append.
+  function step({ messages: all, start: startAt = start, ws = null, signal = null, step: n = null, host: tab = null }) {
     return serial(async () => {
       workspace = ws ?? workspace;
+      host = tab ?? host;
       const results = (all.at(-1)?.content ?? []).map(resultOf).filter(r => r && typeof r === "object");
-      const changed = new Set(results.filter(r => r.version != null && r.path).map(r => normalizePath(r.path)));
-      const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal };
+      // A tool's version, or the files a bash command changed.
+      const changed = new Set(results.flatMap(r => [...(r.version != null && r.path ? [r.path] : []), ...(Array.isArray(r.files) ? r.files.map(f => f?.path).filter(Boolean) : [])]).map(normalizePath));
+      const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal, host, threadId };
       const s = stateFor(all, startAt, { ws: workspace, files: Object.keys(workspace?.state?.files ?? {}), shown: workspace?.shownPath?.() ?? null });
       s.events.red = pending.splice(0);
       for (const item of contract.items.filter(i => i.status !== "done" && runnable(i))) {
@@ -1425,16 +1482,24 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       idle = s.events.done.length || learned || !contract.items.some(i => i.status !== "done" && runnable(i)) ? 0 : idle + 1;
       Object.assign(s, { idle, current: currentItem(contract) });
       await save();
-      return fire("step", s);
+      return fire("step", s, { step: n });
     });
   }
 
   return {
     contract, plan, step,
-    // The note for a model that stopped, or null; one at a time, each once a turn.
-    stop: ({ messages: all, start: startAt = start }) => fire("stop", stateFor(all, startAt))[0] ?? null,
-    // The note after a summary ran: the contract, re-injected. The context-budget note may speak again.
-    summarized: () => { reminded.delete("budget"); return fire("summary", stateFor(messages(), start))[0] ?? null; },
+    // When the user's message arrives (not on a resume): the notes for it, e.g. a new day.
+    begin: () => resume ? [] : fire("turn", stateFor(messages(), start, { started }), { step: 0 }),
+    // The note blocks for a model that stopped, empty for none; one delivered at a time, each rule once a turn.
+    stop: ({ messages: all, start: startAt = start, step: n = null }) => fire("stop", stateFor(all, startAt), { step: n, max: STOP_MAX }),
+    // The notes after a summary ran: the contract, re-injected. The context-budget note may speak again.
+    summarized: ({ step: n = null } = {}) => { reminded.delete("budget"); return fire("summary", stateFor(messages(), start), { step: n }); },
+    // The hook for notes from outside the rules (an async sub-agent's result): { rule, text, priority } from
+    // envelope.js note(), delivered with the next step's or stop's notes, through the same cap and log.
+    deliver: n => { delivering.push(n); },
+    // Only what was delivered in, for a step with no results and no rules to read (a sub-agent's result while the lead
+    // waits for it): ranked and capped like any step's.
+    flush: ({ step: n = null } = {}) => fire("deliver", null, { step: n }),
     save: () => serial(save),
   };
 }
@@ -1468,25 +1533,25 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   let parentId = lastMessageId;
   let streaming = null;
   const start = store.messages.length;
-  let director = null;
-  // The director's notes ride after the results, each a block of its own: the tail of the next request.
+  let director = null, tz = null, step = 0;
+  // The director's notes ride after the results, in the message's metadata (envelope.js): the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
-    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director, ...(background && { background }) };
+    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director, tz, ...(background && { background }) };
     const results = await getToolResults(store.messages.at(-1).content, toolMap, context);
-    // Sub-agents that finished meanwhile: after the results, in blocks of their own.
-    if (background) results.content.push(...subagentResultBlocks(background.take()));
-    for (const text of await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal })) results.content.push({ text, harness: true });
+    // Sub-agents that finished meanwhile: through the director's channel, so they ride this step's notes, after the
+    // results, never inside one.
+    if (background) deliverSubagents(director, background.take());
+    const notes = await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal, step, host });
+    const rich = stepMetadata(director.contract, ws);
+    results.content.push(...(Object.keys(rich).length ? [{ metadata: rich }] : []), ...notes);
     return push({ ...results, parentId: callsId, createdAt: Date.now() });
   };
-  // A note for a message not yet sent goes on it, before the user's own words: the user's request stays last.
-  const amendLast = async text => {
+  // Notes for a message not yet sent go on it, in its metadata, apart from the user's own words.
+  const amendLast = async blocks => {
     const i = store.messages.length - 1, last = store.messages[i];
-    if (last?.role !== "user" || last.id == null) return;
-    const content = unwrap(last.content);
-    const typed = content.some(c => c?.toolResult) ? -1 : content.findIndex(c => typeof c?.text === "string" && !c.harness);
-    const at = typed < 0 ? content.length : typed;
-    const next = [...content.slice(0, at), { text, harness: true }, ...content.slice(at)];
+    if (last?.role !== "user" || last.id == null || !blocks.length) return;
+    const next = [...unwrap(last.content), ...blocks];
     setStore("messages", i, "content", next);
     const row = await db.get("messages", last.id);
     if (row?.threadId === params.threadId) await db.put("messages", { ...row, content: next });
@@ -1495,14 +1560,20 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   try {
     // Resolved here so a missing key becomes an error reply instead of a stuck request.
     if (typeof client === "function") client = await client();
-    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume });
     const thread = await db.get("threads", params.threadId);
+    tz = thread?.client?.tz ?? null;
+    // The day the conversation started, in the user's time zone, taken once: the system prompt never changes with it.
+    const started = thread?.started ?? localDate(thread?.createdAt ?? Date.now(), tz);
+    if (thread && !thread.started) await db.put("threads", { ...(await db.get("threads", params.threadId)), started });
+    setStore("started", started);
+    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume, started });
     let summary = thread?.summary ?? null;
     let memories = thread?.memories ?? null;
     if (memories == null && store.tools.some(t => t.toolSpec.name === "editor")) {
       memories = await memoriesBlock(db, params.agentId);
       if (thread) await db.put("threads", { ...(await db.get("threads", params.threadId)), memories });
     }
+    await amendLast(director.begin());
     // Calls made and never answered run first; a reply that had finished has nothing to add.
     const last = store.messages.at(-1);
     if (resume && last?.role === "assistant") {
@@ -1511,6 +1582,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     }
     for (let turn = 0; ; turn++) {
       signal?.throwIfAborted();
+      step = turn;
       if (turn === maxTurns) {
         const note = { text: `(Paused after ${maxTurns} steps. Say "continue" to go on.)` };
         setStore("activeLeafId", await push({ role: "assistant", content: [note], parentId, createdAt: Date.now() }));
@@ -1519,8 +1591,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
       const before = summary;
       summary = await compactHistory(store, client, db, params.threadId, summary, memories, signal);
       // Why: cheap models lose the thread after a summary; the goal and the current item come back with it.
-      const restated = summary !== before && director.summarized();
-      if (restated) await amendLast(restated);
+      if (summary !== before) await amendLast(director.summarized({ step }));
       const request = { ...unwrap(store), summary, memories, messages: store.messages.map(({ id, role, modelId, content }) => ({ id, role, modelId, content: unwrap(content) })) };
       const output = await watchedSend(client, getConverseCommand(request), signal);
 
@@ -1536,11 +1607,16 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
       }
 
       if (stopReason) setStore("messages", streaming, "stopReason", stopReason);
+      // A declined request ends the turn in a plain line: no calls run, no stop rule asks again.
+      const refused = declined(stopReason);
+      if (refused) setStore("messages", streaming, m => ({ ...m, content: [{ text: REFUSAL_TEXT }], refused: true }));
       const savedId = await saveMsg(store.messages.at(-1));
       setStore("messages", streaming, "id", savedId);
       setStore("activeLeafId", savedId);
       streaming = null;
       parentId = savedId;
+      step = turn + 1;
+      if (refused) break;
 
       // Calls run whatever the stop reason says: a stream can close without one, and an unanswered call ends the turn.
       if (!store.messages.at(-1).content.some(c => c?.toolUse)) {
@@ -1548,18 +1624,20 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
         if (background?.running.size || background?.finished.size) {
           if (!background.finished.size && !toldRunning) {
             toldRunning = true;
-            parentId = await push({ role: "user", content: [{ text: stillRunning(background), harness: true }], parentId, createdAt: Date.now() });
+            director.deliver(note("running", stillRunning(background)));
+            parentId = await push({ role: "user", content: director.flush({ step }), parentId, createdAt: Date.now() });
             continue;
           }
           if (!background.finished.size) await background.next(signal);
           signal?.throwIfAborted();
-          parentId = await push({ role: "user", content: subagentResultBlocks(background.take()), parentId, createdAt: Date.now() });
+          deliverSubagents(director, background.take());
+          parentId = await push({ role: "user", content: director.flush({ step }), parentId, createdAt: Date.now() });
           continue;
         }
         // Each stop rule speaks once a turn; then the model's word stands.
-        const note = director.stop({ messages: unwrap(store.messages), start });
-        if (!note) break;
-        parentId = await push({ role: "user", content: [{ text: note, harness: true }], parentId, createdAt: Date.now() });
+        const notes = director.stop({ messages: unwrap(store.messages), start, step });
+        if (!delivered(notes).length) break;
+        parentId = await push({ role: "user", content: notes, parentId, createdAt: Date.now() });
         continue;
       }
 
@@ -1598,6 +1676,33 @@ async function projectHeads(db, threadId) {
   return project ? { ...project.heads } : null;
 }
 
+// The <metadata> a user message carries (envelope.js renders it): the user's local time, the client when it changed,
+// this message's attachments and the changes since the last turn. metadata=rich adds the contract's state and the
+// project's files.
+function userMetadata({ thread = null, client = null, files = [], kept = [], changes = null, ws = null, now = Date.now() } = {}) {
+  const attachments = [...kept, ...files.map(f => ({ name: f.name, type: f.type || null, bytes: f.size ?? null }))];
+  return {
+    timestamp: isoLocal(now, client?.tz ?? thread?.client?.tz),
+    ...(client && !sameClient(client, thread?.client) && { client }),
+    ...(attachments.length && { attachments }),
+    ...(changes && { changes }),
+    ...stepMetadata(thread?.contract, ws),
+  };
+}
+
+// What metadata=rich adds after every step and on every user message; nothing at the default.
+function stepMetadata(contract, ws) {
+  if (flag("metadata", "minimal") !== "rich") return {};
+  return { state: contractState({ ...emptyContract(), ...contract }), files: Object.keys(ws?.state?.files ?? {}).sort() };
+}
+
+// Stop reasons that mean the model declined: the turn ends with a plain line, and isn't retried. Bedrock Converse
+// says guardrail_intervened or content_filtered, the Anthropic API refusal; the Gemini client maps its safety stops
+// to refusal.
+const REFUSALS = ["refusal", "guardrail_intervened", "content_filtered"];
+const REFUSAL_TEXT = "The model declined this request.";
+const declined = stopReason => REFUSALS.includes(stopReason);
+
 function getConverseCommand(config) {
   const model = modelInfo(config.modelId);
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
@@ -1605,7 +1710,7 @@ function getConverseCommand(config) {
   const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec }));
   // subagents=async: wait comes with task.
   if (flag("subagents") === "async" && tools.some(t => t.toolSpec.name === "task") && !tools.some(t => t.toolSpec.name === "wait")) tools.push({ toolSpec: WAIT_TOOL.toolSpec });
-  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId });
+  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId, started: config.started });
   return {
     modelId: config.modelId,
     messages: prepareMessages(config.messages, { documents: model.documents, beside: model.beside, cache: model.cache, summary: config.summary, tail: config.tail, modelId: config.modelId }),
@@ -1624,7 +1729,12 @@ function getConverseCommand(config) {
 // Cache points ride the last two user messages: the newest writes, the one before is where the previous
 // request (or the parent of a fork) wrote, so the read is exact however many blocks the last turn added.
 // Reasoning goes back only to the model that wrote it: another model can't read its signature and rejects the turn.
+// Each message is first rendered in the envelope (envelope.js renderTurn): the user's words, their metadata, the notes
+// that fired, each result's times.
 function prepareMessages(messages, { documents = true, beside = false, cache = false, summary = null, tail = [], modelId = null } = {}) {
+  const envelope = flag("envelope", "xml");
+  messages = messages.map(m => renderTurn(m, { envelope }));
+  tail = tail.map(m => renderTurn(m, { envelope }));
   const through = summary ? messages.findIndex(m => m.id === summary.throughId) : -1;
   if (through >= 0) messages = [{ role: "user", content: [{ text: `<summary>\n${summary.text}\n</summary>` }] }, ...messages.slice(through + 1)];
   const results = messages.flatMap((m, i) => (m.content.some(b => b?.toolResult) ? [i] : []));
@@ -1676,8 +1786,10 @@ function besideResults(message, calls) {
     const parts = block.toolResult?.content;
     if (!parts?.some(c => c.image || c.document)) return block;
     const label = parts.find(c => c.json)?.json?.result?.path ?? calls.get(block.toolResult.toolUseId)?.name ?? "tool result";
-    for (const c of parts) if (c.image || c.document) moved.push({ text: label }, c);
-    return { toolResult: { ...block.toolResult, content: parts.filter(c => !c.image && !c.document) } };
+    // A file's own label (a full page's "page 2 of 4") is the text just before it, and moves with it.
+    const own = k => typeof parts[k - 1]?.text === "string" && !!(parts[k]?.image || parts[k]?.document);
+    parts.forEach((c, k) => (c.image || c.document) && moved.push({ text: own(k) ? `${label}, ${parts[k - 1].text}` : label }, c));
+    return { toolResult: { ...block.toolResult, content: parts.filter((c, k) => !c.image && !c.document && !own(k + 1)) } };
   });
   message.content.splice(message.content.findLastIndex(b => b.toolResult) + 1, 0, ...moved);
 }
@@ -1719,7 +1831,7 @@ async function compactHistory(store, client, db, threadId, summary, memories, si
 
   // The summary request is the history so far, with the instruction added to its last (user) message.
   const head = messages.slice(0, cut).map(({ id, role, content }) => ({ id, role, content }));
-  head[cut - 1] = { ...head[cut - 1], content: [...head[cut - 1].content, { text: SUMMARY_PROMPT }] };
+  head[cut - 1] = { ...head[cut - 1], content: [...head[cut - 1].content, ...steer([note("summarize", SUMMARY_PROMPT)])] };
   try {
     const output = await watchedSend(client, getConverseCommand({ ...unwrap(store), memories, summary, messages: head }), signal);
     const content = [];
@@ -1849,9 +1961,13 @@ function getEchoClient() {
   async function* stream(input, signal) {
     yield { messageStart: { role: "assistant" } };
 
-    // The last text block is what the user typed; workspace notices come before it.
+    // What the user typed: the envelope's <contents>, unescaped; under envelope=plain, the first text that isn't the
+    // harness's (its metadata and notes follow the user's words).
     const lastUserMsg = input.messages?.filter(m => m.role === "user").pop();
-    const userText = lastUserMsg?.content?.findLast(c => c.text)?.text || "";
+    const texts = (lastUserMsg?.content ?? []).filter(c => c.text).map(c => c.text);
+    const wrapped = texts.find(t => t.startsWith("<message><contents>"))?.match(/^<message><contents>([\s\S]*)<\/contents><\/message>$/)?.[1];
+    const userText = wrapped != null ? wrapped.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+      : texts.find(t => !/^(<metadata>|<workspace>|Sent \d{4}-)/.test(t)) || "";
 
     // Try to parse as JSON instruction
     let instruction;
@@ -1910,6 +2026,8 @@ function getEchoClient() {
   return { send: (input, { signal } = {}) => Promise.resolve({ stream: stream(input, signal) }) };
 }
 
+// Gemini's finish reasons for a reply it declined or withheld.
+const GEMINI_REFUSALS = ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION"];
 export function getGeminiClient(client) {
   const toB64 = b => btoa(b.reduce((s, x) => s + String.fromCharCode(x), ""));
   const MIME = { png: "image/png", jpeg: "image/jpeg", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf" };
@@ -1965,6 +2083,8 @@ export function getGeminiClient(client) {
     let idx = 0, active = null, calledTools = false, usage = null;
 
     for await (const chunk of response) {
+      // A prompt Gemini blocks comes back with no candidate at all.
+      if (chunk.promptFeedback?.blockReason && !chunk.candidates?.length) { yield { messageStop: { stopReason: "refusal" } }; return; }
       const parts = chunk.candidates?.[0]?.content?.parts ?? [];
       const done = chunk.candidates?.[0]?.finishReason;
       if (chunk.usageMetadata) usage = chunk.usageMetadata;
@@ -2001,7 +2121,7 @@ export function getGeminiClient(client) {
         const cached = usage?.cachedContentTokenCount || 0;
         if (usage) yield { metadata: { usage: { inputTokens: (usage.promptTokenCount || 0) - cached, outputTokens: (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0), cacheReadInputTokens: cached } } };
         // A call Gemini couldn't form ends the reply with nothing in it; the model is told why, not just that.
-        const reason = { MAX_TOKENS: "max_tokens", MALFORMED_FUNCTION_CALL: "malformed_tool_call" }[done];
+        const reason = { MAX_TOKENS: "max_tokens", MALFORMED_FUNCTION_CALL: "malformed_tool_call" }[done] ?? (GEMINI_REFUSALS.includes(done) ? "refusal" : null);
         yield { messageStop: { stopReason: reason ?? (calledTools ? "tool_use" : "end_turn") } };
       }
     }
@@ -2014,14 +2134,18 @@ export function getGeminiClient(client) {
 // settings with every command, and again when another tab changes them; the latest copy stands in. The proxy sent
 // is the stored one: the worker finds the local proxy itself.
 const FLAGS_KEY = "harness-flags"; // localStorage: { name: value }, the experiment's feature flags
-const SETTING_KEYS = ["aws-config", "google-config", "brave-config", FLAGS_KEY];
+const SETTING_KEYS = ["aws-config", "google-config", "brave-config", "github-config", FLAGS_KEY];
 const settings = { items: {}, proxy: null };
 const setting = key => globalThis.localStorage ? localStorage.getItem(key) : settings.items[key] ?? null;
 const storedJSON = key => { try { return JSON.parse(setting(key) || "null"); } catch { return null; } };
 // A feature flag, or its default. Set per eval run (eval.js --flags) so an ablation needs no code change; each flag
 // is a no-op at its default. director=off, rule.<id>=off, plan.where=prompt: activeRules and systemPrompt.
 // effort=<level>: getConverseCommand. context=<tokens>: modelInfo. noProjectError=old: workspaceFor.
+// envelope=plain: loose text blocks instead of <message>/<metadata> (envelope.js renderTurn). metadata=rich: the
+// contract's state and the file list on every user message and after every step (userMetadata, stepMetadata).
 const flag = (name, fallback = null) => { const value = storedJSON(FLAGS_KEY)?.[name]; return value == null ? fallback : String(value); };
+// The user's GitHub token (Settings), for GitHub projects: a fine-grained one, scoped to the repositories.
+const githubToken = () => storedJSON("github-config")?.token || null;
 const snapshotSettings = () => ({ items: Object.fromEntries(SETTING_KEYS.map(key => [key, setting(key)])), proxy: storedProxyConfig() });
 const applySettings = ({ items, proxy }) => Object.assign(settings, { items, proxy });
 
@@ -2280,7 +2404,7 @@ async function sandboxFiles(command, args = {}, context = {}) {
   const store = resourceStore(context);
   const ws = context.workspace?.state.project ? context.workspace : null;
   const path = normalizePath(args.path ?? "").replace(/\/+$/, "");
-  const inWorkspace = p => !!ws && p in ws.state.files;
+  const inWorkspace = p => !!ws && (p in ws.state.files || !!ws.root?.has(p));
   const paths = async (prefix = "") => {
     const all = new Set((await store.all()).map(r => r.path));
     if (ws) for (const p of await ws.listFiles()) all.add(p);
@@ -2532,7 +2656,10 @@ async function mcp({ command, server, tool, uri, name, args, filename }, context
 // wants each one answered) and finds its question in its own. It reads; the caller changes things.
 function forkOf({ request, turn }, toolUseId, question, { brief = q => fill(FORK_BRIEF, { question: q }), refuses = FORK_REFUSES } = {}) {
   const refuse = name => () => ({ error: `A fork does not ${name === "task" ? "start sub-agents" : "change files"}. Put what should change in your answer; the caller makes the change.` });
-  const toolMap = Object.fromEntries(request.tools.map(({ toolSpec: { name }, fn }) => [name, refuses.includes(name) ? refuse(name) : fn]));
+  // A fork that reads may still run commands (the tests, say): in a shell of its own, whose changes aren't saved.
+  const readOnly = refuses.includes("write_file");
+  const shellOf = fn => (input, context) => fn(input, { ...context, shell: { session: `fork-${toolUseId}`, commit: false } });
+  const toolMap = Object.fromEntries(request.tools.map(({ toolSpec: { name }, fn }) => [name, refuses.includes(name) ? refuse(name) : readOnly && name === "bash" ? shellOf(fn) : fn]));
   toolMap.wait = () => ({ error: "Only the caller waits for sub-agents." }); // offered with task under subagents=async
   // The brief rides in the fork's own result, after a line that says so: read as the result, a fork took itself for the
   // caller and called the task it was; sent as the user's words, it made Haiku drop the caller's thinking, and the cache.
@@ -2555,7 +2682,9 @@ function ownedTools(toolMap, owned, ws, db) {
     if (path && !ownsPath(owned, path)) return { error: `${path} isn't yours: this part owns ${owned.join(", ")}. The rest is the contract: read it, build against it, and say in your final message what it lacks.` };
     return fn(input, context);
   };
-  return Object.fromEntries(Object.entries(toolMap).map(([name, fn]) => [name, ["write_file", "edit_file", "restore"].includes(name) ? guard(name, fn) : fn]));
+  // Its commands run, and only what they change in its own files is saved.
+  const shellOwned = fn => (input, context) => fn(input, { ...context, shell: { owns } });
+  return Object.fromEntries(Object.entries(toolMap).map(([name, fn]) => [name, ["write_file", "edit_file", "restore"].includes(name) ? guard(name, fn) : name === "bash" ? shellOwned(fn) : fn]));
 }
 
 // The files the other parts called in the same turn own.
@@ -2604,10 +2733,11 @@ function createBackground(parent) {
   };
 }
 
-// Finished sub-agents' results for the lead, each a harness text block of its own: never inside a tool result, never
-// merged with the user's words. One place builds them, so a message envelope (E17) can route them.
-const subagentResultBlocks = entries => entries.map(({ id, type, result }) =>
-  ({ text: `Sub-agent ${id} (${type}) finished. Its result:\n${JSON.stringify(result)}`, harness: true, subagent: { id, result } }));
+// Finished sub-agents' results for the lead, each a note of its own through the director's channel (envelope.js):
+// in the message's metadata, never inside a tool result, never merged with the user's words. The result rides the
+// note as data, so it counts as its task's result (resultOf). A capped one waits for the next step.
+const deliverSubagents = (director, entries) => entries.forEach(({ id, type, result }) =>
+  director.deliver({ ...note("subagent", `Sub-agent ${id} (${type}) finished. Its result:\n${JSON.stringify(result)}`), data: { subagent: { id, result } } }));
 
 const STARTED_NOTE = "Running. Its result will arrive in a later message; call wait({ id }) to wait for it.";
 const stillRunning = background => {
@@ -2718,12 +2848,12 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
         general: [fill(GENERAL_PROMPT, { folder: folderName }), ["code", "think", "editor", "mcp"]],
         review: [REVIEW_PROMPT, ["code", "think", "view_file", "run_app", "history", "diff"]],
       }[type];
-      request = { systemPrompt: system };
+      request = { systemPrompt: system, started: conversation?.request?.started ?? localDate(Date.now(), context.tz) };
       subTools = TOOLS.filter(t => [...names, ...webToolNames()].includes(t.toolSpec.name));
       toolMap = Object.fromEntries(subTools.map(t => [t.toolSpec.name, t.fn]));
       // A reviewer starts from what the caller's turn would see: the files and the last run.
       const files = type === "review" && workspace?.state?.project ? await workspace.describeChanges(null) : null;
-      messages = [{ role: "user", content: [...(files ? [{ text: files }] : []), { text: prompt }] }];
+      messages = [{ role: "user", content: [{ text: prompt }, ...(files ? [{ metadata: { changes: files } }] : [])] }];
     }
 
     const effectiveModelId = (model && !forked && MODELS.find(m => m.label === model)?.id) || modelId || DEFAULT_MODEL;
@@ -2736,7 +2866,7 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
       signal?.throwIfAborted();
       const input = forked
         ? getConverseCommand({ ...request, tail: messages })
-        : getConverseCommand({ modelId: effectiveModelId, reasoningMode, systemPrompt: request.systemPrompt, tools: subTools, messages });
+        : getConverseCommand({ modelId: effectiveModelId, reasoningMode, systemPrompt: request.systemPrompt, tools: subTools, messages, started: request.started });
       const output = await watchedSend(client, input, signal);
       const assistantMsg = { role: "assistant", content: [], createdAt: Date.now(), modelId: effectiveModelId };
       let stopReason = null;
@@ -2746,15 +2876,16 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
         if (msg.metadata?.usage) assistantMsg.usage = msg.metadata.usage;
         update({ currentMessage: { ...assistantMsg } });
       }
+      if (declined(stopReason)) Object.assign(assistantMsg, { content: [{ text: REFUSAL_TEXT }], refused: true });
       messages.push(assistantMsg);
       await save(assistantMsg);
       update(entry => ({ messages: [...entry.messages, { ...assistantMsg }], currentMessage: null }));
 
       if (!assistantMsg.content.some(c => c?.toolUse)) { capped = false; break; }
 
-      const toolResults = await getToolResults(assistantMsg.content, toolMap, { ...subContext, cutOff: stopReason === "max_tokens" });
+      const toolResults = await getToolResults(assistantMsg.content, toolMap, { ...subContext, tz: context.tz, cutOff: stopReason === "max_tokens" });
       // Work cut off at the cap is lost to the caller, so the last turn is for the answer.
-      if (turn === most - 2) toolResults.content.push({ text: "One turn left: answer now with what you have, and say what you didn't get to.", harness: true });
+      if (turn === most - 2) toolResults.content.push(...steer([note("last-turn", "One turn left: answer now with what you have, and say what you didn't get to.")], { step: turn + 1 }));
       messages.push(toolResults);
       await save(toolResults);
       update(entry => ({ messages: [...entry.messages, { ...toolResults }] }));
@@ -2794,11 +2925,16 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
   };
 }
 
+// Each result keeps when its call started and ended (in context.tz, the user's), rendered inside it (envelope.js).
 async function getToolResults(toolUseContent, tools, context = {}) {
   const calls = toolUseContent.filter(c => c.toolUse);
+  const timed = run => async (call, i) => {
+    const started = Date.now(), block = await run(call, i);
+    return { ...block, timing: timing(started, Date.now(), context.tz) };
+  };
   const content = await Promise.all(
     calls
-      .map(async ({ toolUse }, i) => {
+      .map(timed(async ({ toolUse }, i) => {
         const { toolUseId, name, input } = toolUse;
         // Output that hit the length limit ends inside its last call, so that call's input is incomplete.
         if (context.cutOff && i === calls.length - 1) return { toolResult: { toolUseId, content: [{ json: { result: { error: "Your output hit the length limit before this call was complete, so it did not run. Send less per call: edit rather than rewrite, or split the file." } } }] } };
@@ -2810,12 +2946,13 @@ async function getToolResults(toolUseContent, tools, context = {}) {
           const output = await fn(input, { ...context, toolUseId });
           if (!output?.__media) return { toolResult: { toolUseId, content: [{ json: { result: output } }] } };
           const { __media: media, ...result } = output;
-          return { toolResult: { toolUseId, content: [{ json: { result } }, ...media.map(mediaBlock)] } };
+          // A file with a label (a full page's "page 2 of 4") comes after it, so the model reads which one it sees.
+          return { toolResult: { toolUseId, content: [{ json: { result } }, ...media.flatMap(m => (m.label ? [{ text: m.label }, mediaBlock(m)] : [mediaBlock(m)]))] } };
         } catch (error) {
           console.error("Tool error:", error);
           return { toolResult: { toolUseId, content: [{ json: { result: error.stack || error.message || String(error) } }] } };
         }
-      })
+      }))
   );
   return { role: "user", content };
 }
@@ -3154,21 +3291,10 @@ function toResultValue(value) {
   }
 }
 
-async function fileHandle(dir, path, create = false) {
-  const parts = path.split("/");
-  const name = parts.pop();
-  for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
-  return dir.getFileHandle(name, { create });
-}
-
-async function listFolder(dir, prefix = "", out = []) {
-  for await (const [name, handle] of dir.entries()) {
-    if (out.length >= 200) break;
-    if (handle.kind === "file") out.push(prefix + name);
-    else if (!/^(\.git|node_modules|\.artifacts)$/.test(name) && prefix.split("/").length < 3) await listFolder(handle, prefix + name + "/", out);
-  }
-  return out;
-}
+// isomorphic-git, for a folder project's git, loaded the first time one asks.
+const loadGit = () => import(`${CDN["isomorphic-git"]}/+esm`);
+// A run serves the root's files beside the journal's, up to these: a bigger project serves the files it touched.
+const ROOT_RUN_FILES = 2000, ROOT_RUN_BYTES = 20_000_000;
 
 // One per App. Owns the open project, its runner, and the run queue.
 // Read-modify-commit sections on one project run one at a time, in whichever workspace, tab or worker holds it.
@@ -3182,7 +3308,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   const view = project => (branch && project ? { ...project, heads: project.branches?.[branch]?.heads ?? project.heads } : project);
   const id = crypto.randomUUID().slice(0, 8);
   const [state, setState] = createStore({
-    project: null,    // { id, agentId, name, entry, heads: { path: versionId }, dirHandle? }
+    project: null,    // { id, agentId, name, entry, heads: { path: versionId }, root? } (root: see projects.js)
     files: {},        // path -> current text
     report: null,     // last run report of the shown artifact
     running: false,
@@ -3195,15 +3321,14 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     selected: null,   // file open in the Code tab; defaults to the shown artifact
     preview: null,    // { versionId, path, text } while an older version is shown
     capture: "none",  // element | region | tab | none
-    folder: null,     // { name, status: connected | permission }
+    root: null,       // a folder or GitHub root: { kind, name, status: connected | permission | missing, files, git, branch… }
     versions: [],     // newest first
     notice: null,
     captureChoice: globalThis.localStorage?.getItem(CAPTURE_CHOICE_KEY) ?? null, // allowed | dismissed | null
   });
   let context = {};
   let runQueue = Promise.resolve();
-  let folder = null, stopWatching = null, syncing = false, noticeTimer = null;
-  const diskSeen = new Map();
+  let root = null, stopWatching = null, noticeTimer = null;
   const runner = host || !frames ? null : frames(id, {
     state, setState,
     notify: message => notify(message),
@@ -3254,17 +3379,18 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     if (await show(path)) await run();
   }
 
-  // screenshot: true forces one, false skips it, "auto" attaches one while the user shares the tab.
+  // screenshot: true forces one, false skips it, "auto" attaches one while the user shares the tab. full: the whole
+  // page instead, as a list of labelled pages (snapshot.js).
   // announce: tell the other workspaces on the project, for a run the engine asked for.
   // signal: a run its caller stopped doesn't start, or stops where it is.
   // tests: { files, path }, test files to run as `node --test` would (see testFiles), reported as path.
-  function run({ versionId = null, script = null, screenshot = false, viewport = null, announce = false, signal = null, tests = null } = {}) {
-    if (host) return hostRun({ versionId, script, screenshot, viewport, tests }, signal);
+  function run({ versionId = null, script = null, screenshot = false, full = false, viewport = null, announce = false, signal = null, tests = null } = {}) {
+    if (host) return hostRun({ versionId, script, screenshot, full, viewport, tests }, signal);
     if (viewport) setState("viewport", viewport);
     return enqueueRun(async () => {
       signal?.throwIfAborted();
       if (tests) return runTests(tests, signal);
-      const result = await runNow({ versionId, script, screenshot, signal });
+      const result = await runNow({ versionId, script, screenshot, full, signal });
       if (announce) channel.postMessage({ projectId: state.project.id, ran: true });
       return result;
     });
@@ -3286,7 +3412,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   const refresh = () => run().catch(e => e.closed || notify(e.message));
 
   // The runner answers with the report; the version keeps it, as the shown artifact's latest.
-  async function runNow({ versionId, script, screenshot, signal }) {
+  async function runNow({ versionId, script, screenshot, full, signal }) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
     const shown = shownPath(project);
@@ -3301,13 +3427,12 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     // A scratch page runs off screen: the preview, its logs, and its report stay the shown artifact's.
     const scratch = isScratch(version.path);
     // The page runs in its folder: the project's other files, served beside it.
-    const files = Object.fromEntries(await Promise.all(Object.entries(project.heads).filter(([p]) => p !== version.path)
-      .map(async ([p, id]) => [p, await getBlob(db, (await db.get("versions", id)).hash)])));
+    const files = await servedFiles(project, version.path);
     const missing = isHtml(version.path) ? await missingFiles(version.path, content, p => files[p] ?? null) : [];
     if (missing.length) return { report: { version: version.id, path: version.path, ok: false, errors: missing, notes: ["Not run: the page loads files the workspace doesn't have."] } };
     setState({ running: true, ...(!scratch && { logs: [], preview: isHead ? null : { versionId: version.id, path: version.path, text: content } }) });
     try {
-      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, parked: scratch, signal });
+      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, full, parked: scratch, signal });
       if (!scratch) setState("runLog", runLog);
       if (isHead) {
         const stored = { ...report, thumb: thumb || version.report?.thumb || null };
@@ -3322,13 +3447,30 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     }
   }
 
+  // What a run serves: the journal's files, over the root's (read on first use, within ROOT_RUN_FILES and
+  // ROOT_RUN_BYTES), all but except.
+  async function servedFiles(project, except = null) {
+    const files = {};
+    if (root) {
+      let bytes = 0;
+      for (const path of root.list().slice(0, ROOT_RUN_FILES)) {
+        if (path in project.heads || path === except || isBinaryPath(path)) continue;
+        const text = await root.read(path).catch(() => null);
+        if (text == null) continue;
+        if ((bytes += text.length) > ROOT_RUN_BYTES) break;
+        files[path] = text;
+      }
+    }
+    for (const [path, id] of Object.entries(project.heads)) if (path !== except) files[path] = await getBlob(db, (await db.get("versions", id)).hash);
+    return files;
+  }
+
   // Test files run off screen, in a page of their own at the top of the folder; the preview and its report stay the
   // shown artifact's.
   async function runTests({ files: tests, path }, signal) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
-    const files = Object.fromEntries(await Promise.all(Object.entries(project.heads)
-      .map(async ([p, id]) => [p, await getBlob(db, (await db.get("versions", id)).hash)])));
+    const files = await servedFiles(project);
     // A file that imports one the workspace hasn't got fails without a run, which would only say "failed to fetch".
     const missing = [], broken = [];
     for (const file of tests) {
@@ -3414,27 +3556,30 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   async function open(projectId, { run: preview = true } = {}) {
     const project = view(await db.get("projects", +projectId));
     if (!project) return null;
-    detachFolder();
+    detachRoot();
     runner?.reset();
     setState({ project, report: null, preview: null, logs: [], runLog: [], selected: null, focus: false });
     await loadFiles();
     await refreshVersions();
-    if (project.dirHandle && !branch) await reconnect(project.dirHandle, false).catch(e => notify(e.message));
+    if (project.root && project.root.kind !== "workspace") await attachRoot().catch(e => notify(e.message));
     if (headless) return state.project;
-    setState("panel", !!shownPath() && globalThis.innerWidth >= 992);
+    // A folder or a repository with nothing to show opens on its files.
+    setState({ panel: (!!shownPath() || !!state.root) && globalThis.innerWidth >= 992, ...(state.root && !shownPath() && { tab: "project" }) });
     if (shownPath() && preview) refresh();
     return state.project;
   }
 
   function close() {
-    detachFolder();
+    detachRoot();
     setState({ project: null, files: {}, report: null, preview: null, versions: [], logs: [], runLog: [], panel: false, focus: false, selected: null });
     runner?.blank();
   }
 
-  async function createProject({ agentId = 1, name = "Untitled", entry = "index.html", content = null } = {}) {
+  // root: { kind: "folder", handle } or a GitHub record (projects.js connectGitHub); none is a workspace project.
+  async function createProject({ agentId = 1, name = "Untitled", entry = "index.html", content = null, root: record = null } = {}) {
     const now = Date.now();
-    const projectId = await db.add("projects", { agentId, name, entry, heads: {}, createdAt: now, updatedAt: now });
+    const stored = record?.kind === "folder" ? { kind: "folder", name: record.handle.name, handle: storableHandle(record.handle) } : record;
+    const projectId = await db.add("projects", { agentId, name, entry, heads: {}, ...(stored && { root: stored }), createdAt: now, updatedAt: now });
     await open(projectId);
     if (content != null) {
       await exclusive(() => commit(entry, content, { source: "user" }));
@@ -3464,9 +3609,21 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     const headId = state.project.heads[path];
     const head = headId ? await db.get("versions", headId) : null;
     if (head?.hash === hash) return { version: head, changed: false, before: text };
-    const before = head ? await getBlob(db, head.hash) : null;
+    let before = head ? await getBlob(db, head.hash) : null, parentId = headId ?? null;
+    // A root's file the journal doesn't hold yet starts its history as it was: the root's copy, which the write
+    // replaces, or for a change from the disk, the copy the harness last read.
+    if (!head && root) {
+      const seen = meta.source === "disk" && (await db.get("reads", readKey(path)));
+      const base = meta.source === "disk" ? seen && (await getBlob(db, seen.hash)) : await root.read(path).catch(() => null);
+      if (base != null && base !== text) {
+        const baseVersion = { projectId: state.project.id, path, parentId: null, hash: await putBlob(db, base), size: base.length, lines: countLines(base), source: "base", threadId: null, toolUseId: null, restoredFrom: null, createdAt: Date.now(), report: null, branch };
+        parentId = baseVersion.id = await db.add("versions", baseVersion);
+        before = base;
+        setState("versions", versions => [baseVersion, ...versions].slice(0, 200));
+      }
+    }
     const version = {
-      projectId: state.project.id, path, parentId: headId ?? null, hash, size: text.length, lines: countLines(text),
+      projectId: state.project.id, path, parentId, hash, size: text.length, lines: countLines(text),
       source: meta.source || "agent", threadId: meta.threadId ?? context.threadId ?? null, toolUseId: meta.toolUseId ?? null,
       restoredFrom: meta.restoredFrom ?? null, createdAt: Date.now(), report: null, branch,
     };
@@ -3475,8 +3632,40 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     await saveProject({ heads: { ...unwrap(state.project.heads), [path]: version.id } }, { quiet: !!host && meta.source !== "disk" });
     setState("files", path, text);
     setState("versions", versions => [version, ...versions].slice(0, 200));
-    if (meta.source !== "disk") await writeToFolder(path, text);
+    if (meta.source !== "disk" && meta.source !== "base") await writeRoot(path, text);
     return { version, changed: true, before };
+  }
+
+  // A file goes from the heads; its versions stay in the history. Call it inside exclusive, as commit. On a folder
+  // project it goes from the disk too, as commit's writes do.
+  async function remove(path) {
+    path = normalizePath(path);
+    if (!state.project || !(path in state.project.heads)) return false;
+    const { [path]: _, ...heads } = unwrap(state.project.heads);
+    await saveProject({ heads }, { quiet: !!host });
+    setState("files", path, undefined);
+    if (root && !branch) await root.remove(path).catch(e => notify(`Could not remove ${path} from ${root.name}: ${e.message}`));
+    return true;
+  }
+
+  // A root's file into the journal, as the root has it (to run it, or show it): its version, or null if there is none.
+  function adopt(path) {
+    path = normalizePath(path);
+    return exclusive(async () => {
+      if (state.project.heads[path]) return db.get("versions", state.project.heads[path]);
+      const text = await readFile(path);
+      return text == null ? null : (await commit(path, text, { source: "base" })).version;
+    });
+  }
+
+  // A file the disk no longer has leaves the journal's heads (its versions stay, for restore).
+  async function drop(path) {
+    if (!(path in state.project.heads)) return false;
+    const heads = { ...unwrap(state.project.heads) };
+    delete heads[path];
+    await saveProject({ heads });
+    setState("files", path, undefined);
+    return true;
   }
 
   async function checkout(heads) {
@@ -3487,7 +3676,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     await exclusive(async () => {
       await saveProject({ heads: { ...heads } });
       await loadFiles();
-      for (const path of Object.keys(heads)) if (heads[path] !== current[path]) await writeToFolder(path, state.files[path]);
+      for (const path of Object.keys(heads)) if (heads[path] !== current[path]) await writeRoot(path, state.files[path]);
     });
     if (shownPath()) refresh();
     return true;
@@ -3501,10 +3690,12 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     if (!project || parentHeads === undefined) return null;
     const heads = unwrap(project.heads);
     const used = liveErrors.length ? `\nWhile the user used ${shownPath()}, it logged errors:\n${liveErrors.map(e => "- " + e).join("\n")}` : "";
-    const block = body => `<workspace>\n${body}${used}\n</workspace>`;
+    // The text of a message's <changes> (envelope.js renders it, escaped, or as a <workspace> block under envelope=plain).
+    const block = body => body + used;
     if (parentHeads === null) {
       const paths = Object.keys(heads).sort();
-      if (!paths.length) return null;
+      const where = describeRootForAgent();
+      if (!paths.length) return where ? block(where) : null;
       const lines = [];
       for (const path of paths) {
         const v = await db.get("versions", heads[path]);
@@ -3512,30 +3703,35 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
         lines.push(`- ${path} v${v.id}, ${v.lines} lines${shown}`);
       }
       const last = state.report ? `\nLast run of v${state.report.version}: ${summarizeReport(state.report)}` : "";
-      return block(`Artifacts in this chat:\n${lines.join("\n")}${last}`);
+      return block(`${where ? where + "\n" : ""}Artifacts in this chat:\n${lines.join("\n")}${last}`);
     }
     const changed = [...new Set([...Object.keys(heads), ...Object.keys(parentHeads)])].filter(p => heads[p] !== parentHeads[p]).sort();
     if (!changed.length) return used ? block("No file changes since your last turn.") : null;
     const parts = [];
     for (const path of changed) {
-      const from = parentHeads[path] ? await db.get("versions", parentHeads[path]) : null;
+      let from = parentHeads[path] ? await db.get("versions", parentHeads[path]) : null;
       const to = heads[path] ? await db.get("versions", heads[path]) : null;
+      // A root's file the journal took in with this change: compared with the file as the harness first read it.
+      if (!from && to?.parentId) from = await db.get("versions", to.parentId).then(v => (v?.source === "base" ? v : null));
+      // One taken in as it was (to run it) is no change.
+      if (!from && to?.source === "base") continue;
       const a = from ? await getBlob(db, from.hash) : "", b = to ? await getBlob(db, to.hash) : "";
       const label = `${path}: ${from ? "v" + from.id : "new"} → ${to ? `v${to.id} (${to.source})` : "removed"}`;
       const patch = createTwoFilesPatch(path, path, a, b, from ? `v${from.id}` : "", to ? `v${to.id}` : "", { context: 2 });
       parts.push(label + "\n" + truncate(patch.split("\n").slice(2).join("\n"), 4000));
     }
+    if (!parts.length) return used ? block("No file changes since your last turn.") : null;
     return block(`Files changed outside your edits since your last turn:\n${parts.join("\n\n")}`);
   }
 
   async function readFile(path) {
     path = normalizePath(path || shownPath() || state.project?.entry);
     if (path in state.files) return state.files[path];
-    if (folder) {
-      const disk = await readDisk(path);
-      if (disk) return disk.text;
-    }
-    return null;
+    if (!root) return null;
+    const text = await root.read(path).catch(() => null);
+    // Remembered as last read, so a change the user makes on disk later shows as a change from it.
+    if (text != null) await db.put("reads", { key: readKey(path), hash: await putBlob(db, text), createdAt: Date.now() });
+    return text;
   }
 
   async function readVersion(versionId) {
@@ -3548,7 +3744,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
 
   async function listFiles(prefix = "") {
     const paths = new Set(Object.keys(state.files));
-    if (folder) for (const path of await listFolder(folder)) paths.add(path);
+    if (root) for (const path of root.list()) paths.add(path);
     return [...paths].filter(p => p.startsWith(prefix)).sort();
   }
 
@@ -3577,101 +3773,167 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     return version;
   }
 
-  async function readDisk(path) {
-    try {
-      const file = await (await fileHandle(folder, path)).getFile();
-      diskSeen.set(path, file.lastModified);
-      return { text: await file.text(), lastModified: file.lastModified };
-    } catch {
-      return null;
-    }
-  }
+  // #region Roots: a folder or a repository under the journal (projects.js)
+  const readKey = path => `${state.project.id}:${path}`;
 
-  async function writeToFolder(path, text) {
-    if (!folder || text == null) return;
+  async function writeRoot(path, text) {
+    if (!root || branch || text == null) return;
     try {
-      const handle = await fileHandle(folder, path, true);
-      const writable = await handle.createWritable();
-      await writable.write(text);
-      await writable.close();
-      diskSeen.set(path, (await handle.getFile()).lastModified);
+      await root.write(path, text);
     } catch (e) {
-      notify(`Could not write ${path} to the folder: ${e.message}`);
+      notify(`Could not write ${path} to ${root.name}: ${e.message}`);
     }
   }
 
-  async function openFolder() {
-    if (!state.project) throw new Error("Create or open an app first.");
-    if (!window.showDirectoryPicker) throw new Error("This browser cannot open local folders.");
-    const handle = await window.showDirectoryPicker({ id: "chat-harness", mode: "readwrite" });
-    await saveProject({ dirHandle: handle });
-    await attachFolder(handle);
+  // The root as the panel shows it.
+  async function describeRoot() {
+    if (!root) return null;
+    if (root.kind === "folder") return { kind: "folder", name: root.name, status: "connected", files: root.list().length, large: root.large.length, git: await root.git.present() };
+    const r = unwrap(state.project.root) ?? root.record;
+    return { kind: "github", name: root.name, status: "connected", files: root.list().length, git: true, branch: r.branch, from: r.from, defaultBranch: r.defaultBranch,
+      base: r.base.commit, commits: r.commits.length, truncated: !!r.base.truncated, pullRequest: r.pullRequest ?? null };
+  }
+  const showRoot = async () => setState("root", await describeRoot());
+
+  // What the agent is told about the root in a chat's first message.
+  function describeRootForAgent() {
+    const r = state.root;
+    if (!r) return null;
+    if (r.status !== "connected") return `This project is the folder "${r.name}" on the user's disk, but ${r.status === "permission" ? "this session may not read it until the user clicks Reconnect in the panel" : "this browser can't reach it"}: only the files below are here.`;
+    if (r.kind === "folder") return `This project is the folder "${r.name}" on the user's disk: ${r.files} files${r.git ? ", a git repository" : ""}. Your writes go to the disk at once; the user's own edits there come back as changes.`;
+    return `This project is the GitHub repository ${r.name} at ${r.base.slice(0, 7)} on ${r.from}: ${r.files} files. Your writes stay here until pushed to a branch (the default branch, ${r.defaultBranch}, only with the user's yes).`;
   }
 
-  async function reconnect(handle = state.project?.dirHandle, ask = true) {
-    if (!handle) return;
+  // Connects the project's root: a folder needs the user's permission, which Chrome remembers when they allow it on
+  // every visit; ask (a click) asks for it. mirror: the journal's files the folder lacks are written out (an app
+  // saved to a new folder); otherwise a file the disk lost leaves the heads. Either way the disk wins.
+  async function attachRoot({ ask = false, mirror = false } = {}) {
+    detachRoot();
+    const record = unwrap(state.project?.root);
+    if (!record || record.kind === "workspace") return null;
+    if (record.kind === "github") {
+      root = createGitHubRoot(record, {
+        token: githubToken, patch: createTwoFilesPatch, files: async () => ({ ...unwrap(state.files) }), current: () => unwrap(state.project?.root),
+        save: async changes => { await saveProject({ root: { ...unwrap(state.project.root), ...changes } }); },
+      });
+      await showRoot();
+      return root;
+    }
+    const handle = liveHandle(record.handle);
+    if (!handle) { setState("root", { kind: "folder", name: record.name, status: "missing" }); return null; }
     const mode = { mode: "readwrite" };
-    let permission = await handle.queryPermission?.(mode);
+    let permission = (await handle.queryPermission?.(mode)) ?? "granted";
     if (permission !== "granted" && ask) permission = await handle.requestPermission(mode);
-    if (permission === "granted") return attachFolder(handle);
-    setState("folder", { name: handle.name, status: "permission" });
+    if (permission !== "granted") { setState("root", { kind: "folder", name: handle.name, status: "permission" }); return null; }
+    root = createFolderRoot(handle, { git: { load: loadGit, patch: createTwoFilesPatch }, Observer: isMemoryDirectory(handle) ? MemoryObserver : globalThis.FileSystemObserver });
+    await root.ready();
+    await showRoot();
+    if (branch) return root;
+    // What changed while nobody watched: the journal's files, and the ones the harness had read.
+    const changes = [];
+    for (const path of Object.keys(state.files)) {
+      if (root.has(path)) changes.push({ path, type: "modified" });
+      else if (mirror) await writeRoot(path, state.files[path]);
+      else changes.push({ path, type: "removed" });
+    }
+    const prefix = state.project.id + ":";
+    for (const key of await db.getAllKeys("reads", IDBKeyRange.bound(prefix, prefix + "\uffff"))) {
+      const path = key.slice(prefix.length);
+      if (!(path in state.files) && root.has(path)) changes.push({ path, type: "modified" });
+    }
+    await onRootChanges(changes);
+    const unlisten = root.watch(changes => onRootChanges(changes).catch(e => notify(`Folder sync failed: ${e.message}`)));
+    stopWatching = () => { unlisten(); root?.unwatch(); };
+    return root;
   }
 
-  // The folder's copy wins when the two differ; files the folder lacks are written out.
-  async function attachFolder(handle) {
-    detachFolder();
-    folder = handle;
-    setState("folder", { name: handle.name, status: "connected" });
-    let entryChanged = false;
-    for (const path of new Set([...Object.keys(state.files), state.project.entry])) {
-      const disk = await readDisk(path);
-      if (!disk) await writeToFolder(path, state.files[path]);
-      else if (disk.text !== state.files[path]) {
-        await exclusive(() => commit(path, disk.text, { source: "disk" }));
-        if (path === shownPath()) entryChanged = true;
-      }
-    }
-    const sync = () => syncFromDisk().catch(e => notify(`Folder sync failed: ${e.message}`));
-    if ("FileSystemObserver" in window) {
-      const observer = new FileSystemObserver(() => sync());
-      observer.observe(handle, { recursive: true }).catch(() => {});
-      stopWatching = () => observer.disconnect();
-    } else {
-      const timer = setInterval(() => document.visibilityState === "visible" && sync(), 1500);
-      stopWatching = () => clearInterval(timer);
-    }
-    if (entryChanged) refresh();
-  }
-
-  async function syncFromDisk() {
-    if (!folder || syncing || !state.project) return;
-    syncing = true;
-    try {
-      let entryChanged = false;
-      for (const path of Object.keys(state.files)) {
-        const handle = await fileHandle(folder, path).catch(() => null);
-        if (!handle) continue;
-        const file = await handle.getFile();
-        if (diskSeen.get(path) === file.lastModified) continue;
-        diskSeen.set(path, file.lastModified);
-        const text = await file.text();
-        if (text === state.files[path]) continue;
-        const { changed } = await exclusive(() => commit(path, text, { source: "disk" }));
-        if (changed && path === shownPath()) entryChanged = true;
-      }
-      if (entryChanged) refresh();
-    } finally {
-      syncing = false;
-    }
-  }
-
-  function detachFolder() {
+  function detachRoot() {
     stopWatching?.();
     stopWatching = null;
-    folder = null;
-    diskSeen.clear();
-    setState("folder", null);
+    root?.unwatch();
+    root = null;
+    setState("root", null);
   }
+
+  // The user's edits on disk: a file the journal holds, or one the harness has read, gets a version from the disk
+  // (the disk wins); a file nobody has read is read fresh when it is. One the disk lost leaves the heads.
+  async function onRootChanges(changes) {
+    if (!state.project || !root) return;
+    let shown = false;
+    for (const { path, type } of changes) {
+      if (type === "removed") {
+        if (path in state.files && (await exclusive(() => drop(path))) && path === shownPath()) shown = true;
+        continue;
+      }
+      if (!(path in state.files)) {
+        const seen = await db.get("reads", readKey(path));
+        if (!seen) continue;
+      }
+      const text = await root.read(path).catch(() => null);
+      if (text == null) continue;
+      const { changed } = await exclusive(async () => {
+        if (path in state.files ? state.files[path] === text : await db.get("reads", readKey(path)).then(async r => !r || (await getBlob(db, r.hash)) === text)) return { changed: false };
+        return commit(path, text, { source: "disk" });
+      });
+      if (changed && path === shownPath()) shown = true;
+    }
+    if (changes.length) await showRoot();
+    if (shown && !headless) refresh();
+  }
+
+  // Saves the open project to a folder the user picks: its files are written there, and it becomes a folder project.
+  async function openFolder({ handle = null } = {}) {
+    if (!state.project) return openFolderProject({ handle });
+    handle ??= await pickFolder();
+    await saveProject({ root: { kind: "folder", name: handle.name, handle: storableHandle(handle) } });
+    await attachRoot({ mirror: true });
+  }
+
+  async function pickFolder() {
+    if (!globalThis.showDirectoryPicker) throw new Error("This browser can't open local folders (Chrome and Edge can): connect a GitHub repository instead.");
+    return globalThis.showDirectoryPicker({ id: "chat-harness", mode: "readwrite" });
+  }
+
+  // A folder on disk as a new project: its files are listed at once, read when first needed.
+  async function openFolderProject({ handle = null, agentId = context.agentId ?? 1 } = {}) {
+    handle ??= await pickFolder();
+    const project = await createProject({ agentId, name: handle.name, root: { kind: "folder", handle } });
+    if (state.root?.status === "connected" && state.root.files === 0) notify(`${handle.name} has no files the project lists (dependencies, build output and .gitignore'd files are left out).`);
+    return project;
+  }
+
+  // A GitHub repository's branch as a new project: its tree is listed, its files fetched when first needed.
+  async function connectRepository({ owner, repo, branch: name = null, agentId = context.agentId ?? 1 } = {}) {
+    const record = await connectGitHub({ owner, repo, branch: name, token: githubToken() });
+    const project = await createProject({ agentId, name: `${owner}/${repo}`, root: record });
+    if (record.base.truncated) notify(`${owner}/${repo} is too big for one listing: GitHub truncated its tree.`);
+    return project;
+  }
+
+  // One click re-grants a folder Chrome forgot (or remembers, with "Allow on every visit").
+  const reconnect = () => attachRoot({ ask: true });
+
+  async function rescan() {
+    if (!root) return [];
+    const { changes } = await root.scan();
+    await onRootChanges(changes);
+    await showRoot();
+    return changes;
+  }
+
+  // git on the project, for the shell's git and gh commands: a folder's own repository (isomorphic-git), or the
+  // connected GitHub branch. status, diff, log, branch, commit; push and openPullRequest for GitHub only.
+  const NO_GIT = "This project has no git: open a folder (with a .git) or connect a GitHub repository.";
+  const git = Object.fromEntries(["status", "diff", "log", "branch", "commit", "push", "pull", "openPullRequest", "init"].map(name => [name, async (args = {}) => {
+    if (!root) throw new Error(state.root?.status === "permission" ? `${state.root.name} needs your permission again: click Reconnect.` : NO_GIT);
+    const fn = root.git?.[name];
+    if (!fn) throw new Error(`git ${name} isn't available on a ${root.kind} project.`);
+    // GitHub's commits and pushes read the working copy and write the root's record: one at a time, from the database.
+    const result = root.kind === "github" && name !== "status" && name !== "diff" && name !== "log" ? await exclusive(() => fn(args)) : await fn(args);
+    if (["commit", "push", "branch", "openPullRequest", "init"].includes(name)) await showRoot();
+    return result;
+  }]));
+  // #endregion
 
   async function captureView() {
     if (!shownPath()) throw new Error("Nothing is shown yet.");
@@ -3681,20 +3943,20 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   function dispose() {
     channel.close();
     runner?.dispose();
-    detachFolder();
+    detachRoot();
     clearTimeout(noticeTimer);
   }
 
   return {
     id, state, setState, notify, shownPath, show, select, rememberCapture: runner?.rememberCapture, captureView,
-    open, close, createProject, ensureProject, commit, checkout, describeChanges,
+    open, close, createProject, ensureProject, commit, remove, checkout, describeChanges,
     readFile, readVersion, listFiles, listVersions, diff, restore, userEdit, exclusive,
     run, preview: versionId => run({ versionId }),
     setContext: value => { context = { ...context, ...value }; },
     rename: name => saveProject({ name }),
     mountPreview: runner?.mountPreview, enableCapture: runner?.enableCapture, disableCapture: runner?.disableCapture,
     liveErrors: () => runner?.liveErrors() ?? [],
-    openFolder, reconnect, dispose,
+    openFolder, openFolderProject, connectRepository, reconnect, rescan, adopt, git, get root() { return root; }, dispose,
     branch, branchOf: name => createWorkspace(db, { host, frames, branch: name }),
   };
 }
@@ -4323,19 +4585,23 @@ async function writeFile({ path, content, screenshot } = {}, context = {}) {
   });
 }
 
-async function runApp({ path, version, viewport, script, screenshot = true } = {}, context = {}) {
+async function runApp({ path, version, viewport, script, screenshot = true, full = false } = {}, context = {}) {
   return attempt(async () => {
     const ws = await workspaceFor(context);
     if (viewport && viewport !== "fit" && !Object.hasOwn(VIEWPORTS, viewport)) viewport = null;
     // A test file, a folder or a glob runs its tests as `node --test` would.
-    const tests = path && version == null && !isHtml(path) ? testFiles(path, ws.state.project.heads) : null;
+    // A folder's or repository's files count as the journal's.
+    const known = ws.root ? { ...Object.fromEntries((await ws.listFiles()).map(p => [p, true])), ...ws.state.project.heads } : ws.state.project.heads;
+    const tests = path && version == null && !isHtml(path) ? testFiles(path, known) : null;
     if (tests && !tests.length) return { error: `No test files in ${normalizePath(path) || "the project"}: a folder runs its *.test.js, *.test.mjs and test*.js files. Name a file to run another.` };
     if (tests) return { report: (await ws.run({ tests: { files: tests, path: normalizePath(path) }, signal: context.signal })).report };
-    // A version names its own file, a variant's on its branch too; path picks the current one.
-    const head = path && version == null && ws.state.project.heads[normalizePath(path)];
+    // A version names its own file, a variant's on its branch too; path picks the current one. A root's file the
+    // journal doesn't hold yet comes in as the root has it.
+    let head = path && version == null && ws.state.project.heads[normalizePath(path)];
+    if (path && version == null && !head && ws.root?.has(normalizePath(path))) head = (await ws.adopt(normalizePath(path)))?.id;
     if (path && version == null && !head) return { error: await missingFile(ws, normalizePath(path), context) };
-    const { report, image } = await ws.run({ versionId: version ?? head ?? null, script: script || null, screenshot, viewport, signal: context.signal });
-    return withMedia({ report }, image);
+    const { report, image } = await ws.run({ versionId: version ?? head ?? null, script: script || null, screenshot, full: full === true, viewport, signal: context.signal });
+    return withMedia({ report }, ...[image].flat());
   });
 }
 
@@ -4577,14 +4843,14 @@ if (inSharedWorker) {
 // #endregion
 
 export {
-  CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, FLAGS_KEY, PRE_DIRECTOR_RULES, activeRules, flag, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
-  PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
+  CAPTURE_CHOICE_KEY, CDN, CHANNEL_RULES, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, FLAGS_KEY, REFUSAL_TEXT, newDayNote, stepMetadata, userMetadata, PRE_DIRECTOR_RULES, activeRules, flag, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
+  PROXY_CONFIG_KEY, SHELL_DB, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
   countLines, countRepeats, createDirector, createWorkspace, describeCheck, editFile, editor, renderPlan, runCheck, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
   getConverseClient, getConverseCommand, getProxyConfig, getToolResults, guardLoops, initDB, inspectArgs, isHtml, isLocalHost,
   isPlanFile, isRenderable, isScratch, listHistory, loopGuard, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
   ownedTools, parseJSON, parsePatch, plainError, polishedTake, preflight, prepareMessages, processStreamChunk,
   providerOf, proxyFetch, proxyRewrite, readUrl, reasoningFields, reasoningLevel, relayUrl, restoreVersion,
-  runAgentWithBranching, runApp, runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent,
+  runAgentWithBranching, runApp, runningSubagents, sameView, shellTool, sandboxFiles, sandboxResources, serve, setSubagent,
   siblingFiles, silentReply, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, systemPrompt,
   task, think, timeAgo, toDocument, toError, toResultValue, unadoptedVariants, unmuteScripts, unplannedTask, untestedChange,
   viewFile, waitSubagents, watchedSend, webSearch, webToolNames, writeFile,

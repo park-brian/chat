@@ -152,7 +152,7 @@ li { padding: .5rem 0; border-bottom: 1px solid #ddd; }
 
 // The app itself, as the eval started: a large, real project the model has to navigate rather than read.
 const own = file => new URL("../" + file, import.meta.url);
-const SELF = Object.fromEntries(["index.html", "engine.js", "prompts.js", "ws-sw.js"].filter(f => existsSync(own(f))).map(f => [f, readFileSync(own(f), "utf8")]));
+const SELF = Object.fromEntries(["index.html", "engine.js", "prompts.js", "envelope.js", "snapshot.js", "projects.js", "node-test.js", ...["tool", "host", "worker", "node", "python", "npm", "git", "project-git", "archive", "store"].map(f => `shell/${f}.js`), "ws-sw.js"].filter(f => existsSync(own(f))).map(f => [f, readFileSync(own(f), "utf8")]));
 
 // The deliverable; scratch/ is the agent's bench and not graded.
 const html = run => Object.keys(run.files).filter(p => p.endsWith(".html") && !p.startsWith("scratch/"));

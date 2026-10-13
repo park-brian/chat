@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lazy images</title>
+<style>
+  body { margin: 0; font: 15px/1.4 system-ui, sans-serif; background: #f8fafc; }
+  h1 { margin: 0; padding: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 12px; }
+  .grid img { width: 100%; height: auto; display: block; background: #e2e8f0; }
+  .loose img { width: 300px; display: block; margin: 12px; }
+</style>
+</head>
+<body>
+<h1>Lazy-loaded gallery (the server delays each image 250 ms)</h1>
+<div class="grid" id="grid"></div>
+<h2 style="padding: 0 12px">Without dimensions (they grow the page when they load)</h2>
+<div class="loose" id="loose"></div>
+<script>
+  const grid = document.getElementById("grid");
+  for (let i = 1; i <= 30; i++) grid.insertAdjacentHTML("beforeend", `<img loading="lazy" src="../img/slow/photo-${i}.svg" width="320" height="240" alt="photo ${i}" ${i === 30 ? "data-check" : ""}>`);
+  const loose = document.getElementById("loose");
+  for (let i = 31; i <= 34; i++) loose.insertAdjacentHTML("beforeend", `<img loading="lazy" src="../img/slow/photo-${i}.svg" alt="photo ${i}">`);
+</script>
+</body>
+</html>

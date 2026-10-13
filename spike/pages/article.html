@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Long article</title>
+<link rel="stylesheet" href="article.css">
+<style>
+  body { margin: 0; font: 17px/1.6 Georgia, serif; color: #222; background: #fbf8f2; }
+  .hero { min-height: 60vh; display: grid; place-items: center; background: linear-gradient(135deg, #234 0%, #456 60%, #a64 100%); color: #fff; }
+  .hero h1 { font-size: 48px; margin: 0; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px; }
+  figure { margin: 24px 0; }
+  figure img { width: 100%; height: auto; display: block; border-radius: 6px; }
+  blockquote { border-left: 4px solid #a64; margin: 24px 0; padding: 8px 16px; background: #fff; }
+  table { border-collapse: collapse; width: 100%; } td, th { border: 1px solid #ccc; padding: 4px 8px; }
+</style>
+</head>
+<body>
+<header class="hero"><h1 data-check>On Seeing the Whole Page</h1></header>
+<main id="main"></main>
+<script>
+  // Deterministic text: 14 sections, each a heading, three paragraphs, and every third a figure.
+  const words = "the page model sees viewport screenshot tall content layout stitch capture render canvas tile scroll header footer image text column grid".split(" ");
+  let seed = 3;
+  const rnd = () => (seed = seed * 16807 % 2147483647) / 2147483647;
+  const sentence = () => { const n = 8 + Math.floor(rnd() * 12); const w = Array.from({ length: n }, () => words[Math.floor(rnd() * words.length)]); w[0] = w[0][0].toUpperCase() + w[0].slice(1); return w.join(" ") + "."; };
+  const main = document.getElementById("main");
+  for (let s = 1; s <= 14; s++) {
+    const h = document.createElement("h2"); h.textContent = `${s}. Section ${s}`; main.append(h);
+    for (let p = 0; p < 3; p++) { const el = document.createElement("p"); el.textContent = Array.from({ length: 4 }, sentence).join(" "); main.append(el); }
+    if (s % 3 === 0) main.insertAdjacentHTML("beforeend", `<figure><img src="../img/figure-${s}.svg" alt="Figure ${s}" width="672" height="300"><figcaption>Figure ${s}: an inline image.</figcaption></figure>`);
+    if (s === 5) main.insertAdjacentHTML("beforeend", `<blockquote class="pull">A pull quote, styled by a linked stylesheet.</blockquote>`);
+    if (s === 8) main.insertAdjacentHTML("beforeend", `<table><tr><th>Method</th><th>Real pixels</th></tr><tr><td>stitch</td><td>yes</td></tr><tr><td>snapshot</td><td>no</td></tr></table>`);
+  }
+  main.insertAdjacentHTML("beforeend", `<p data-check style="font-weight:bold">The end of the article.</p>`);
+</script>
+</body>
+</html>
