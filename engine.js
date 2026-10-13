@@ -1138,6 +1138,9 @@ async function runCheck(check, { ws = null, messages = [], fresh = [], signal = 
   }
 }
 
+// A command check of a GitHub project's CI (gh pr checks, gh run ...): it reads the pushed commit, not the files.
+const isCICheck = check => check.kind === "command" && /^\s*gh\s+(pr\s+checks|run)\b/.test(check.run ?? "");
+
 // Whether a change to path is a reason to run the check again.
 function watches(check, path) {
   if (isPlanFile(path)) return false;
@@ -1471,9 +1474,11 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal, host, threadId };
       const s = stateFor(all, startAt, { ws: workspace, files: Object.keys(workspace?.state?.files ?? {}), shown: workspace?.shownPath?.() ?? null });
       s.events.red = pending.splice(0);
+      // A push is what moves CI: a check of it (gh pr checks, gh run) runs again after one, not after an edit.
+      const pushed = results.some(r => r.pushed);
       for (const item of contract.items.filter(i => i.status !== "done" && runnable(i))) {
         if (item.check.kind === "source") record(item, await runCheck(item.check, env), "step", s.events);
-        else if ([...changed].some(p => watches(item.check, p))) record(item, await runCheck(item.check, env), "change", s.events);
+        else if (isCICheck(item.check) ? pushed : [...changed].some(p => watches(item.check, p))) record(item, await runCheck(item.check, env), "change", s.events);
       }
       // A milestone: every check that passed before runs again, and one that fails reopens its item.
       if (s.events.done.length) for (const item of contract.items.filter(i => i.status === "done" && !s.events.done.includes(i)))
@@ -3937,6 +3942,12 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     const result = root.kind === "github" && name !== "status" && name !== "diff" && name !== "log" ? await exclusive(() => fn(args)) : await fn(args);
     if (["commit", "push", "branch", "openPullRequest", "init"].includes(name)) await showRoot();
     return result;
+  }]));
+  // A GitHub project's CI (projects.js createGitHubCI): read only, so nothing waits on the project's lock.
+  git.ci = Object.fromEntries(["hasWorkflows", "checks", "runs", "run", "jobs", "failedLog", "waitForChecks", "waitForRun", "pullRequest"].map(name => [name, (...args) => {
+    const fn = root?.git?.ci?.[name];
+    if (!fn) throw new Error(root ? `CI is a GitHub project's: this is a ${root.kind} project.` : NO_GIT);
+    return fn(...args);
   }]));
   // #endregion
 
