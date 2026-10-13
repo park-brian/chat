@@ -6243,6 +6243,116 @@ if (window.__HARNESS__?.test) (async () => {
           assert((await withFlags({ noProjectError: "old" }, none)) === "No project is open yet. Create the app with write_file.", "noProjectError=old");
         }
 
+        // E15: under subagents=async the lead goes on while sub-agents run; without the flag, task blocks as before
+        async function testAsyncSubagents() {
+          const withAsync = async fn => {
+            localStorage.setItem(FLAGS_KEY, JSON.stringify({ subagents: "async" }));
+            try { return await fn(); } finally { localStorage.removeItem(FLAGS_KEY); }
+          };
+          const STARTED = "Running. Its result will arrive in a later message; call wait({ id }) to wait for it.";
+          // A sub-agent's model, held until open(); a stop rejects it.
+          const held = () => {
+            const gate = Promise.withResolvers();
+            const client = { send: async (input, { signal } = {}) => {
+              await Promise.race([gate.promise, new Promise((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }))]);
+              return createMockClient([reply("Sub-agent done.")]).send(input);
+            } };
+            return { client, open: () => gate.resolve() };
+          };
+          const taskTool = TOOLS.find(t => t.toolSpec.name === "task");
+          const run = async ({ script, tools = [taskTool], sub, workspace = null, signal, onSend = () => {} }) => {
+            const threadId = await db.add("threads", { agentId: 1, name: "async", createdAt: Date.now() });
+            const userId = await db.add("messages", { role: "user", content: [{ text: "go" }], threadId, agentId: 1 });
+            const [store, setStore] = createStore({ modelId: "echo", systemPrompt: "P", tools, messages: [{ id: userId, role: "user", content: [{ text: "go" }] }] });
+            const sent = [], mock = createMockClient(script);
+            const client = { send: (input, o) => (sent.push(input), onSend(sent.length), mock.send(input, o)) };
+            await runAgentWithBranching(store, setStore, client, userId, { threadId, agentId: 1 }, db, { workspace, signal, modelClient: async () => sub.client });
+            const blocks = store.messages.flatMap(m => m.content.map(c => ({ role: m.role, ...c })));
+            const results = blocks.filter(b => b.toolResult).map(b => [b.toolResult.toolUseId, b.toolResult.content[0].json.result]);
+            return { store, sent, blocks, result: id => results.findLast(([i]) => i === id)?.[1], notes: blocks.filter(b => b.harness).map(b => b.text) };
+          };
+          const call = (name, input, id) => ({ blocks: mockToolUseBlock(name, input, id), stopReason: "tool_use" });
+          const finished = id => text => text.startsWith(`Sub-agent ${id} (`) && text.includes(" finished. Its result:\n");
+          const ids = [];
+
+          // Without the flag: task blocks and returns the result itself, and no wait is offered.
+          const plain = await run({ script: [call("task", { type: "fork", prompt: "q" }, "b1"), reply("Done.")], sub: { client: createMockClient([reply("Forked answer.")]) } });
+          ids.push("b1");
+          assert(plain.result("b1")?.type === "fork" && plain.result("b1").summary === "Forked answer." && !plain.result("b1").started, `blocking: the result in the call's own result: ${JSON.stringify(plain.result("b1"))}`);
+          assert(plain.sent.every(r => !r.toolConfig.tools.some(t => t.toolSpec.name === "wait") && !r.system[0].text.includes("Sub-agents run in the background")), "blocking: no wait tool, no async docs");
+          assert(!plain.notes.some(finished("b1")), "blocking: nothing delivered later");
+
+          await withAsync(async () => {
+            // A part: task returns at once, the lead's edits to its files are refused while it runs, and its result
+            // (adoption and all) comes in the next tool-results message, beside the results.
+            const ui = createTestUI();
+            try {
+              const main = ui.workspace, context = { workspace: main, db, agentId: 1, threadId: null };
+              await writeFile({ content: fixtureApp("good") }, context);
+              const ahead = main.branchOf("part-pa1");
+              await ahead.open(main.state.project.id);
+              await writeFile({ path: "drums.js", content: "export const drum = 2;" }, { ...context, workspace: ahead });
+              ahead.dispose();
+              const sub = held();
+              const lands = async () => { sub.open(); await waitFor(() => main.state.files["drums.js"] === "export const drum = 2;"); await sleep(50); return { ok: true }; };
+              const written = [];
+              const tools = [taskTool, fakeTool("write_file", input => (written.push(input.path), { ok: true })), fakeTool("probe", lands)];
+              const part = await run({ tools, sub, workspace: main, script: [
+                call("task", { type: "part", prompt: "drums", files: ["drums.js"] }, "pa1"),
+                call("write_file", { path: "drums.js", content: "x" }, "w1"),
+                call("write_file", { path: "other.js", content: "x" }, "w2"),
+                call("probe", {}, "p1"),
+                call("write_file", { path: "drums.js", content: "y" }, "w3"),
+                reply("Done."),
+              ] });
+              ids.push("pa1");
+              const started = part.result("pa1");
+              assert(started?.started === "pa1" && started.type === "part" && started.note === STARTED && Object.keys(started).length === 3, `task returns at once: ${JSON.stringify(started)}`);
+              assert(part.result("w1")?.error === "drums.js belongs to a running part (pa1); wait for it or work on other files.", `a running part's file is locked: ${JSON.stringify(part.result("w1"))}`);
+              assert(part.result("w2")?.ok && part.result("w3")?.ok && eq(written, ["other.js", "drums.js"]), `other files are free, and the part's once it lands: ${JSON.stringify(written)}`);
+              const msg = part.store.messages.find(m => m.content.some(c => c.toolResult?.toolUseId === "p1"));
+              const block = msg.content.find(c => c.harness && finished("pa1")(c.text));
+              assert(block && msg.content.indexOf(block) > msg.content.findIndex(c => c.toolResult), "delivered in the next tool-results message, after the results");
+              const delivered = JSON.parse(block.text.split("Its result:\n")[1]);
+              assert(delivered.type === "part" && delivered.adopted?.["drums.js"] && delivered.note === "These are your files now: run the whole." && delivered.summary === "Sub-agent done.", `what blocking task returns, adoption included: ${JSON.stringify(delivered)}`);
+              assert(!part.blocks.some(b => b.toolResult && JSON.stringify(b.toolResult).includes("finished. Its result")), "never inside a tool result");
+              assert(part.notes.filter(finished("pa1")).length === 1, "delivered once");
+              assert(part.sent[0].toolConfig.tools.some(t => t.toolSpec.name === "wait") && part.sent[0].system[0].text.includes('Sub-agents run in the background: task returns { "started": id } at once'), "wait is offered, and the task docs say how results come");
+            } finally {
+              ui.cleanup();
+            }
+
+            // The lead stops while one runs: told once, then the result comes as a message of its own.
+            const sub = held();
+            const stopped = await run({ sub, onSend: n => n === 3 && setTimeout(sub.open, 30), script: [call("task", { type: "fork", prompt: "q" }, "f1"), reply("Waiting."), reply("Still waiting."), reply("Got it.")] });
+            ids.push("f1");
+            const told = stopped.notes.filter(n => n.includes("still running"));
+            assert(told.length === 1 && told[0] === "1 sub-agent is still running (fork). Their results will arrive here; continue with other work or call wait.", `the stop rule speaks once: ${JSON.stringify(told)}`);
+            const later = stopped.store.messages.find(m => m.role === "user" && m.content.some(c => c.harness && finished("f1")(c.text)));
+            assert(later && later.content.every(c => c.harness && !c.toolResult), `after the stop, a message carrying the result: ${JSON.stringify(later?.content)}`);
+            const answer = stopped.store.messages.findIndex(m => m.role === "assistant" && m.content[0]?.text === "Got it.");
+            assert(answer > stopped.store.messages.indexOf(later), "the turn goes on to the lead's answer to it");
+
+            // wait blocks until they finish and returns their results, which then aren't delivered again.
+            const both = held();
+            const two = { blocks: [...mockToolUseBlock("task", { type: "fork", prompt: "a" }, "k1", 0), ...mockToolUseBlock("task", { type: "fork", prompt: "b" }, "k2", 1)], stopReason: "tool_use" };
+            const waited = await run({ sub: both, onSend: n => n === 2 && setTimeout(both.open, 30), script: [two, call("wait", {}, "wt"), call("wait", { id: "k1" }, "wt2"), call("wait", { id: "nope" }, "wt3"), reply("Done.")] });
+            ids.push("k1", "k2");
+            const got = waited.result("wt");
+            assert(eq(got?.results?.map(r => r.id).sort(), ["k1", "k2"]) && got.results.every(r => r.result.type === "fork" && r.result.summary === "Sub-agent done.") && !got.running, `wait returns both results: ${JSON.stringify(got)}`);
+            assert(waited.result("wt2")?.error === "k1's result was delivered already, in an earlier message." && waited.result("wt3")?.error.startsWith("No sub-agent nope is running."), `a delivered or unknown id says so: ${JSON.stringify([waited.result("wt2"), waited.result("wt3")])}`);
+            assert(!waited.notes.some(n => finished("k1")(n) || finished("k2")(n) || n.includes("still running")), `nothing repeated, no stop note: ${JSON.stringify(waited.notes)}`);
+
+            // The user's stop cancels them, as before.
+            const user = new AbortController(), stuck = held();
+            const cancelled = await run({ sub: stuck, signal: user.signal, onSend: n => n === 3 && setTimeout(() => user.abort(), 30), script: [call("task", { type: "fork", prompt: "q" }, "s1"), reply("Waiting."), reply("Still waiting.")] });
+            ids.push("s1");
+            await waitFor(() => runningSubagents().get("s1")?.status === "stopped");
+            assert(cancelled.store.messages.at(-1).content.some(c => c.text === "(stopped)" || c.text === "Still waiting."), `the run stops: ${JSON.stringify(cancelled.store.messages.at(-1).content)}`);
+          });
+          for (const id of ids) setSubagent(id, null);
+        }
+
         // Why: "17 passed" with no report saying so was the commonest failure on swe
         async function testClaimCheck() {
           const ran = tests => [{ role: "assistant", content: [{ toolUse: { toolUseId: "e", name: "edit_file", input: {} } }] }, { role: "user", content: [{ toolResult: { toolUseId: "e", content: [{ json: { result: { report: { path: "index.html", ok: !tests.failed, tests } } } }] } }] }];
@@ -6581,6 +6691,7 @@ if (window.__HARNESS__?.test) (async () => {
           testContractRerun,
           testDirectorRules,
           testFeatureFlags,
+          testAsyncSubagents,
           testClaimCheck,
           testReinjectAfterSummary,
           testEmptyMessages,

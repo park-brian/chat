@@ -106,6 +106,13 @@ Spawn sub-agents (main agent only). Several task calls in one turn run in parall
 - model: { "type": "explore", "model": "Haiku 5.5", ... } runs a sub-agent on another model; yours is the default.
 `;
 
+// Appended to the task section under subagents=async (E15).
+export const TASK_ASYNC = `- Sub-agents run in the background: task returns { "started": id } at once, and each result arrives later in a
+  message of its own. Go on with other work meanwhile, or call wait { "id": id } ({ "ids": [...] } for several, {}
+  for all) to block until they finish and get their results. A running part's files are its own until its result
+  arrives: you can't change them before.
+`;
+
 // The shape every HTML artifact takes, the same one this chat app has: one file, CDN imports, in-file tests.
 const ARTIFACT_SKELETON = `<!doctype html>
 <html lang="en">
