@@ -1,0 +1,333 @@
+# Experiment log
+
+Every change to the harness is an experiment: a question, a hypothesis with a predicted effect and a reason, a
+method that changes one thing, a result with its spread, and what we now believe. Raw eval output is in
+`.artifacts/`; run-by-run notes are in `evals/NOTES.md`; this log keeps the reasoning.
+
+## Method
+
+- **One variable per experiment.** Everything else is held fixed: model, effort, tasks, repeats, judge.
+- **Predict before running.** Write the hypothesis and the expected direction and size first.
+- **Know the noise.** Measured in E5 on identical code (Haiku, ×3 per task): tier means move up to 2 points,
+  single tasks up to 12. A tier change over 3 points is a signal; a single task needs over 12 points or a
+  mechanism seen in transcripts. Single-repeat comparisons (Gemini ×1) are anecdotes.
+- **Read transcripts, not just scores.** A score says something changed; the transcript says why.
+- **Check the grader too.** Two "regressions" so far were grading bugs (E2's lodash key, E1's decision rubric).
+- **Record what was refuted** as carefully as what held.
+
+Metrics: mean pass (share of checks passed, averaged over graded runs), pass^k (tasks that pass every check on
+every repeat), cost (input tokens in uncached equivalents), seconds, and task-specific counts from transcripts.
+
+## Current beliefs
+
+| # | Belief | Evidence | Strength |
+| --- | --- | --- | --- |
+| B1 | A rule in the system prompt is followed less than the same rule injected at the right moment | E3: plan file 0/3 with the prompt rule, 3/3 with an injection after 8 calls | tentative (n=3, one task) |
+| B2 | Models report in the vocabulary of the process they run; removing one trigger doesn't stop it | E6: leak 0-2/21 before the director, 15/21 with it; E6b: removing the strongest trigger left it at 11-12/21 | strong (the cause is the process, not one note) |
+| B9 | Asking the model to change wording rarely holds; checking the output and asking for a fix might | E4b (wording) 15 → 11; E6b (rule change) 11 → 11-12; E6c pending | tentative |
+| B3 | Tool error messages steer behavior | E4c: "No project is open yet. Create the app with write_file" preceded a 2,317-line app for a prose request | one transcript |
+| B4 | Making the model compute with code fixes counting errors | E1: arxiv 0.64 → 0.97, lodash 0.85 → 1.00 | moderate (two tasks, ×3) |
+| B5 | Unbounded context grows with page reads; a budget plus summaries bounds it | E3: 280k → 30-60k per request on the long report | strong (direct measurement) |
+| B6 | Summaries drop sources unless told to keep them | E3: 2/3 reports without links; E3b: 1/3 | tentative |
+| B7 | Short, well-posed questions are already answered well by Haiku 5.5 | answer set 0.97-0.98 across rounds | strong (saturated) |
+| B8 | A harness that adds process to small tasks makes them worse | E4: fix-bug rewritten after four plan calls; inner 1.00 → 0.88 | moderate |
+
+## Experiments
+
+### E1. Literal persona and working rules (round 1, 5d81348)
+
+- **Question:** does rewriting the prompt literally, with verify, cite, compute-with-code, plan-file and
+  ambiguity rules, improve answers on the hard tiers?
+- **Hypothesis:** yes, mostly on research (compute, cite) and answer-hard (assumptions, audience), by 5+ points.
+- **Method:** Haiku 5.5, effort high, ×3 on research, answer-hard, swe, answer; inner ×1. Against baseline B.
+- **Result:** research 0.88 → 0.98, answer-hard 0.86 → 0.89, swe 0.95 → 0.96, answer 0.97 → 0.98, inner 0.97 → 1.00.
+- **Analysis:** research's gain is large and has a mechanism in the transcripts (code runs for counts). The others
+  are within what noise might be. The plan-file rule had no effect (0/3).
+- **Learned:** B4. Rules that describe an action the model takes anyway (compute) work; a rule about a separate
+  bookkeeping step (write a plan file) doesn't.
+
+### E2. Network tools that match reality (round 2, 39cad47)
+
+- **Question:** do honest network instructions, cause-naming CORS errors and `web.read` in code change scores?
+- **Hypothesis:** small or none in evals (the proxy runs there); the value is for the published app.
+- **Result:** research 0.96, answer-hard 0.89, swe 0.96: unchanged. `web.read` used in 2 of 63 transcripts.
+- **Analysis:** as predicted. A drop on lodash was the answer key (305 in a browser, 306 under CommonJS).
+- **Learned:** a new tool isn't used unless something gives the model a reason to; graders need checking when a
+  score moves.
+
+### E3. Context budget and plan reminder (round 3, 3a0f703) and E3b (sources kept)
+
+- **Question:** with requests bounded (256k default, 100k Haiku) and a reminder after 8 calls, does long work keep
+  its plan and stay correct?
+- **Hypothesis:** context per request drops sharply; the plan file appears; scores hold.
+- **Result:** plan file 3/3 (0/3 before); requests 30-60k (280k before); scores held; 2/3 reports lost their links;
+  cost per run up 15-25%. E3b (summary and reminder keep URLs): 1/3 reports without links.
+- **Learned:** B1, B5, B6. Bounded context has a price in cache breaks.
+
+### E4. The director, first run (de36eda)
+
+- **Question:** does a contract of harness-run checks plus a rules table improve long and intent work without
+  hurting the rest?
+- **Hypothesis:** intent and long improve; short tiers unchanged.
+- **Result:** long finished 3/3 (2/3 timed out before); intent 0.84 → 0.85; research 0.98 → 0.99; swe 0.97 → 0.88;
+  inner 1.00 → 0.88.
+- **Analysis:** the regressions had three causes found in transcripts: contract vocabulary in replies (B2), the
+  director starting on small tasks through a 100-word request trigger (B8), and a stall rule that read research
+  as no progress.
+- **E4b (d0ca249):** tool-call trigger only, replies in the user's terms, research counts as progress. inner back
+  to 1.00; swe 0.90; intent 0.86; Gemini timed out three times, once building a 2,317-line app for a prose plan.
+- **E4c (da412ed):** the no-project error no longer says to create an app; the plan doc says a question or prose
+  plan needs no contract; the all-done note asks a fix's report for its cause. Result: Gemini had no timeouts
+  (3 in E4b) and answered the GraphQL request with one view_file, as before the director (E4b: a 2,317-line app);
+  intent 0.81 and answer-hard 0.91 on 6-7 runs each, against 0.88 and 0.95 on the 4-6 runs E4b finished. Haiku swe
+  0.88 (E4b 0.90), leak 11/21: unchanged, as E6 explains. Supports B3 (one repeat per task: tentative).
+
+### E6. Vocabulary leak (B2), measured on saved transcripts
+
+- **Question:** how often do final replies speak in contract terms, and what causes it?
+- **Hypothesis:** the leak rises with the director and falls with E4b's "user's terms" wording.
+- **Method:** every swe final reply (21 per round), regex for "item N", "the check", "the harness"; validated by
+  reading flagged replies (all were real leaks, e.g. "The harness shows it as open because the check was already
+  green when I added the item"). Cross-tabbed against whether the open-items or red-first injection had fired.
+- **Result:** baseline and rounds 1-3: 0-2/21. Director v1: 15/21. After E4b: 11/21. After E4c: 11/21.
+  Two rounds, leak by injection: leaked after an injection 10 and 10; leaked without one 1 and 1; injection without
+  a leak 5 and 8; neither 5 and 2.
+- **Analysis:** B2 confirmed and quantified. The wording fix barely helped (15 → 11). 20 of 22 leaking replies came
+  after an open-items or red-first note. The trigger is structural: on a bug fix the repository's existing tests
+  already pass, so a check on them is flagged red-first, the item can never be done, and the stop rule then tells
+  the model that items are open; the model explains this to the user.
+- **Learned:** an injection the model can't act on turns into an explanation to the user. Wording can't fix a rule
+  that fires when nothing can be done.
+- **Next (E6b):** a red-flagged item no longer counts as open at the stop (it is unverified, and the reply says so
+  plainly), and stop-time notes say they are for the model, not for the reply. Prediction: leak at most 3/21 and swe
+  at least 0.95 (pre-director 0.97).
+
+### E5 + E6b. Noise floor, and weak items no longer open (0df40e3)
+
+- **Questions:** (E5) how far do results move when nothing changes? (E6b) does dropping weak items from the
+  open-items rule stop the leak and restore swe?
+- **Hypotheses, written before the run:** (E5) the two identical copies differ by under 3 points on each tier's
+  mean, but single tasks move by up to 10-15 points on ×3. (E6b) leak at most 3/21 per copy; swe at least 0.95.
+- **Method:** the same commit run twice (copies a and b): swe, answer-hard, intent ×3 each, Haiku 5.5, effort high;
+  inner ×1 for regressions. Noise = |a − b| per tier and per task. E6b effect = mean(a, b) against E4c.
+- **Result so far:** swe a 0.92, b 0.90; answer-hard a 0.90, b 0.90; intent a 0.86 (b running). Leak: a 11/21,
+  b 12/21.
+- **E6b refuted.** The leak didn't move (11-12/21 against E4c's 11/21; predicted at most 3). Removing weak items
+  from the stop rule wasn't the cause. Leaking runs had slightly more director notes (7.3 against 5.7 on average)
+  and the same number of plan calls (7.7 against 7.6): the model uses the contract heavily on every swe run and
+  reports in its terms. One injection isn't the source; the contract's presence in the run is.
+- **E5 result (complete).** Same code twice, Haiku ×3 per task: swe 0.92/0.90, answer-hard 0.90/0.90, intent
+  0.86/0.84. **Tier means move by up to 2 points; single tasks by up to 12 (klona 0.91/0.79), 3.5 on average.**
+  inner ×1: 0.94.
+- **What that changes.** A tier change of more than about 3 points is a signal; a single task needs more than
+  about 12, or a mechanism found in transcripts. Re-judged: round 1's research gain (+10) and the director's swe
+  drop (-7 to -9) are real; the decision-record "regression" (-11 on one task, E1), most single-task moves, and
+  the Gemini single-run comparisons (×1) are within noise. Beliefs resting only on single-task moves are
+  downgraded.
+- **Next (E6c):** enforce instead of ask. A stop rule checks the final reply for contract vocabulary ("item N",
+  "the check", "the harness", "the plan") and asks for a rewrite in the user's terms, once. Prediction: leak at
+  most 2/21, swe unchanged or better, one extra turn in about half the runs. Also worth testing: 7.7 plan calls
+  per bug fix is overhead; raise the director's start threshold for edits to existing code (E13).
+
+### E10. Running a repository's tests (user observation, 2026-10-13)
+
+- **Observation (user):** the coder thinks it can't test code, because tests run automatically and must live in the
+  page; it sometimes plans to call `node --test`, spending thinking tokens on a tool that doesn't exist.
+- **Measured on saved transcripts:** swe reasoning mentions running node, npm or a terminal, or being unable to run
+  tests, in 16/21 (baseline B), 12/21 (E4b) and 11/21 (E4c) runs. Examples: "Since I can't execute node …",
+  "probing feels infeasible without page-level loading of the source". It then settles on text-presence checks
+  ("those were just text-presence checks confirming my edits exist, not that the behavior works").
+- **Hypothesis:** the harness lacks an obvious way to run a `node:test` file. If run_app runs a test file directly
+  (mapping node:test and node:assert to browser versions and returning pass/fail counts), and the docs say plainly
+  that there is no Node or shell and how tests run, then: reasoning about running tests falls below 3/21; test
+  checks replace text checks in the contract; claims of test counts match reports (the "reports only results it
+  got" check stops failing); swe's mean rises.
+- **Method:** build it, then swe ×3 against E6b's copies (same code otherwise); count reasoning mentions, check
+  kinds used, claim failures, thinking tokens before the first test run.
+- **Result:** pending.
+
+### E11. Shell spike (design: docs/specs/2026-10-13-shell.md)
+
+- **Question:** can a real-enough shell run in a static page, without COOP/COEP, fast enough for a cheap model?
+- **Hypotheses, before the spike:** just-bash runs in a Worker and passes the coreutils list; a DIY `node` with a
+  CommonJS loader and polyfills runs the swe seeds' `node:test` files with the right counts; `npm install` from
+  registry tarballs works for small pure-JS packages and fails for packages that need native code or sync
+  resolution tricks; Worker.terminate() stops an infinite loop where in-page guards can't; cold boot under 1 s.
+- **Method:** a spike page driven by Playwright with a fixed command list, served without COOP/COEP
+  (crossOriginIsolated false, no SharedArrayBuffer), as on GitHub Pages. Branch 2c74ee3, `spike/`.
+- **Result: 66 of 67 items passed.**
+  - **just-bash** (pinned via esm.sh) in a Worker: coreutils, pipes, redirects and loops all pass. Cold boot to
+    first result 318 ms (190 ms warm cache), median command 1.4 ms, 490 KB brotli. Its browser build has no tar
+    and a broken gzip, so the spike wrote both (60 lines on CompressionStream). `while true` stops by its limits
+    (exit 124) or by Worker.terminate() (about 0 ms; restart 334 ms).
+  - **DIY node layer** (nested Worker, CommonJS and ESM loaders, bundled polyfills, 62 KB): `node -e`, `.cjs`,
+    `.mjs`, writes back to the shell FS, `node --test` with Node's exact counts (dequal 44/44, ms 47/47; hidden
+    tests fail before the fix and pass after), `npm test`, and a sync infinite loop terminated (exit 124).
+    `node -e "1"` takes 6-20 ms on a small tree.
+  - **npm from registry tarballs:** ms, chalk@4 (6 packages), lodash (600 files), an ESM-only package, and
+    typescript 5.9.3 (`tsc --noEmit` reports TS2322, exit 2). Fails: `require()` of an ESM-only package.
+  - **git** (isomorphic-git plus a jsdiff `diff`): init, add, commit, status, diff, log.
+  - **Python** (Pyodide): `-c`, files on the shared FS, pip install of six, attrs and numpy, pytest with exit
+    codes, pandas + duckdb + matplotlib with the PNG read back. Cold boot 7.9 s, warm command 266 ms; the science
+    stack is 22.6 MB of wheels and must be cached by us in Cache Storage. A terminated Python costs a 5-7 s reboot.
+  - **GPU:** WebGPU in the node Worker works in Edge and Chrome; not in Playwright's bundled Chromium here.
+    TensorFlow.js trains (webgpu 4.4 s in Edge); onnxruntime-web runs only if `process.versions.node` is hidden.
+  - **almostnode** fails `node -e`, CommonJS, ESM imports and `--test`, and runs on the main thread where it can't
+    be stopped: rejected.
+- **Analysis:** every prediction held except two: npm did better than expected (typescript works) and Python's
+  cold boot is 8x the 1 s target, which only the shell and node meet.
+- **Learned:** a real enough shell runs on static hosting today. Looking like Node is a double edge: libraries
+  that support both take their Node path when they see `process.versions.node`, so the loader needs a per-package
+  policy (prefer the `browser` export condition).
+
+### E14. Following Anthropic's "Prompting Claude Haiku 5.5" guide (read 2026-10-13)
+
+The guide gives tested texts and placements; ours are paraphrases or differ. One is a bug, the rest are
+experiments, each against the noise floor from E5.
+
+- **Bug (fix, no experiment): the date.** The guide: render the date once when the conversation starts and keep
+  `system` unchanged; on a later day give the new date in the newest turn. Ours renders it on every request, so a
+  conversation that continues past midnight changes `system`, which returns a 400 once thinking blocks are sent
+  back. Fix: the date comes from the thread's start (like memories, taken once per thread), and a later day adds
+  a one-line note to the newest turn.
+- **Bug (fix): refusals.** `stop_reason: "refusal"` is not handled; the turn should end with a plain message that
+  the model declined, not an empty reply or a retry loop.
+- **E14a. Tested texts.** Replace our paraphrases with the guide's texts for search ("Your training data ends
+  well before today's date…"), early stopping ("Keep working until everything the user asked for is done…") and
+  verification ("When you change code that can be run…"). Our round-1 line "facts that can change come from a
+  tool" is close to the blanket rule the guide says doubled needless searches. Measure: answer (restraint tasks:
+  searches on questions that need none), research, swe (checks run before reporting), the "reports only results
+  it got" check. Prediction: needless searches unchanged or fewer; swe claims check failures fewer.
+- **E14b. Notices as system messages.** The guide: keep harness notices in a separate mid-conversation system
+  message; Haiku can treat text placed right after a tool result as untrusted. Ours are text blocks beside the
+  tool results. Hypothesis: notices are followed more often as system messages. Measure on the director's notes:
+  the share of "goal" notes followed by a plan call, of "same failure twice" notes followed by reading the code,
+  and of claim-check notes followed by a corrected reply. Needs Bedrock support for mid-conversation system
+  messages in the Converse API (check first; if absent, test the newest-turn placement instead).
+- **E8 (effort)** now has the guide's prior: medium is the default for agentic coding, high for strict
+  instruction following; low stops early and skips checks.
+
+### E15. The lead keeps working while sub-agents run (Anthropic guidance for Fable 5.1)
+
+- **Guidance:** don't make the lead stop and wait for each sub-agent. The tool that starts one returns at once;
+  each result arrives in a later user message; a separate tool waits when the lead wants to. On coding tasks this
+  lowered average time to completion at similar quality, tokens and cost. "The model still often chooses to wait.
+  The time savings come from the runs where it carries on."
+- **Ours today:** `task` blocks until the sub-agent finishes (parallel calls in one turn block until all finish).
+  The novella run (long baseline) shows the cost of the opposite failure: the lead gave up on four of six
+  chapter sub-agents and revised chapters they were still writing.
+- **Hypothesis:** for cheap models the gain is smaller than for Fable, and there is a risk: Haiku may lose track of
+  work in flight or edit files a running sub-agent owns. With the harness tracking what is in flight (a running
+  sub-agent's files locked to it; its result delivered in the next message; the lead told at its stop which are
+  still running), long work finishes faster at the same quality.
+- **Method:** async `task` (returns `{ started: id }`), results delivered as harness user messages, a `wait` tool,
+  file ownership enforced while running, and a stop rule for sub-agents still running. Flag `subagents=async`
+  against the current blocking default on long-novella, game-ambitious and hard-ssg-report, Haiku and Gemini,
+  ×3: seconds to completion, score, tokens, edits refused for ownership, and how often the lead waited.
+- **Result:** pending.
+
+### E16. A timestamp on every message (user, 2026-10-13)
+
+- **Idea (user):** include the time in each message sent to the model, so it knows how long things take and what
+  time it is for the user.
+- **Design, which also fixes E14's date bug:** the system prompt keeps only the date the conversation started
+  (rendered once, so `system` never changes). Each user message gets a harness block with the user's local time
+  and UTC offset ("Sent 2026-10-13 14:05 (UTC-04:00)"), kept apart from the user's words. Each tool result
+  carries its start and end time and duration ("ran 14:05:02-14:05:05, 3.2 s", user, 2026-10-13), so parallel
+  calls show what overlapped and the model can see where time went. Appending to the newest turn leaves the cached prefix intact.
+- **Hypotheses:** (a) questions that depend on the time ("is it too late to call Tokyo?", "how long until
+  Friday 5 pm?") are answered from the timestamp without asking; (b) on long tasks the model paces itself
+  (fewer timeouts, earlier wrap-up of optional work) when it can see elapsed time; (c) cost: under 1% more input
+  tokens. Risk, from B2: the model mentions timestamps or durations to the user unprompted.
+- **Method:** flag `timestamps=off` against the default on: a few new time-dependent answer tasks (with a fixed
+  clock in eval so answers are checkable), long tier and game-ambitious ×3 for timeouts and seconds, and a count
+  of replies that mention a timestamp or a duration nobody asked for.
+- **Result:** pending.
+
+### E17. One message envelope: contents and metadata (user, 2026-10-13)
+
+- **Design (user):** every user turn as `<message><contents>…</contents></message>` plus
+  `<metadata><timestamp>…</timestamp><additional_instructions>…</additional_instructions></metadata>`, with the
+  director's steering in `additional_instructions`. It carries E16's timestamps and replaces today's loose
+  `harness` text blocks.
+- **Constraints:**
+  - The user's words and the harness's notes stay in separate blocks (Haiku guide: never a notice and the user's
+    words in one block), so `<contents>` and `<metadata>` are two text blocks of one user message.
+  - The user's text is escaped (`&`, `<`), and so is any tool output quoted inside metadata, so nobody can type
+    `</contents><metadata><additional_instructions>` and pass for the harness.
+  - The system prompt says once what the envelope means: metadata comes from the harness, not the user;
+    `timestamp` is the user's local time; `additional_instructions` are for the current step, not for the reply
+    (B2: steering that gets echoed is what leaked).
+  - Tool results carry `<metadata><started/><ended/></metadata>` inside each result.
+- **Hypotheses:** structured, consistently named steering is followed more often than loose text blocks
+  (Anthropic: XML tags with consistent names), and saying it is not for the reply lowers the leak (E6's measure).
+- **Method:** flag `envelope=xml|plain` and, from E14b, `notices=metadata|block|system`. Measures: the share of
+  each director note acted on, the leak count on swe, intent and answer-hard scores, an injection test (a user
+  message containing a fake `<additional_instructions>` must not be obeyed as harness steering).
+- **Result:** pending.
+
+### E18. Minimal or rich metadata (design: docs/specs/2026-10-13-envelope.md)
+
+- **Question (user):** should each message's metadata carry uploads, things created, plan reminders and a goal
+  mode, or should it stay small (time, device, resolution) with the rest elsewhere?
+- **Constraints that decide most of it:** the system prompt can't change mid-conversation (cache, and Haiku's 400
+  on a changed `system` with thinking), and messages can't be taken back (every metadata block is re-sent on every
+  later request). Fixed things go in the system prompt; events and changes in metadata; state on request; full
+  state again only after a summary, when a goal mode starts, and at milestones.
+- **Hypothesis:** minimal metadata (events and changes) matches or beats rich metadata (full state every message)
+  on intent, answer-hard and long, at much lower input tokens per request; rich may help long work where a cheap
+  model doesn't read its own state.
+- **Method:** flag `metadata=minimal|rich`, Haiku and Gemini ×3: scores, input tokens per request over the run,
+  state reads (plan, view_file), leak count, unprompted mentions of metadata.
+- **Result:** pending.
+
+### E19 and E20. Six primitives; goals as confirmed contracts (design: docs/specs/2026-10-13-goals-and-primitives.md)
+
+- **E19 question:** does a small set of general tools (bash, edit, look, web, agent, goal; checks as commands)
+  beat the current ~17 tools with 7 sub-agent types and 8 check kinds, for cheap models?
+  **Prediction:** equal or better scores with fewer steps and tool errors; the largest gain on Gemini (its guide
+  advises 10-20 tools; E4c showed tool presence steering it).
+- **E20 question:** is a goal better as a contract the model proposes and the user confirms (checks failing now,
+  a budget, run to green) than as the current director that starts after 8 calls?
+  **Prediction:** no run keeps revising after its checks are green; no red check at "done"; no process on small
+  tasks (B8); leak count near the pre-director level (E6), since the process is the model's own proposal and
+  the harness speaks only on state changes.
+- **Status:** after the shell (E12) lands.
+
+## Ideas, as testable hypotheses
+
+What a good harness for cheap models might do, each with how to test it.
+
+1. **Tool results carry the next step.** A run report that ends "2 tests fail: totals rounds wrong; the failing
+   line is cart.js:41" is worth more than a rule to read reports. Test: run reports with and without a one-line
+   cause and next step; measure steps to green on swe.
+2. **Fewer tools, shown when relevant.** Gemini's guide says 10-20 tools; we offer about 17, several rarely used
+   (history, diff, restore, mcp). Test: hide them until a trigger (a restore needs a version list) and measure
+   score, tool errors and prompt tokens on Gemini.
+3. **Tool docs on first use.** Inject a tool's full documentation the first time it is called or becomes relevant,
+   instead of all upfront. Test: system prompt length against score on the short tiers.
+4. **Pick the best of two with the harness's checks.** For a cheap model, sample two attempts at low effort and
+   let the checks choose. Test: best-of-2 at medium against one at high on swe: score and cost.
+5. **Escalate one step.** When an item fails twice, the harness runs the next step on a stronger model (Sonnet
+   5.5) and returns to the cheap one. Test: swe and long with and without; cost per passing check.
+6. **A facts sheet at the tail.** The harness keeps the current truth (files and versions, last test result,
+   sources read) as a short block at the end of each request, so the model doesn't reconstruct state from history.
+   Test: claims that contradict the ledger, with and without.
+7. **Claims as data.** The model returns its final answer as claims with the evidence each rests on; the harness
+   verifies them and renders the prose. Test: unsupported claims in answer-hard and research.
+8. **Errors that don't steer.** Audit every tool error for instructions (B3) and rewrite them as facts. Test: E9.
+9. **Questions the user answers in one click.** Assumption chips in the UI. Test with the simulated user: turns to
+   DONE on intent.
+
+## Planned
+
+- **E5. Noise floor (A/A).** Run identical code twice on swe, answer-hard and intent (×3 each) and measure how
+  much the mean and each task move. Everything above is judged against this.
+- **E6. Vocabulary leak (B2), from existing transcripts.** Count final replies that mention "item N", "check" or
+  "the harness", before and after E4b.
+- **E7. Injection vs system prompt (B1).** The same plan instruction placed in WORKING versus injected after 8
+  calls, on the long report ×5 each. Needs feature flags.
+- **E8. Effort (medium vs high)** for Haiku on answer-hard and swe: does medium hold quality at lower cost?
+- **E9. Error-message steering (B3).** The old and new no-project error on the restraint and plan tasks.
+- **Infrastructure: feature flags** set per eval run (`--flags director=off,rule.stalled=off,effort=medium`), so
+  ablations don't need worktrees.
