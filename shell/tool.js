@@ -4,8 +4,12 @@
 // versions with source "shell", so history, diff, run_app, PLAN.md and the director's checks see them. Also the
 // director's command check. The engine passes in what it owns, so this module imports nothing of it.
 import { BASH_DESCRIPTION } from "../prompts.js";
+import { isBinaryPath } from "../projects.js";
+import { SHELL_GIT_NOTE, mentionsGit, projectGitChain, runProjectGit } from "./project-git.js";
 
 export const SHELL_ROOT = "/project";
+// A folder or GitHub project's files not yet in the journal go to the shell too, within these.
+const ROOT_FILES = 5000, ROOT_BYTES = 50e6;
 const DEFAULT_TIMEOUT = 60, PYTHON_TIMEOUT = 300, MAX_TIMEOUT = 600, CHECK_TIMEOUT = 300;
 const PYTHON = /(^|[\s;&|(`])(python3?|pip3?|pytest)(\s|$)/;
 
@@ -52,6 +56,21 @@ export function createShellTool({ workspaceFor, runApp }) {
     return { write, remove };
   }
 
+  // The root's text files outside the journal: { path: text }, or null for one the shell has already (known: "root").
+  async function rootTexts(ws, journal, known) {
+    const out = {};
+    let bytes = 0;
+    for (const path of (await ws.listFiles()).slice(0, ROOT_FILES)) {
+      if (path in journal || isBinaryPath(path)) continue;
+      if (known?.get(path) === "root") { out[path] = null; continue; }
+      const text = await ws.readFile(path).catch(() => null);
+      if (typeof text !== "string") continue;
+      if ((bytes += text.length) > ROOT_BYTES) break;
+      out[path] = text;
+    }
+    return out;
+  }
+
   // Runs a command in the session's shell, then commits what it changed. commit: false keeps the changes in the
   // shell (a fork's); owns(path): only those files are committed (a part's). keepState: false leaves cwd and env.
   async function exec(ws, context, { command, timeoutMs, cwd = null, keepState = true, toolUseId = null, commit = true, owns = null }) {
@@ -59,9 +78,18 @@ export function createShellTool({ workspaceFor, runApp }) {
     if (!host?.shell) throw new Error("No tab is open to run the shell in.");
     const key = keyOf(context, ws), s = session(key);
     await ws.exclusive(() => {}); // the files as other workspaces left them
-    const heads = { ...ws.state.project.heads }, files = ws.state.files;
+    const journal = { ...ws.state.project.heads };
+    let heads = journal, files = ws.state.files;
     const base = { op: "exec", key, projectId: ws.state.project.id, threadId: context.threadId ?? null, command, cwd: cwd ?? s.cwd, env: s.env, timeoutMs };
-    const send = full => host.shell(full ? { ...base, shellId: null, seed: textFiles(heads, files) } : { ...base, shellId: s.shellId, delta: deltaOf(s.known, heads, files) }, { signal: context.signal });
+    const send = async full => {
+      // A root's files the journal doesn't hold: read once per shell, and known by the shell as "root" after.
+      if (ws.root && !ws.branch) {
+        const extra = await rootTexts(ws, journal, full ? null : s.known);
+        heads = { ...journal, ...Object.fromEntries(Object.keys(extra).map(p => [p, "root"])) };
+        files = { ...ws.state.files, ...extra };
+      }
+      return host.shell(full ? { ...base, shellId: null, seed: textFiles(heads, files) } : { ...base, shellId: s.shellId, delta: deltaOf(s.known, heads, files) }, { signal: context.signal });
+    };
     let reply;
     try {
       reply = await send(!s.shellId);
@@ -80,6 +108,8 @@ export function createShellTool({ workspaceFor, runApp }) {
         if (commit === false || (owns && !owns(c.path))) { if (!c.deleted || c.path in ws.state.project.heads) skipped.push(c.path); continue; }
         if (c.deleted) {
           if (c.path in ws.state.project.heads) { await ws.remove(c.path); saved.push({ path: c.path, deleted: true }); }
+          // TODO: a GitHub project's file the journal never held stays in its working copy: its root can't remove.
+          else if (ws.root?.kind === "folder" && !ws.branch && ws.root.has?.(c.path)) { await ws.root.remove(c.path); saved.push({ path: c.path, deleted: true }); }
           s.known.delete(c.path);
           continue;
         }
@@ -92,12 +122,35 @@ export function createShellTool({ workspaceFor, runApp }) {
     return { ...reply, saved, skipped };
   }
 
+  // A && chain with git or gh in it, on a project whose git is its root's: each git or gh command on workspace.git,
+  // the others in the shell, in order, until one fails. Returns what exec does, for the chain.
+  async function execChain(ws, context, chain, options) {
+    const s = session(keyOf(context, ws));
+    const readOnly = options.commit === false || !!options.owns;
+    const r = { stdout: "", stderr: "", exitCode: 0, ms: 0, saved: [], skipped: [], images: [], opens: [], kept: { binary: [] } };
+    for (const segment of chain) {
+      const began = Date.now();
+      const one = segment.git ? await runProjectGit(ws, segment.words, { state: s, readOnly }) : await exec(ws, context, { ...options, command: segment.text });
+      r.stdout += one.stdout ?? "";
+      r.stderr += one.stderr ?? "";
+      r.exitCode = one.exitCode;
+      r.ms += one.ms ?? Date.now() - began;
+      if (one.cwd) r.cwd = one.cwd;
+      for (const k of ["saved", "skipped", "images", "opens"]) r[k].push(...(one[k] ?? []));
+      r.kept.binary.push(...(one.kept?.binary ?? []));
+      if (one.exitCode !== 0 || one.killed) break;
+    }
+    return r;
+  }
+
   async function bash(input, context = {}) {
     try {
       const { command = "", timeout = null, restart = false } = input && typeof input === "object" ? input : {};
       if (typeof command !== "string") return { error: "command must be a string, e.g. { \"command\": \"ls\" }" };
-      if (!context.host?.shell) return { error: "No tab is open to run the shell in." };
       const ws = await workspaceFor(context, { create: true });
+      // A folder or GitHub project's git is its own repository: git and gh go to workspace.git (project-git.js).
+      const chain = !restart && projectGitChain(ws, command);
+      if (!context.host?.shell && !(chain && chain.every(s => s.git))) return { error: "No tab is open to run the shell in." };
       if (restart) {
         const key = keyOf(context, ws);
         await context.host.shell({ op: "restart", key, threadId: context.threadId ?? null }, { signal: context.signal });
@@ -106,7 +159,8 @@ export function createShellTool({ workspaceFor, runApp }) {
       }
       if (!command.trim()) return { error: "command is empty: give a bash command, e.g. ls" };
       const secs = Math.min(MAX_TIMEOUT, Math.max(1, Number(timeout) || (PYTHON.test(command) ? PYTHON_TIMEOUT : DEFAULT_TIMEOUT)));
-      const r = await exec(ws, context, { command, timeoutMs: secs * 1000, toolUseId: context.toolUseId ?? null, commit: context.shell?.commit, owns: context.shell?.owns });
+      const options = { timeoutMs: secs * 1000, toolUseId: context.toolUseId ?? null, commit: context.shell?.commit, owns: context.shell?.owns };
+      const r = chain ? await execChain(ws, context, chain, options) : await exec(ws, context, { command, ...options });
       const out = { stdout: r.stdout ?? "", stderr: r.stderr ?? "", exitCode: r.exitCode, ms: r.ms };
       if (r.cwd && r.cwd !== SHELL_ROOT) out.cwd = r.cwd;
       if (r.saved.length) out.files = r.saved;
@@ -124,6 +178,7 @@ export function createShellTool({ workspaceFor, runApp }) {
       }
       if (reports.length === 1) out.report = reports[0].report;
       else if (reports.length) out.opened = reports;
+      if (!chain && ws.root && !ws.branch && mentionsGit(command)) notes.push(SHELL_GIT_NOTE);
       if (notes.length) out.notes = notes;
       return media.length ? { ...out, __media: media.slice(0, 4) } : out;
     } catch (e) {

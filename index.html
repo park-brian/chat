@@ -7776,6 +7776,89 @@ if (window.__HARNESS__?.test) (async () => {
           }
         }
 
+        // Why: on a folder or GitHub project the shell's own git is a copy's; git status, a commit, a push and a pull
+        // request have to reach the project's repository, or the agent commits where nobody looks
+        async function testShellProjectGit() {
+          const { splitChain } = await import("./shell/project-git.js");
+          const words = c => splitChain(c)?.map(s => s.words);
+          assert(eq(words(`git add . && git commit -m "Fix: the \\"edge\\" case"`), [["git", "add", "."], ["git", "commit", "-m", 'Fix: the "edge" case']]) && eq(words("git commit -m 'a $b'"), [["git", "commit", "-m", "a $b"]]), "a && chain splits into words, quotes and all");
+          for (const c of ["git diff | head", "git log; ls", "git status > s.txt", "git commit -m \"$MSG\"", "git log || true", "echo $(git log)", "git add *.js"]) assert(splitChain(c) === null, `left to the shell: ${c}`);
+
+          const ui = createTestUI();
+          try {
+            const dir = await P.memoryDirectory("repo", { "a.txt": "one\n" });
+            const ws = ui.workspace;
+            await ws.openFolderProject({ handle: dir, agentId: 1 });
+            await ws.git.init();
+            await ws.git.commit({ message: "Start" });
+            const p = await shellProject({}, { ws });
+            try {
+              const clean = await p.run("git status");
+              assert(clean.exitCode === 0 && clean.stdout === "On branch main\nnothing to commit, working tree clean\n", `git status is the folder's repository's: ${JSON.stringify(clean)}`);
+              // The shell writes, then git adds and commits on the folder: the chain runs in order.
+              const made = await p.run(`echo two > b.txt && echo more >> a.txt; true`);
+              assert(made.exitCode === 0 && made.notes === undefined && await diskRead(dir, "b.txt") === "two\n" && (await diskRead(dir, "a.txt")) === "one\nmore\n", `the shell's files reach the folder: ${JSON.stringify(made)}`);
+              const short = await p.run("git status -s");
+              assert(short.stdout === " M a.txt\n?? b.txt\n", `short status: ${JSON.stringify(short.stdout)}`);
+              const diff = await p.run("git diff a.txt");
+              assert(diff.stdout.startsWith("diff --git a/a.txt b/a.txt") && diff.stdout.includes("+more"), `git diff: ${diff.stdout}`);
+              const committed = await p.run(`git add b.txt && git commit -m "Add b"`);
+              assert(committed.exitCode === 0 && /^\[main [0-9a-f]{7}\] Add b\n 1 file changed\n$/.test(committed.stdout), `git add, then commit what it staged: ${JSON.stringify(committed)}`);
+              assert((await p.run("git status -s")).stdout === " M a.txt\n", "a.txt wasn't added, so it isn't committed");
+              const all = await p.run(`git commit -am "More"`);
+              assert(all.exitCode === 0 && all.stdout.includes("] More"), `commit -am takes the rest: ${JSON.stringify(all)}`);
+              const log = await p.run("git log --oneline");
+              assert(eq(log.stdout.trim().split("\n").map(l => l.slice(8)), ["More", "Add b", "Start"]), `git log: ${log.stdout}`);
+              assert(eq((await ws.git.log()).map(c => c.message), ["More", "Add b", "Start"]), "the commits are the folder's");
+              const branched = await p.run("git checkout -b feature && git branch");
+              assert(branched.stdout === "Switched to a new branch 'feature'\n* feature\n  main\n", `branches: ${JSON.stringify(branched.stdout)}`);
+              const push = await p.run("git push");
+              assert(push.exitCode === 1 && /isn't supported on a folder project/.test(push.stderr), `push on a folder says why not: ${push.stderr}`);
+              const stop = await p.run(`git push && echo after`);
+              assert(!stop.stdout.includes("after"), "a failing git command stops the chain");
+              const unknown = await p.run("git stash");
+              assert(unknown.exitCode === 1 && unknown.stderr.includes("git stash isn't available on this project's repository"), `what isn't here says what is: ${unknown.stderr}`);
+              const piped = await p.run("git log | head -1");
+              assert(piped.notes?.some(n => n.includes("ran on the shell's copy")), `a git the chain rule leaves to the shell says so: ${JSON.stringify(piped)}`);
+              const fork = await p.run(`git commit -am "x"`, {}, { shell: { session: "fork-1", commit: false } });
+              assert(fork.exitCode === 1 && /doesn't change it/.test(fork.stderr), `a fork's shell reads the repository and doesn't commit: ${JSON.stringify(fork)}`);
+              assert((await p.run("git status", {}, { host: null })).exitCode === 0, "git alone needs no shell");
+            } finally {
+              p.done();
+            }
+          } finally {
+            ui.cleanup();
+          }
+
+          // GitHub: commit, push to a branch, open a pull request; never the default branch.
+          const gh = await fakeGitHub({ files: { "README.md": "# R\n" } });
+          const realFetch = globalThis.fetch, saved = localStorage.getItem("github-config");
+          globalThis.fetch = gh.fetch;
+          localStorage.setItem("github-config", JSON.stringify({ token: "test-token" }));
+          const ui2 = createTestUI();
+          try {
+            const ws = ui2.workspace;
+            await ws.connectRepository({ owner: "o", repo: "r", agentId: 1 });
+            const p = await shellProject({}, { ws });
+            try {
+              await writeFile({ path: "README.md", content: "# R, edited\n" }, { ...p.context, workspace: ws });
+              assert((await p.run("git status -s")).stdout === " M README.md\n", "status against the base");
+              const main = await p.run(`git commit -m "Edit" && git push origin main`);
+              assert(main.exitCode === 1 && /default branch/.test(main.stderr) && gh.calls.every(c => c.method === "GET"), `the default branch isn't pushed from the shell: ${main.stderr}`);
+              const pushed = await p.run(`git push origin agent/edit && gh pr create --title "Edit the readme" --body "Why"`);
+              assert(pushed.exitCode === 0 && pushed.stdout.includes("1 commit -> agent/edit") && pushed.stdout.endsWith("https://github.com/o/r/pull/7\n"), `push and pull request: ${JSON.stringify(pushed)}`);
+              assert(eq(gh.calls.at(-1).body, { title: "Edit the readme", body: "Why", head: "agent/edit", base: "main", draft: false }), `the pull request: ${JSON.stringify(gh.calls.at(-1))}`);
+              assert((await p.run("git remote -v")).stdout.startsWith("origin\thttps://github.com/o/r.git (fetch)"), "the remote is the repository");
+            } finally {
+              p.done();
+            }
+          } finally {
+            ui2.cleanup();
+            globalThis.fetch = realFetch;
+            if (saved == null) localStorage.removeItem("github-config"); else localStorage.setItem("github-config", saved);
+          }
+        }
+
         // The network: npm's registry, curl through the proxy, git clone through the proxy, pip and a figure.
         async function testShellNet() {
           if (!NET) return console.log("SKIP: testShellNet (reaches the internet; run with --net)");
@@ -7947,6 +8030,7 @@ if (window.__HARNESS__?.test) (async () => {
           testShellOpen,
           testShellPython,
           testCommandCheck,
+          testShellProjectGit,
           testShellNet,
 
           // Story tests - demonstrate WHY the app exists through complete user workflows. Each drives a whole
