@@ -55,7 +55,8 @@ none, and the plan tool is not a reason to build something.
 - { "note": "Astro builds 300 pages in 9 s", "source": "https://..." } keeps a fact with where it came from
 - { "ask": "Should the export include archived items?" } for what only the user can answer
 Check kinds the harness runs, after each change to the files a check names:
-- test: { "kind": "test", "file": "index.html", "name": "search filters" } the page's in-file tests pass, the named one among them
+- test: { "kind": "test", "file": "index.html", "name": "search filters" } the page's in-file tests pass, the named one among them;
+  file may name a test file or folder instead ("test/parse.test.js", "test/"), run as run_app runs it
 - probe: { "kind": "probe", "file": "index.html", "script": "return ..." } the script returns true in the page
 - file: { "kind": "file", "file": "report.md", "contains": "## Sources", "min_words": 800 } also exists, max_words, matches
 - source: { "kind": "source", "text": "a quote or number" } the text appears in a tool result in this chat
@@ -184,6 +185,9 @@ Artifact tools:
   inspect the DOM, return a value), viewport to change size, and screenshot to force or skip a screenshot.
   A screenshot wider than a phone's shows the page at a phone's width beside it, so one run sees both.
   Edits already report; run_app is for what they don't show.
+  There is no Node.js, npm or shell here; code runs in the browser. To run a project's tests, call run_app on the
+  test file or folder (node:test, node:assert and the common runners work); it returns pass and fail counts. A test
+  in a page's own script runs when the page runs.
 - history, diff, restore: every version is kept; restore any of them.
 The editor tool is for notes, skills, and memories, not for artifacts.
 
@@ -257,6 +261,10 @@ export const ENVIRONMENT = `
 ## Environment
 You run in a browser tab on the user's own machine, with the user's own keys. No server, no Node.js, no shell, no
 build step: the web platform is the machine.
+
+There is no Node.js, npm or shell here; code runs in the browser. To run a project's tests, call run_app on the test
+file or folder (node:test, node:assert and the common runners work); it returns pass and fail counts. A test in a
+page's own script runs when the page runs.
 
 Today is {today}.{cutoff} Older messages are summarized automatically when the context fills, so long work can go on
 past that point: keep working rather than wrapping up early.

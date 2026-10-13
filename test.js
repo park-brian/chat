@@ -239,7 +239,8 @@ async function run(config = options(process.argv.slice(2))) {
           );
           continue;
         }
-        await page.waitForFunction(() => window.TESTS_DONE, null, { timeout: 120000 });
+        // index.html's suite takes about two minutes on this machine; the limit is for a suite that hangs.
+        await page.waitForFunction(() => window.TESTS_DONE, null, { timeout: 180000 });
         const result = await page.evaluate(() => window.TESTS_DONE);
         if (
           typeof result !== "object" ||
