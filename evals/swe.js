@@ -164,8 +164,9 @@ export async function grade(run, { name, relevant, maxLines }) {
 
     // Test counts the answer gives ("21 passed") must be ones a run report or a log returned.
     const claimed = [...new Set([...(run.answer ?? "").matchAll(/\b(\d+)(?:\s*\/\s*\d+)?\s+(?:tests?\s+)?pass(?:ed|ing|es)?\b/gi)].map(m => m[1]))];
-    const unbacked = claimed.filter(n => !new RegExp(String.raw`"passed":\s*${n}\b|\b${n}(?:\s*/\s*\d+)?\s+(?:tests?\s+)?pass`, "i").test(run.results ?? ""));
-    const ran = (run.calls ?? []).some(c => c.name === "code" || c.name === "run_app" || (["edit_file", "write_file"].includes(c.name) && /\.html?$/.test(c.input?.path ?? "")));
+    // node --test prints "# pass 47"; pytest and run reports say "47 passed".
+    const unbacked = claimed.filter(n => !new RegExp(String.raw`"passed":\s*${n}\b|\b${n}(?:\s*/\s*\d+)?\s+(?:tests?\s+)?pass|\bpass(?:ed)?\s+${n}\b`, "i").test(run.results ?? ""));
+    const ran = (run.calls ?? []).some(c => c.name === "code" || c.name === "run_app" || (c.name === "bash" && /\b(node|npm|npx|pytest|python3?)\b/.test(c.input?.command ?? "")) || (["edit_file", "write_file"].includes(c.name) && /\.html?$/.test(c.input?.path ?? "")));
     const tally = r => `${r.passed}/${r.passed + r.failed}${r.timedOut ? ", timed out" : ""}${r.failures.length ? "; failing: " + r.failures.join(" | ") : ""}`;
     return [
       [fixed.passed > 0 && fixed.failed === 0 && !fixed.timedOut, `fixes the issue: hidden tests pass (${tally(fixed)})`],

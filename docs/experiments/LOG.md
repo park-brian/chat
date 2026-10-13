@@ -379,7 +379,17 @@ experiments, each against the noise floor from E5.
   time. (E12) on swe, bash is used for running tests or inspecting files in most runs, and swe holds at >= 0.95
   (E10 level).
 - **Method:** game-ambitious and game-arcade ×3 at high and ×3 at medium; swe ×3. Haiku 5.5.
-- **Result:** running.
+- **Result E24:** high: game-ambitious 0.97 (952 s), game-arcade 0.91 (678 s), mean 0.94 (E15: 0.55). medium:
+  1.00 and 1.00 (406 s, 152 s), pass^k 2/2. The E15 fixes restored the games; **medium beat high** on score
+  (+6, beyond tier noise) at a third to a half of the time. Prediction (medium within noise of high) was too
+  cautious. Matches the Haiku guide (medium for agentic coding).
+- **Result E12:** swe 0.81 with the shell (E10 0.95), pass^k 0/7. Every run used bash; no hidden test failed.
+  **A grader bug, not a regression:** "ran code to reproduce or check the fix" knew only the code and run_app
+  tools, and "reports only test results it got" looked for "N passed" while node --test prints "# pass 47". Both
+  checks now understand bash and node's counts. Learned: graders must change when tools do (the third grading
+  bug found by a result that looked like a regression, after E2's lodash key and E1's rubric).
+- **Next:** swe ×3 at high and ×3 at medium with the fixed graders: the shell's true swe score, and whether medium
+  holds on bug fixes before it becomes Haiku's default.
 
 ### E21 (part). GitHub projects against a real repository
 
