@@ -1,0 +1,11 @@
+{ "group": "strings", "programs": [
+  { "name": "literal", "source": "(display \"hello\")", "expect": "hello" },
+  { "name": "string-append", "source": "(display (string-append \"foo\" \"bar\" \"baz\"))", "expect": "foobarbaz" },
+  { "name": "string-length", "source": "(display (string-length \"hello world\"))", "expect": "11" },
+  { "name": "escaped quote", "source": "(display \"say \\\"hi\\\"\")", "expect": "say \"hi\"" },
+  { "name": "escaped newline", "source": "(display \"a\\nb\")", "expect": "a\nb" },
+  { "name": "number->string", "source": "(display (string-append \"n=\" (number->string 42)))", "expect": "n=42" },
+  { "name": "empty string", "source": "(display (string-length \"\"))", "expect": "0" },
+  { "name": "string in a variable", "source": "(define s \"abc\") (display (string-append s s))", "expect": "abcabc" },
+  { "name": "semicolon inside a string", "source": "(display \"semi;colon\")", "expect": "semi;colon" }
+] }

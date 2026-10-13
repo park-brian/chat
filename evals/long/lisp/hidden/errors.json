@@ -1,0 +1,14 @@
+{ "group": "errors", "note": "error: true means the output is expect, then a last line starting with \"Error:\"; run must return, not throw.", "programs": [
+  { "name": "unbound variable", "source": "(display x)", "expect": "", "error": true },
+  { "name": "car of ()", "source": "(display 1) (newline) (car '())", "expect": "1", "error": true },
+  { "name": "error stops the program", "source": "(display \"before\") (error \"boom\") (display \"after\")", "expect": "before", "error": true },
+  { "name": "calling a number", "source": "(5 3)", "expect": "", "error": true },
+  { "name": "too many arguments", "source": "(define (f x) x) (f 1 2)", "expect": "", "error": true },
+  { "name": "adding a string", "source": "(+ 1 \"a\")", "expect": "", "error": true },
+  { "name": "missing )", "source": "(display (+ 1 2)", "expect": "", "error": true },
+  { "name": "stray )", "source": ")", "expect": "", "error": true },
+  { "name": "inside nested calls", "source": "(define (f n) (if (= n 0) (undefined-fn) (f (- n 1)))) (display \"start\") (f 3)", "expect": "start", "error": true },
+  { "name": "cdr of a number", "source": "(cdr 5)", "expect": "", "error": true },
+  { "name": "length of a number", "source": "(display (length 5))", "expect": "", "error": true },
+  { "name": "set! of an unbound variable", "source": "(display \"ok\") (newline) (set! undefined-var 1)", "expect": "ok", "error": true }
+] }

@@ -1,5 +1,5 @@
 // Runs the chat harness against real models on fixed tasks, grades each run, and keeps every transcript.
-// npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout | swe | research | answer-hard | intent] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
+// npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout | swe | research | answer-hard | intent | long] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
 //                 [--system persona.md] [--baseline run-id] [--reasoning off|low|medium|high (default)|xhigh|max] [--headed] [--yes (needed above MAX_UNCONFIRMED jobs)]
 // A task with a rubric is also graded by a judge model (evals/judge.js); its criteria join the checks.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -29,7 +29,7 @@ const START_TIMEOUT = 5_000;
 // Every job calls paid APIs: more than this many must be confirmed with --yes.
 export const MAX_UNCONFIRMED = 20;
 const root = path.dirname(fileURLToPath(import.meta.url));
-export const SETS = ["inner", "holdout", "hard", "game", "answer", "answer-holdout", "swe", "research", "answer-hard", "intent"];
+export const SETS = ["inner", "holdout", "hard", "game", "answer", "answer-holdout", "swe", "research", "answer-hard", "intent", "long"];
 const LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function options(argv, tasks = TASKS) {

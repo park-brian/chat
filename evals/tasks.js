@@ -5,6 +5,7 @@ import SWE from "./swe.js";
 import RESEARCH from "./research.js";
 import ANSWER_HARD from "./answer-hard.js";
 import INTENT from "./intent.js";
+import LONG from "./long.js";
 
 // Eval tasks: each hits one behavior the prompt asks for. A turn is a user message, { seed } to place a file
 // first (written by the echo model, so the real model finds it in the workspace), or { said: [question, reply] } for an
@@ -1073,4 +1074,5 @@ export default [
   ...RESEARCH,
   ...ANSWER_HARD,
   ...INTENT,
+  ...LONG,
 ];

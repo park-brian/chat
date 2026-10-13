@@ -1,0 +1,12 @@
+{ "group": "display", "programs": [
+  { "name": "booleans", "source": "(display #t) (display #f)", "expect": "#t#f" },
+  { "name": "a builtin", "source": "(display car)", "expect": "#<procedure>" },
+  { "name": "a lambda", "source": "(display (lambda (x) x))", "expect": "#<procedure>" },
+  { "name": "strings in a list have no quotes", "source": "(display '(a \"b\" 3))", "expect": "(a b 3)" },
+  { "name": "booleans in a list", "source": "(display (list #t #f))", "expect": "(#t #f)" },
+  { "name": "newline between", "source": "(display 1) (newline) (display 2)", "expect": "1\n2" },
+  { "name": "list of lists", "source": "(display '((1 2) (3 4)))", "expect": "((1 2) (3 4))" },
+  { "name": "numbers in a list", "source": "(display (list 1.5 -2 0))", "expect": "(1.5 -2 0)" },
+  { "name": "improper list", "source": "(display (cons 1 (cons 2 3)))", "expect": "(1 2 . 3)" },
+  { "name": "comments", "source": "; a comment\n(display 5) ; trailing\n", "expect": "5" }
+] }

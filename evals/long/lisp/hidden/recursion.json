@@ -1,0 +1,13 @@
+{ "group": "recursion", "programs": [
+  { "name": "factorial", "source": "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (display (fact 10))", "expect": "3628800" },
+  { "name": "fibonacci", "source": "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 20))", "expect": "6765" },
+  { "name": "sum of a list", "source": "(define (sum l) (if (null? l) 0 (+ (car l) (sum (cdr l))))) (display (sum '(1 2 3 4 5)))", "expect": "15" },
+  { "name": "ackermann", "source": "(define (ack m n) (cond ((= m 0) (+ n 1)) ((= n 0) (ack (- m 1) 1)) (else (ack (- m 1) (ack m (- n 1)))))) (display (ack 2 3))", "expect": "9" },
+  { "name": "mutual recursion", "source": "(define (my-even? n) (if (= n 0) #t (my-odd? (- n 1)))) (define (my-odd? n) (if (= n 0) #f (my-even? (- n 1)))) (display (my-even? 10)) (display (my-odd? 7))", "expect": "#t#t" },
+  { "name": "hanoi moves", "source": "(define (hanoi n) (if (= n 0) 0 (+ 1 (* 2 (hanoi (- n 1)))))) (display (hanoi 10))", "expect": "1023" },
+  { "name": "power", "source": "(define (pow b e) (if (= e 0) 1 (* b (pow b (- e 1))))) (display (pow 2 16))", "expect": "65536" },
+  { "name": "builds a list", "source": "(define (range a b) (if (>= a b) '() (cons a (range (+ a 1) b)))) (display (range 0 5))", "expect": "(0 1 2 3 4)" },
+  { "name": "gcd", "source": "(define (gcd a b) (if (= b 0) a (gcd b (modulo a b)))) (display (gcd 48 18))", "expect": "6" },
+  { "name": "1000 deep, not in tail position", "source": "(define (count-up n) (if (= n 0) 0 (+ 1 (count-up (- n 1))))) (display (count-up 1000))", "expect": "1000" },
+  { "name": "flatten", "source": "(define (flatten x) (cond ((null? x) '()) ((pair? x) (append (flatten (car x)) (flatten (cdr x)))) (else (list x)))) (display (flatten '(1 (2 (3 4)) ((5)))))", "expect": "(1 2 3 4 5)" }
+] }

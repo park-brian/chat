@@ -1,0 +1,13 @@
+{ "group": "conditionals", "programs": [
+  { "name": "if true", "source": "(display (if #t 'yes 'no))", "expect": "yes" },
+  { "name": "if false", "source": "(display (if #f 'yes 'no))", "expect": "no" },
+  { "name": "0 is true", "source": "(display (if 0 'true 'false))", "expect": "true" },
+  { "name": "empty list is true", "source": "(display (if '() 'true 'false))", "expect": "true" },
+  { "name": "if without else", "source": "(if #f (display \"no\")) (display \"done\")", "expect": "done" },
+  { "name": "cond with else", "source": "(define (sign n) (cond ((< n 0) 'negative) ((= n 0) 'zero) (else 'positive))) (display (sign -3)) (display (sign 0)) (display (sign 9))", "expect": "negativezeropositive" },
+  { "name": "cond picks the first true clause", "source": "(display (cond ((= 1 2) 'a) ((= 1 1) 'b) (else 'c)))", "expect": "b" },
+  { "name": "cond clause with several expressions", "source": "(cond (#f (display 1)) (#t (display 2) (display 3)))", "expect": "23" },
+  { "name": "if evaluates one branch", "source": "(display (if (> 3 2) (+ 1 1) (error \"not evaluated\")))", "expect": "2" },
+  { "name": "cond returning strings", "source": "(define (grade n) (cond ((>= n 90) \"A\") ((>= n 80) \"B\") (else \"C\"))) (display (grade 85))", "expect": "B" },
+  { "name": "if as a test", "source": "(display (if (if #f #f #t) 1 2))", "expect": "1" }
+] }

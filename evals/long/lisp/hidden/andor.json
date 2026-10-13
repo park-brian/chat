@@ -1,0 +1,11 @@
+{ "group": "and-or", "programs": [
+  { "name": "and returns the last value", "source": "(display (and 1 2 3))", "expect": "3" },
+  { "name": "and stops at #f", "source": "(display (and 1 #f 3))", "expect": "#f" },
+  { "name": "empty and", "source": "(display (and))", "expect": "#t" },
+  { "name": "or returns the first true value", "source": "(display (or #f 2 3))", "expect": "2" },
+  { "name": "or of falses", "source": "(display (or #f #f))", "expect": "#f" },
+  { "name": "empty or", "source": "(display (or))", "expect": "#f" },
+  { "name": "or short-circuits", "source": "(display (or 1 (error \"short circuit failed\")))", "expect": "1" },
+  { "name": "and short-circuits", "source": "(display (and #f (error \"short circuit failed\")))", "expect": "#f" },
+  { "name": "range test", "source": "(define x 5) (display (and (> x 0) (< x 10) 'in-range))", "expect": "in-range" }
+] }

@@ -1,0 +1,16 @@
+{ "group": "numbers", "programs": [
+  { "name": "integer", "source": "(display 42)", "expect": "42" },
+  { "name": "negative", "source": "(display -17)", "expect": "-17" },
+  { "name": "decimal", "source": "(display 3.25)", "expect": "3.25" },
+  { "name": "variadic +", "source": "(display (+ 1 2 3 4))", "expect": "10" },
+  { "name": "variadic -", "source": "(display (- 10 4 3))", "expect": "3" },
+  { "name": "unary -", "source": "(display (- 5))", "expect": "-5" },
+  { "name": "variadic *", "source": "(display (* 2 3 4))", "expect": "24" },
+  { "name": "/ gives a decimal", "source": "(display (/ 10 4))", "expect": "2.5" },
+  { "name": "/ that divides", "source": "(display (/ 12 3))", "expect": "4" },
+  { "name": "nested arithmetic", "source": "(display (+ (* 2 3) (- 10 (/ 8 2))))", "expect": "12" },
+  { "name": "modulo follows the divisor", "source": "(display (modulo 17 5)) (newline) (display (modulo -7 3))", "expect": "2\n2" },
+  { "name": "float sum as JavaScript prints it", "source": "(display (+ 0.1 0.2))", "expect": "0.30000000000000004" },
+  { "name": "whole float prints as integer", "source": "(display (* 1.5 2))", "expect": "3" },
+  { "name": "empty + and *", "source": "(display (+)) (display (*))", "expect": "01" }
+] }

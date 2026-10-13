@@ -1,0 +1,10 @@
+{ "group": "let", "programs": [
+  { "name": "two bindings", "source": "(display (let ((x 2) (y 3)) (* x y)))", "expect": "6" },
+  { "name": "shadows, then restores", "source": "(define x 10) (display (let ((x 1)) (+ x 1))) (display x)", "expect": "210" },
+  { "name": "bindings see the outer scope", "source": "(display (let ((x 1)) (let ((x 2) (y x)) y)))", "expect": "1" },
+  { "name": "body of several expressions", "source": "(let ((a 1)) (display a) (display (+ a 1)))", "expect": "12" },
+  { "name": "nested", "source": "(display (let ((x 5)) (let ((y (* x 2))) (+ x y))))", "expect": "15" },
+  { "name": "captured by a closure", "source": "(define (f n) (let ((double (* n 2))) (lambda () double))) (display ((f 21)))", "expect": "42" },
+  { "name": "no bindings", "source": "(display (let () 7))", "expect": "7" },
+  { "name": "set! on a let variable", "source": "(display (let ((x 1)) (set! x (+ x 10)) x))", "expect": "11" }
+] }

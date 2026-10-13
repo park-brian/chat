@@ -1,0 +1,11 @@
+{ "group": "comparison", "programs": [
+  { "name": "=", "source": "(display (= 3 3))", "expect": "#t" },
+  { "name": "<", "source": "(display (< 1 2)) (display (< 2 1))", "expect": "#t#f" },
+  { "name": ">", "source": "(display (> 5 2))", "expect": "#t" },
+  { "name": "<= and >=", "source": "(display (<= 2 2)) (display (>= 1 2))", "expect": "#t#f" },
+  { "name": "integer = decimal", "source": "(display (= 1 1.0))", "expect": "#t" },
+  { "name": "eq? on symbols", "source": "(display (eq? 'a 'a)) (display (eq? 'a 'b))", "expect": "#t#f" },
+  { "name": "equal? on nested lists", "source": "(display (equal? '(1 (2 3)) (list 1 (list 2 3))))", "expect": "#t" },
+  { "name": "not", "source": "(display (not #f)) (display (not 0))", "expect": "#t#f" },
+  { "name": "type predicates", "source": "(display (number? 5)) (display (symbol? 'x)) (display (string? \"s\")) (display (procedure? car))", "expect": "#t#t#t#t" }
+] }

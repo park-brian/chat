@@ -1,0 +1,11 @@
+{ "group": "macros", "optional": true, "programs": [
+  { "name": "builds a form with list", "source": "(define-macro (my-if c a b) (list 'cond (list c a) (list 'else b))) (display (my-if #t 1 2))", "expect": "1" },
+  { "name": "quasiquote and unquote", "source": "(define-macro (unless c body) `(if ,c #f ,body)) (display (unless #f 'ran))", "expect": "ran" },
+  { "name": "swap!", "source": "(define-macro (swap! a b) `(let ((tmp ,a)) (set! ,a ,b) (set! ,b tmp))) (define x 1) (define y 2) (swap! x y) (display (list x y))", "expect": "(2 1)" },
+  { "name": "or of two", "source": "(define-macro (my-or2 a b) `(let ((t ,a)) (if t t ,b))) (display (my-or2 #f 7))", "expect": "7" },
+  { "name": "when", "source": "(define-macro (when c body) `(if ,c ,body #f)) (when #t (display \"yes\"))", "expect": "yes" },
+  { "name": "unquote-splicing", "source": "(define-macro (seq a b) `(begin ,@(list a b))) (seq (display 1) (display 2))", "expect": "12" },
+  { "name": "arguments are not evaluated", "source": "(define-macro (ignore x) ''ignored) (display (ignore (error \"evaluated\")))", "expect": "ignored" },
+  { "name": "inc!", "source": "(define-macro (inc! v) `(set! ,v (+ ,v 1))) (define n 5) (inc! n) (inc! n) (display n)", "expect": "7" },
+  { "name": "quasiquote as data", "source": "(define x 5) (display `(a ,x ,@(list 1 2)))", "expect": "(a 5 1 2)" }
+] }

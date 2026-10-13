@@ -1,0 +1,18 @@
+{ "group": "lists", "programs": [
+  { "name": "list", "source": "(display (list 1 2 3))", "expect": "(1 2 3)" },
+  { "name": "cons onto a list", "source": "(display (cons 1 '(2 3)))", "expect": "(1 2 3)" },
+  { "name": "dotted pair", "source": "(display (cons 1 2))", "expect": "(1 . 2)" },
+  { "name": "car and cdr", "source": "(display (car '(1 2 3))) (display (cdr '(1 2 3)))", "expect": "1(2 3)" },
+  { "name": "cdr of a one-element list", "source": "(display (cdr '(1)))", "expect": "()" },
+  { "name": "null?", "source": "(display (null? '())) (display (null? '(1)))", "expect": "#t#f" },
+  { "name": "length", "source": "(display (length '(a b c d)))", "expect": "4" },
+  { "name": "length of ()", "source": "(display (length '()))", "expect": "0" },
+  { "name": "append", "source": "(display (append '(1 2) '(3 4) '(5)))", "expect": "(1 2 3 4 5)" },
+  { "name": "reverse", "source": "(display (reverse '(1 2 3)))", "expect": "(3 2 1)" },
+  { "name": "pair? and list?", "source": "(display (pair? '(1))) (display (pair? '())) (display (list? '(1 2))) (display (list? '()))", "expect": "#t#f#t#t" },
+  { "name": "third element", "source": "(display (car (cdr (cdr '(a b c)))))", "expect": "c" },
+  { "name": "nested and empty", "source": "(display (list 1 (list 2 3) '()))", "expect": "(1 (2 3) ())" },
+  { "name": "cons doesn't change the tail", "source": "(define l (list 1 2)) (define m (cons 0 l)) (display m) (display l)", "expect": "(0 1 2)(1 2)" },
+  { "name": "cons chain", "source": "(display (cons 1 (cons 2 (cons 3 '()))))", "expect": "(1 2 3)" },
+  { "name": "empty list call", "source": "(display (list))", "expect": "()" }
+] }

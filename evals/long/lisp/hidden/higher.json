@@ -1,0 +1,13 @@
+{ "group": "higher-order", "programs": [
+  { "name": "map", "source": "(display (map (lambda (x) (* x x)) '(1 2 3 4)))", "expect": "(1 4 9 16)" },
+  { "name": "filter", "source": "(display (filter (lambda (x) (> x 2)) '(1 2 3 4 5)))", "expect": "(3 4 5)" },
+  { "name": "reduce +", "source": "(display (reduce + 0 '(1 2 3 4 5)))", "expect": "15" },
+  { "name": "reduce folds from the left", "source": "(display (reduce - 0 '(1 2 3)))", "expect": "-6" },
+  { "name": "reduce with (acc x)", "source": "(display (reduce (lambda (acc x) (cons x acc)) '() '(1 2 3)))", "expect": "(3 2 1)" },
+  { "name": "map a builtin", "source": "(display (map car '((a 1) (b 2))))", "expect": "(a b)" },
+  { "name": "filter with a defined predicate", "source": "(define (odd? n) (= (modulo n 2) 1)) (display (filter odd? '(1 2 3 4 5)))", "expect": "(1 3 5)" },
+  { "name": "map over ()", "source": "(display (map (lambda (x) x) '()))", "expect": "()" },
+  { "name": "reduce for a maximum", "source": "(display (reduce (lambda (a b) (if (> a b) a b)) 0 '(3 9 2 7)))", "expect": "9" },
+  { "name": "filter, map, reduce", "source": "(display (reduce + 0 (map (lambda (x) (* 2 x)) (filter (lambda (x) (< x 4)) '(1 2 3 4 5)))))", "expect": "12" },
+  { "name": "own map over strings", "source": "(define (my-map f l) (if (null? l) '() (cons (f (car l)) (my-map f (cdr l))))) (display (my-map (lambda (s) (string-append s \"!\")) '(\"a\" \"b\")))", "expect": "(a! b!)" }
+] }

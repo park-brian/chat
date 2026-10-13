@@ -1,0 +1,11 @@
+{ "group": "begin-set", "programs": [
+  { "name": "begin runs in order", "source": "(begin (display 1) (display 2) (display 3))", "expect": "123" },
+  { "name": "begin returns the last value", "source": "(display (begin 1 2 3))", "expect": "3" },
+  { "name": "set! a global", "source": "(define x 1) (set! x 5) (display x)", "expect": "5" },
+  { "name": "set! from a function", "source": "(define x 1) (define (bump) (set! x (+ x 1))) (bump) (bump) (display x)", "expect": "3" },
+  { "name": "set! a list", "source": "(define lst '()) (set! lst (cons 1 lst)) (set! lst (cons 2 lst)) (display lst)", "expect": "(2 1)" },
+  { "name": "define inside a body is local", "source": "(define (f) (define y 10) (set! y (* y 2)) y) (display (f))", "expect": "20" },
+  { "name": "accumulator", "source": "(define total 0) (define (add! n) (set! total (+ total n)) total) (add! 5) (add! 7) (display total)", "expect": "12" },
+  { "name": "set! changes the nearest binding", "source": "(define x 'outer) (let ((x 'inner)) (set! x 'changed)) (display x)", "expect": "outer" },
+  { "name": "newline", "source": "(display \"a\") (newline) (display \"b\") (newline)", "expect": "a\nb" }
+] }

@@ -1,0 +1,11 @@
+{ "group": "tail-calls", "programs": [
+  { "name": "if, 100000 deep", "source": "(define (loop n) (if (= n 0) 'done (loop (- n 1)))) (display (loop 100000))", "expect": "done" },
+  { "name": "accumulator, 100000 deep", "source": "(define (sum n acc) (if (= n 0) acc (sum (- n 1) (+ acc n)))) (display (sum 100000 0))", "expect": "5000050000" },
+  { "name": "cond", "source": "(define (loop n) (cond ((= n 0) 'ok) (else (loop (- n 1))))) (display (loop 100000))", "expect": "ok" },
+  { "name": "let body", "source": "(define (loop n) (let ((m (- n 1))) (if (< m 0) 'ok (loop m)))) (display (loop 100000))", "expect": "ok" },
+  { "name": "begin", "source": "(define (loop n) (begin (if (= n 0) 'ok (loop (- n 1))))) (display (loop 100000))", "expect": "ok" },
+  { "name": "mutual", "source": "(define (ev? n) (if (= n 0) #t (od? (- n 1)))) (define (od? n) (if (= n 0) #f (ev? (- n 1)))) (display (ev? 100000))", "expect": "#t" },
+  { "name": "and/or", "source": "(define (all-pos? n) (or (= n 0) (and (> n 0) (all-pos? (- n 1))))) (display (all-pos? 100000))", "expect": "#t" },
+  { "name": "side effects in a loop", "source": "(define count 0) (define (loop n) (if (> n 0) (begin (set! count (+ count 1)) (loop (- n 1))))) (loop 100000) (display count)", "expect": "100000" },
+  { "name": "through a lambda", "source": "(define (loop n acc) (if (= n 0) acc ((lambda (m) (loop m (+ acc 1))) (- n 1)))) (display (loop 100000 0))", "expect": "100000" }
+] }

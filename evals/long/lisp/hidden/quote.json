@@ -1,0 +1,10 @@
+{ "group": "quote", "programs": [
+  { "name": "quoted symbol", "source": "(display 'x)", "expect": "x" },
+  { "name": "quoted list", "source": "(display '(1 2 3))", "expect": "(1 2 3)" },
+  { "name": "quote form", "source": "(display (quote (a b)))", "expect": "(a b)" },
+  { "name": "empty list", "source": "(display '())", "expect": "()" },
+  { "name": "nested quoted list", "source": "(display '(1 (2 (3))))", "expect": "(1 (2 (3)))" },
+  { "name": "car of a quoted list", "source": "(display (car '(a b c)))", "expect": "a" },
+  { "name": "quoted code is data", "source": "(display '(+ 1 2))", "expect": "(+ 1 2)" },
+  { "name": "quoted element is a symbol", "source": "(display (symbol? (car '(foo))))", "expect": "#t" }
+] }

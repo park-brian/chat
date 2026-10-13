@@ -1,0 +1,10 @@
+{ "group": "define", "programs": [
+  { "name": "variable", "source": "(define x 10) (display x)", "expect": "10" },
+  { "name": "from another variable", "source": "(define x 2) (define y (* x 5)) (display y)", "expect": "10" },
+  { "name": "function shorthand", "source": "(define (square n) (* n n)) (display (square 7))", "expect": "49" },
+  { "name": "redefine", "source": "(define x 1) (define x 2) (display x)", "expect": "2" },
+  { "name": "no parameters", "source": "(define (f) 5) (display (f))", "expect": "5" },
+  { "name": "body of several expressions", "source": "(define (g a b) (display a) (display b) (+ a b)) (display (g 1 2))", "expect": "123" },
+  { "name": "uses a global", "source": "(define pi 3.14159) (define (area r) (* pi r r)) (display (area 2))", "expect": "12.56636" },
+  { "name": "function values", "source": "(define (compose f g) (lambda (x) (f (g x)))) (define inc (lambda (x) (+ x 1))) (display ((compose inc inc) 5))", "expect": "7" }
+] }
