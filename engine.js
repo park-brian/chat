@@ -1163,10 +1163,12 @@ function contradictedClaim(messages) {
 }
 
 function openItemsNote(contract, asked) {
-  const open = contract.items.filter(i => i.status !== "done" && runnable(i));
+  // A weak item (its check passed before the work) can't turn done, so it isn't open work: saying it is only made the
+  // model explain the plan to the user (docs/experiments/LOG.md, E6).
+  const open = contract.items.filter(i => i.status !== "done" && runnable(i) && !i.weak);
   if (!open.length || asked) return null;
   const [first] = open;
-  return `${itemsLabel(open.map(i => i.id))} ${open.length > 1 ? "are" : "is"} open, and the harness counts an item done only when its check passes. Continue with item ${first.id}, "${first.title}" (check: ${describeCheck(first.check)}), or say why the work stops here.`;
+  return `${itemsLabel(open.map(i => i.id))} ${open.length > 1 ? "are" : "is"} open, and the harness counts an item done only when its check passes. Continue with item ${first.id}, "${first.title}" (check: ${describeCheck(first.check)}), or tell the user why the work stops here, in terms of the work: they don't see the plan.`;
 }
 
 function doneNote(done, contract) {

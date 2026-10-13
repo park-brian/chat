@@ -6136,11 +6136,13 @@ if (window.__HARNESS__?.test) (async () => {
           assert(count((await directedTurn({ script: [...calls(7), reply("Stopping: the source is down.")], contract: stuck })).notes, STALL) === 1, "six steps with no check passing: once");
           assert(count((await directedTurn({ script: [...calls(5), reply("Done.")], contract: stuck })).notes, STALL) === 0, "five: none");
           // Stopping with items open: once a turn, then the model's word stands; not when it stopped to ask.
-          const OPEN = 'Item 1 is open, and the harness counts an item done only when its check passes. Continue with item 1, "Item 1" (check: "never seen" appears in a tool result), or say why the work stops here.';
+          const OPEN = `Item 1 is open, and the harness counts an item done only when its check passes. Continue with item 1, "Item 1" (check: "never seen" appears in a tool result), or tell the user why the work stops here, in terms of the work: they don't see the plan.`;
           const open = await directedTurn({ script: [...calls(1), reply("Done."), reply("It needs the user.")], contract: stuck });
           assert(eq(open.notes, [OPEN]) && open.store.messages.at(-1).content[0].text === "It needs the user.", `open items are named at the stop: ${JSON.stringify(open.notes)}`);
           assert((await directedTurn({ script: [reply("Search is by tag.")], contract: stuck })).notes.length === 0, "not after a turn that only answered");
           assert((await directedTurn({ script: [...calls(1), reply("Done.")], contract: withItems(item(1, { kind: "source", text: "x" }, "done"), item(2, { kind: "judge", text: "reads well" })) })).notes.length === 0, "not when every item the harness can check is done");
+          const weakOnly = withItems({ ...item(1, { kind: "source", text: "never seen" }), weak: true });
+          assert((await directedTurn({ script: [...calls(1), reply("Done.")], contract: weakOnly })).notes.length === 0, "not for an item whose check passed before the work: nothing can turn it done");
           const asking = await directedTurn({ script: [...calls(1, "plan", { ask: "Which tags?" }), reply("Which tags should search use?")], contract: stuck });
           assert(!asking.notes.some(n => n.startsWith("Item 1 is open")), `nor when it stopped to ask: ${JSON.stringify(asking.notes)}`);
           // The context near the summary: write notes, once until the next summary.
