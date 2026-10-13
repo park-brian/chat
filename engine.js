@@ -433,12 +433,12 @@ Examples:
     fn: runApp,
     toolSpec: {
       name: "run_app",
-      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included.",
+      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included. There is no Node.js, npm or shell here: on a test file or folder (test/index.test.js, test/), it runs the tests as node --test would (node:test, node:assert and the common runners work) and returns pass and fail counts.",
       inputSchema: {
         json: {
           type: "object",
           properties: {
-            path: { type: "string", description: "A file to run instead of the shown artifact, e.g. a page under scratch/" },
+            path: { type: "string", description: "A file to run instead of the shown artifact, e.g. a page under scratch/, or a test file, folder or glob (test/parse.test.js, test/, test/*.test.js)" },
             version: { type: "integer", description: "Version id to run instead of the current file, such as one a variant returned" },
             viewport: { type: "string", enum: ["fit", "desktop", "tablet", "mobile"], description: "Preview size. Wider than a phone, the screenshot has a phone's width beside it" },
             script: { type: "string", description: "Async function body run in the app page, e.g. document.querySelector('button').click(); return document.title" },
@@ -1049,10 +1049,13 @@ async function pageReport(ws, page, { script = null, fresh = [], signal } = {}) 
 async function testCheck(c, ws, fresh, signal) {
   if (!ws?.state?.project) return fail("no project is open, so nothing can be tested yet");
   const file = c.file ? normalizePath(c.file) : null;
-  if (file && !ws.state.project.heads[file]) return fail(`${file} doesn't exist`);
-  const page = file && isHtml(file) ? file : ws.shownPath();
-  if (!page || !isHtml(page)) return fail("no page runs tests: the project shows no HTML page");
-  const report = await pageReport(ws, page, { fresh, signal });
+  // A test file or folder runs as `node --test` would.
+  const tests = file && !isHtml(file) ? testFiles(file, ws.state.project.heads) : null;
+  if (tests && !tests.length) return fail(`${file} has no test files`);
+  if (!tests && file && !ws.state.project.heads[file]) return fail(`${file} doesn't exist`);
+  const page = tests ? file : file && isHtml(file) ? file : ws.shownPath();
+  if (!tests && (!page || !isHtml(page))) return fail("no page runs tests: the project shows no HTML page");
+  const report = tests ? (await ws.run({ tests: { files: tests, path: file }, signal })).report : await pageReport(ws, page, { fresh, signal });
   const t = report.tests;
   if (!t) return fail(`${page}: ${clip(report.notes?.[0] ?? report.errors?.[0] ?? "no in-file tests ran", 160)}`);
   if (t.failed) return fail(`${page}: ${t.passed} passed, ${t.failed} failed${t.failures?.length ? `: ${clip(t.failures.slice(0, 2).join("; "), 200)}` : ""}`);
@@ -3125,11 +3128,13 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   // screenshot: true forces one, false skips it, "auto" attaches one while the user shares the tab.
   // announce: tell the other workspaces on the project, for a run the engine asked for.
   // signal: a run its caller stopped doesn't start, or stops where it is.
-  function run({ versionId = null, script = null, screenshot = false, viewport = null, announce = false, signal = null } = {}) {
-    if (host) return hostRun({ versionId, script, screenshot, viewport }, signal);
+  // tests: { files, path }, test files to run as `node --test` would (see testFiles), reported as path.
+  function run({ versionId = null, script = null, screenshot = false, viewport = null, announce = false, signal = null, tests = null } = {}) {
+    if (host) return hostRun({ versionId, script, screenshot, viewport, tests }, signal);
     if (viewport) setState("viewport", viewport);
     return enqueueRun(async () => {
       signal?.throwIfAborted();
+      if (tests) return runTests(tests, signal);
       const result = await runNow({ versionId, script, screenshot, signal });
       if (announce) channel.postMessage({ projectId: state.project.id, ran: true });
       return result;
@@ -3139,6 +3144,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   async function hostRun(args, signal) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
+    if (args.tests) return host.run({ tests: args.tests, path: null, projectId: project.id, branch, threadId: context.threadId ?? null, agentId: context.agentId ?? null }, { signal });
     const shown = shownPath(project);
     const versionId = args.versionId ?? (shown && project.heads[shown]);
     if (!versionId) throw new Error("Nothing to show yet. Create an artifact with write_file.");
@@ -3182,6 +3188,41 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
         if (state.project?.id === project.id && !scratch) setState("report", { ...report });
       }
       return { report, image };
+    } finally {
+      setState("running", false);
+    }
+  }
+
+  // Test files run off screen, in a page of their own at the top of the folder; the preview and its report stay the
+  // shown artifact's.
+  async function runTests({ files: tests, path }, signal) {
+    const project = state.project;
+    if (!project) throw new Error("No project is open.");
+    const files = Object.fromEntries(await Promise.all(Object.entries(project.heads)
+      .map(async ([p, id]) => [p, await getBlob(db, (await db.get("versions", id)).hash)])));
+    // A file that imports one the workspace hasn't got fails without a run, which would only say "failed to fetch".
+    const missing = [], broken = [];
+    for (const file of tests) {
+      const found = (await missingFiles(file, files[file] ?? "", p => files[p] ?? null)).map(f => (f.startsWith("L") ? `${file} ${f}` : f));
+      if (found.length) { missing.push(...found); broken.push(file); }
+    }
+    const runnable = tests.filter(f => !broken.includes(f));
+    setState("running", true);
+    try {
+      const { report } = runnable.length ? await runner.run({ version: { id: null, path: TEST_PAGE }, doc: testDocument(runnable), files, parked: true, signal })
+        : { report: { ok: true, errors: [], errorCount: 0, tests: { passed: 0, failed: 0, failures: [] }, console: [] } };
+      const { version, viewport, overflow, ...rest } = report;
+      const t = rest.tests, ran = t ? t.passed + t.failed : 0;
+      if (t && broken.length) Object.assign(t, { failed: t.failed + broken.length, failures: [...broken.map(f => `${f} failed to load`), ...t.failures].slice(0, 5) });
+      const notes = [
+        ...(broken.length ? [`Not run: ${broken.join(", ")} ${broken.length > 1 ? "load" : "loads"} files the workspace doesn't have.`] : []),
+        ...(t && runnable.length && !ran ? [`No test ran: ${runnable.length > 1 ? "these files register" : `${runnable[0]} registers`} none with test() or it() from node:test.`] : []),
+        ...(rest.notes ?? []).filter(n => !/TESTS_DONE/.test(n)),
+      ];
+      const out = { ...rest, path: path || "./", ...(path !== tests[0] && { files: tests.slice(0, 30) }), ok: rest.ok && !missing.length && ran > 0, errors: [...missing, ...rest.errors].slice(0, 5), errorCount: rest.errorCount + missing.length };
+      if (rest.timedOut?.includes("tests")) notes.push(`The tests stopped before they finished: look at the test after the last one logged.`);
+      if (notes.length) out.notes = notes; else delete out.notes;
+      return { report: out, image: null };
     } finally {
       setState("running", false);
     }
@@ -3868,6 +3909,68 @@ async function missingFiles(path, text, read) {
   return found.slice(0, 3);
 }
 
+// A project's tests as `node --test` runs them, though there is no Node here: run_app on a test file, a folder or a
+// glob runs a page whose import map points node:test, node:assert and the common runners at node-test.js beside this
+// file, imports each test file from the workspace (its relative imports load the workspace's files), and reports the
+// counts. Why: Haiku planned `node --test`, found no way to run a repository's tests, and settled for checking that
+// its edits' text was there (docs/experiments/LOG.md, E10).
+const NODE_TEST_URL = new URL("./node-test.js", import.meta.url).href;
+const TEST_FILE = /(^|\/)([^/]*\.test\.m?js|test[^/]*\.m?js)$/;
+// The page that runs them, at the top of the folder; no file of the project is served in its place.
+const TEST_PAGE = "__tests__.html";
+const globPattern = glob => new RegExp("^" + glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\?/g, "[^/]")
+  .replace(/\*\*\/|\*\*|\*/g, m => (m === "**/" ? "(?:.*/)?" : m === "**" ? ".*" : "[^/]*")) + "$");
+
+// The test files a path names: a .js or .mjs file itself, the test files in a folder (every *.test.js, *.test.mjs
+// and test*.js under it), or those a glob matches. null for a path that names none of these, such as a page.
+function testFiles(path, heads) {
+  const target = normalizePath(path ?? "");
+  const files = Object.keys(heads).filter(p => !p.split("/").includes("node_modules")).sort();
+  if (/\.m?js$/i.test(target) && heads[target]) return [target];
+  if (target.includes("*")) return files.filter(p => globPattern(target).test(p));
+  const dir = target.replace(/\/$/, "");
+  if (heads[dir]) return null;
+  const under = files.filter(p => !dir || p.startsWith(dir + "/"));
+  return dir && !under.length ? null : under.filter(p => TEST_FILE.test(p));
+}
+
+// What each specifier imports: node-test.js's parts under the names Node and the runners give them.
+function testImports(url = NODE_TEST_URL) {
+  const from = JSON.stringify(url);
+  const mod = source => "data:text/javascript," + encodeURIComponent(source);
+  const asserts = name => mod(`import { ${name} as a } from ${from};\nexport default a;\nexport const { ok, equal, notEqual, strictEqual, notStrictEqual, deepEqual, notDeepEqual, deepStrictEqual, notDeepStrictEqual, throws, doesNotThrow, rejects, doesNotReject, match, doesNotMatch, ifError, fail, strict, AssertionError } = a;`);
+  const nodeTest = mod(`export { default, test, it, describe, suite, before, after, beforeEach, afterEach, mock, run } from ${from};`);
+  return {
+    "node:test": nodeTest,
+    "node:assert": asserts("assert"), assert: asserts("assert"),
+    "node:assert/strict": asserts("strict"), "assert/strict": asserts("strict"),
+    uvu: mod(`export { uvuSuite as suite, uvuTest as test } from ${from};`),
+    "uvu/assert": mod(`import { uvuAssert as a } from ${from};\nexport const { ok, is, equal, type, instance, match, snapshot, fixture, throws, unreachable, not, Assertion } = a;`),
+    tape: mod(`export { tape as default, tape as test } from ${from};`),
+  };
+}
+
+function testDocument(files, url = NODE_TEST_URL) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tests</title>
+<script type="importmap">${JSON.stringify({ imports: testImports(url) })}<\/script>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import { runFiles } from ${JSON.stringify(url)};
+const result = await runFiles(${JSON.stringify(files.map(f => "./" + f))}, { base: new URL(".", location.href).href });
+document.getElementById("out").textContent = result.passed + " passed, " + result.failed + " failed";
+window.TESTS_DONE = result;
+<\/script>
+</body>
+</html>
+`;
+}
+
 // Returns the text to commit (with any proven fix), fixes made, errors that stop the run, and notes.
 // run: the code tool's runner, for the imports check.
 async function preflight(path, text, { run = null } = {}) {
@@ -4095,6 +4198,10 @@ async function runApp({ path, version, viewport, script, screenshot = true } = {
   return attempt(async () => {
     const ws = await workspaceFor(context);
     if (viewport && viewport !== "fit" && !Object.hasOwn(VIEWPORTS, viewport)) viewport = null;
+    // A test file, a folder or a glob runs its tests as `node --test` would.
+    const tests = path && version == null && !isHtml(path) ? testFiles(path, ws.state.project.heads) : null;
+    if (tests && !tests.length) return { error: `No test files in ${normalizePath(path) || "the project"}: a folder runs its *.test.js, *.test.mjs and test*.js files. Name a file to run another.` };
+    if (tests) return { report: (await ws.run({ tests: { files: tests, path: normalizePath(path) }, signal: context.signal })).report };
     // A version names its own file, a variant's on its branch too; path picks the current one.
     const head = path && version == null && ws.state.project.heads[normalizePath(path)];
     if (path && version == null && !head) return { error: await missingFile(ws, normalizePath(path), context) };

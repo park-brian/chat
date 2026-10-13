@@ -3020,8 +3020,11 @@
           const failures = lines.filter(t => t.startsWith("FAIL:")).map(t => t.slice(5).trim().replace(/\s+/g, " ").slice(0, 300));
           // The passing tests by name, for the harness's checks; requests leave them out.
           const passes = lines.filter(t => t.startsWith("PASS:")).map(t => t.slice(5).trim().split("\n")[0].slice(0, 120)).slice(0, 100);
-          const tests = testRun.tests
-            ? { passed: +testRun.tests.passed || 0, failed: +testRun.tests.failed || 0, failures: failures.slice(0, 5), ...(passes.length && { passes }) }
+          // A test file's run (node-test.js) also counts what it skipped, and each file's results when there are several.
+          const done = testRun.tests, counted = k => +done?.[k] ? { [k]: +done[k] } : {};
+          const perFile = Array.isArray(done?.files) ? { files: done.files.slice(0, 30).map(f => `${f.file}: ${f.passed} passed, ${f.failed} failed`) } : {};
+          const tests = done
+            ? { passed: +done.passed || 0, failed: +done.failed || 0, ...counted("skipped"), ...counted("todo"), failures: failures.slice(0, 5), ...(passes.length && { passes }), ...perFile }
             : failures.length ? { passed: lines.filter(t => t.startsWith("PASS:")).length, failed: failures.length, failures: failures.slice(0, 5), ...(passes.length && { passes }) } : null;
           const timedOut = [...new Set([...testRun.timedOut, ...previewRun.timedOut])];
           // An HTML artifact without tests isn't done, so the report says so where the model looks first.
@@ -4932,6 +4935,107 @@
           }
         }
 
+        // Why: Haiku planned `node --test`, found no way to run a repository's tests here, and settled for checking that
+        // its edits' text was there (docs/experiments/LOG.md, E10). run_app on a test file runs it as Node would.
+        async function testRunTestFiles() {
+          const ui = createTestUI();
+          try {
+            const context = { workspace: ui.workspace, agentId: 1, threadId: null };
+            await ui.workspace.createProject({ name: "Tests" });
+            await writeFile({ path: "src/math.js", content: `export const add = (a, b) => a + b;\nexport const half = n => n / 2;\n` }, context);
+            await writeFile({ path: "test/math.test.js", content: [
+              `import { test, describe, it, before, beforeEach } from "node:test";`,
+              `import assert from "node:assert/strict";`,
+              `import { add, half } from "../src/math.js";`,
+              `let ready = false, each = 0;`,
+              `before(() => { ready = true; });`,
+              `test("adds", () => assert.equal(add(1, 2), 3));`,
+              `test("waits", async () => { await new Promise(r => setTimeout(r, 10)); assert.ok(ready); });`,
+              `test("halves", () => {`,
+              `  assert.equal(half(3), 1);`,
+              `});`,
+              `test.skip("skipped", () => { throw new Error("ran"); });`,
+              `test("later", { todo: true }, () => { throw new Error("not yet"); });`,
+              `describe("group", () => {`,
+              `  beforeEach(() => { each++; });`,
+              `  it("first", () => assert.equal(each, 1));`,
+              `  it("second", () => assert.equal(each, 2));`,
+              `});`,
+              `test("parent", async t => {`,
+              `  await t.test("child one", () => assert.deepEqual([add(1, 1)], [2]));`,
+              `  t.test("child two", () => assert.throws(() => { throw new TypeError("x"); }, TypeError));`,
+              `});`,
+            ].join("\n") }, context);
+            const one = await runApp({ path: "test/math.test.js" }, context);
+            const t = one.report?.tests;
+            assert(t?.passed === 7 && t.failed === 1 && t.skipped === 1 && t.todo === 1, `a node:test file runs, its counts as Node's: ${JSON.stringify(one)}`);
+            assert(one.report.path === "test/math.test.js" && one.report.ok === false, `the report is the file's: ${JSON.stringify(one.report)}`);
+            assert(eq(t.passes, ["adds", "waits", "group > first", "group > second", "parent > child one", "parent > child two", "parent"]), `passing tests by name, nested ones under theirs: ${JSON.stringify(t.passes)}`);
+            assert(t.failures[0]?.startsWith("halves Expected values to be strictly equal: 1.5 !== 1 (at test/math.test.js:9:"), `the failure says what and where: ${t.failures[0]}`);
+            assert(ui.workspace.shownPath() !== "test/math.test.js" && !ui.workspace.state.report, "the run leaves the preview and its report alone");
+
+            // A folder sums its test files; a helper beside them isn't one.
+            await writeFile({ path: "test/more.test.mjs", content: `import test from "node:test";\nimport { strictEqual } from "assert";\ntest("more", () => strictEqual(1, 1));\n` }, context);
+            await writeFile({ path: "test/helpers.js", content: `throw new Error("not a test file");\n` }, context);
+            const folder = await runApp({ path: "test/" }, context);
+            assert(folder.report?.tests?.passed === 8 && folder.report.tests.failed === 1 && eq(folder.report.files, ["test/math.test.js", "test/more.test.mjs"]), `a folder runs each test file in it: ${JSON.stringify(folder.report)}`);
+            assert(eq(folder.report.tests.files, ["test/math.test.js: 7 passed, 1 failed", "test/more.test.mjs: 1 passed, 0 failed"]), `and counts each: ${JSON.stringify(folder.report.tests.files)}`);
+            const glob = await runApp({ path: "test/*.test.mjs" }, context);
+            assert(glob.report?.ok && glob.report.tests.passed === 1, `so does a glob: ${JSON.stringify(glob.report)}`);
+            assert((await runApp({ path: "src/" }, context)).error?.startsWith("No test files in src/"), "a folder with none says so");
+            const plain = await runApp({ path: "src/math.js" }, context);
+            assert(plain.report?.ok === false && plain.report.notes?.[0]?.startsWith("No test ran: src/math.js registers none"), `a module with no tests isn't a pass: ${JSON.stringify(plain.report)}`);
+            await writeFile({ path: "test/broken.test.js", content: `import { gone } from "../src/gone.js";\n` }, context);
+            const broken = await runApp({ path: "test/broken.test.js" }, context);
+            assert(broken.report?.ok === false && broken.report.tests?.failed === 1 && broken.report.errors?.[0]?.startsWith("test/broken.test.js L1: ../src/gone.js is not in the workspace") && broken.report.notes?.[0] === "Not run: test/broken.test.js loads files the workspace doesn't have.", `an import the folder hasn't got is named: ${JSON.stringify(broken.report)}`);
+
+            // The plan's test check takes a file or a folder too.
+            const failing = await runCheck({ kind: "test", file: "test/math.test.js" }, { ws: ui.workspace });
+            const passing = await runCheck({ kind: "test", file: "test/more.test.mjs", name: "more" }, { ws: ui.workspace });
+            assert(failing.result === "fail" && failing.evidence.startsWith("test/math.test.js: 7 passed, 1 failed: halves") && passing.result === "pass", `a test check runs a test file: ${JSON.stringify([failing, passing])}`);
+
+            // The docs say so, plainly.
+            const said = "There is no Node.js, npm or shell here; code runs in the browser. To run a project's tests, call run_app on the";
+            const prompt = systemPrompt("P", { tools: ["code", "plan", ...WORKSPACE_TOOL_NAMES] }).replace(/\s+/g, " ");
+            assert(prompt.split(said.replace(/\s+/g, " ")).length === 3, "the environment and run_app's docs both say how tests run");
+            assert(/file may name a test file or folder/.test(prompt), "and so does the plan's test check");
+          } finally {
+            ui.cleanup();
+          }
+        }
+
+        // The swe tier's repositories, as the workspace has them: their own tests pass under run_app, and the hidden
+        // ones fail until the fix is in.
+        async function testSweTestFiles() {
+          const tasks = {
+            "swe-ms-negative": { repo: ["index.js", "test/expect.js", "test/index.test.js"], hidden: "negative-decimals.test.js", fix: ["index.js"], own: 47 },
+            "swe-mitt-off-emit": { repo: ["src/index.js", "test/index.test.js"], hidden: "off-during-emit.test.js", fix: ["src/index.js"], own: 19 },
+            "swe-dequal-keys": { repo: ["src/index.js", "src/lite.js", "test/index.test.js", "test/lite.test.js", "test/uvu.js", "test/uvu-assert.js"], hidden: "extra-keys.test.js", fix: ["src/index.js", "src/lite.js"], own: 43 },
+            "swe-mri-alias-default": { repo: ["lib/index.js", "test/index.test.js", "test/num.test.js", "test/unknown.test.js", "test/tape.js"], hidden: "default-alias.test.js", fix: ["lib/index.js"], own: 22 },
+          };
+          const read = async p => { const r = await fetch(`./evals/swe/${p}`); if (!r.ok) throw new Error(`${p}: ${r.status}`); return r.text(); };
+          for (const [id, spec] of Object.entries(tasks)) {
+            const ui = createTestUI();
+            try {
+              const context = { workspace: ui.workspace, agentId: 1, threadId: null };
+              await ui.workspace.createProject({ name: id });
+              for (const p of spec.repo) await writeFile({ path: p, content: await read(`${id}/repo/${p}`) }, context);
+              const own = await runApp({ path: "test/" }, context);
+              // The Buffer test of dequal's needs Node, and registers only there.
+              assert(own.report?.ok && own.report.tests.passed === spec.own && !own.report.tests.failed, `${id}: its own tests pass: ${JSON.stringify(own.report)}`);
+              const hiddenPath = `test/hidden-${spec.hidden}`;
+              await writeFile({ path: hiddenPath, content: await read(`${id}/hidden/${spec.hidden}`) }, context);
+              const before = await runApp({ path: hiddenPath }, context);
+              assert(before.report?.tests?.failed > 0, `${id}: the hidden tests fail before the fix: ${JSON.stringify(before.report?.tests)}`);
+              for (const p of spec.fix) await writeFile({ path: p, content: await read(`${id}/fix/${p}`) }, context);
+              const after = await runApp({ path: hiddenPath }, context);
+              assert(after.report?.ok && after.report.tests.passed > 0 && !after.report.tests.failed, `${id}: and pass after it: ${JSON.stringify(after.report?.tests)}`);
+            } finally {
+              ui.cleanup();
+            }
+          }
+        }
+
         // Why: a user's project is a folder; one file at a time with relative URLs refused, folder-feature couldn't run at all
         async function testFolderProject() {
           const ui = createTestUI();
@@ -6545,6 +6649,8 @@ if (window.__HARNESS__?.test) (async () => {
           testTestScreenshots,
           testArtifactRenderers,
           testFolderProject,
+          testRunTestFiles,
+          testSweTestFiles,
           testLayoutChecks,
           testGameLoop,
           testTestRunStorage,

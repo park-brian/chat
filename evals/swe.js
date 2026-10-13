@@ -25,8 +25,21 @@ export function readTree(dir, prefix = "") {
 }
 
 // The browser half of the test setup, the same in every repository: test/index.html maps node:test and node:assert
-// to small stand-ins, so the suite that `node --test` runs also runs as a page in the workspace.
-const BROWSER = ["node-test.js", "assert.js", "assert-strict.js"];
+// to the app's own stand-ins (node-test.js, which run_app uses on a test file), so the suite that `node --test` runs
+// also runs as a page in the workspace.
+const ASSERT_NAMES = "ok, equal, notEqual, strictEqual, notStrictEqual, deepEqual, notDeepEqual, deepStrictEqual, notDeepStrictEqual, throws, doesNotThrow, rejects, doesNotReject, match, doesNotMatch, ifError, fail";
+const assertShim = name => `// node:assert${name === "strict" ? "/strict" : ""} for the browser: test/index.html maps it here.
+import { ${name} as assert, AssertionError } from "./node-test.js";
+
+export default assert;
+export { AssertionError };
+export const { ${ASSERT_NAMES} } = assert;
+`;
+const browserFiles = () => ({
+  "node-test.js": lf(readFileSync(path.join(SWE_DIR, "..", "..", "node-test.js"), "utf8")),
+  "assert.js": assertShim("assert"),
+  "assert-strict.js": assertShim("strict"),
+});
 function testPage(name, files) {
   return `<!doctype html>
 <html lang="en">
@@ -49,7 +62,7 @@ function testPage(name, files) {
       try { await import(file); }
       catch (e) { broken++; console.log("FAIL: import " + file + "\\n   " + (e?.stack ?? e)); }
     }
-    const { passed, failed } = await run({ broken });
+    const { passed, failed } = await run({ broken, base: new URL("../", location.href).href });
     document.getElementById("out").textContent = passed + " passed, " + failed + " failed";
   </script>
 </body>
@@ -63,8 +76,7 @@ const cache = new Map();
 export function seedFiles(name) {
   if (cache.has(name)) return cache.get(name);
   const repo = readTree(path.join(SWE_DIR, name, "repo"));
-  const runner = path.join(SWE_DIR, "runner");
-  for (const f of BROWSER) repo["test/browser/" + f] = lf(readFileSync(path.join(runner, f), "utf8"));
+  for (const [f, text] of Object.entries(browserFiles())) repo["test/browser/" + f] = text;
   repo["test/index.html"] = testPage(JSON.parse(repo["package.json"]).name, Object.keys(repo).filter(isTest));
   // The README first: it opens the folder, the way a repository's front page does.
   const readme = Object.keys(repo).find(p => /^readme\.md$/i.test(p));
