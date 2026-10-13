@@ -8,6 +8,9 @@ import {
   GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SUMMARY_PROMPT,
   TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
+import {
+  STOP_MAX, STEER_MAX, delivered, envelopeGuide, isoLocal, localDate, note, renderTurn, sameClient, steer, timing,
+} from "./envelope.js";
 
 // A SharedWorker's console is its own; what the engine logs, and what it throws, goes to the tabs' consoles too. The
 // first tab connects while the imports below are still loading: its port waits for the engine.
@@ -53,23 +56,27 @@ const [{ openDB }, { createTwoFilesPatch, diffLines }, { createStore, produce, r
 // A prompt's {name} placeholders, filled. Values go in as they are: none is read as a replacement pattern.
 const fill = (template, values) => template.replace(/\{(\w+)\}/g, (match, name) => values[name] ?? match);
 
-// Assembled per request: the agent's own prompt and memories, then how this harness works, for the tools it has.
-// The date is the day the request is built, so the cached prefix changes once a day.
-function systemPrompt(persona, { tools = [], memories = null, modelId = null } = {}) {
+// Assembled per request, and the same for the whole conversation: the agent's own prompt and memories, then how
+// this harness works, for the tools it has. started: the day the conversation began (the thread's, taken once, like
+// its memories), so the cached prefix never changes; a later day travels in each message's timestamp
+// (docs/specs/2026-10-13-envelope.md). Haiku answers a changed system prompt with thinking sent back with a 400.
+function systemPrompt(persona, { tools = [], memories = null, modelId = null, started = null } = {}) {
+  const changes = flag("envelope", "xml") === "xml" ? "<changes> block" : "<workspace> block";
   const guide = TOOL_DOCUMENTATION.split(/\n(?=### )/).filter(part => !part.startsWith("### ") || tools.includes(part.match(/^### (\w+)/)[1]))
     // subagents=async: the task section says how results come back.
     .map(part => part.startsWith("### task") && flag("subagents") === "async" ? part.trimEnd() + "\n" + TASK_ASYNC : part);
-  const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && HARNESS_DOCUMENTATION;
+  const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && fill(HARNESS_DOCUMENTATION, { changes });
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
   const cutoff = MODELS.find(m => m.id === modelId)?.cutoff;
   const environment = fill(ENVIRONMENT, {
     fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT,
-    today: new Date().toLocaleDateString("en-CA"),
+    started: started ?? localDate(Date.now()),
     cutoff: cutoff ? ` What you know comes from data up to ${cutoff}.` : "",
   });
-  const working = WORKING + (planInPrompt(tools) ?? "");
-  return [persona, memories, environment, working, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
+  const working = fill(WORKING, { changes }) + (planInPrompt(tools) ?? "");
+  const envelope = envelopeGuide({ envelope: flag("envelope", "xml"), metadata: flag("metadata", "minimal") });
+  return [persona, memories, environment, envelope, working, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
 }
 
 // /memories/ as the conversation found it. Taken once per thread: the prompt stays byte-stable for the cache,
@@ -185,8 +192,10 @@ function setSubagent(toolUseId, entry) {
   return entry;
 }
 // The answer a tool result block carries.
-// One delivered later (subagents=async) rides a harness block of its own, and counts as its task's result.
-const resultOf = block => block?.toolResult?.content?.[0]?.json?.result ?? block?.subagent?.result;
+// One delivered later (subagents=async) rides a note of the director's channel, and counts as its task's result
+// once delivered (a capped copy is only the log's).
+const resultOf = block => block?.toolResult?.content?.[0]?.json?.result
+  ?? (block?.instruction?.status === "delivered" ? block.instruction.data?.subagent?.result : undefined);
 
 const TOOLS = [
   {
@@ -666,7 +675,8 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
 
   // Starts a run and answers once its user message is saved: { threadId, done }, or null while that chat runs.
   // leafId is the message the reply follows; forkFromId, a message to retry or edit, which then branches.
-  async function send({ agentId = 1, threadId = null, projectId = null, leafId = null, forkFromId = null, text, files = [], modelId, reasoningMode, liveErrors = [] }) {
+  // client: the page's screen and locale ({ device, viewport, tz, locale }), announced to the model when it changes.
+  async function send({ agentId = 1, threadId = null, projectId = null, leafId = null, forkFromId = null, text, files = [], modelId, reasoningMode, liveErrors = [], client: screen = null }) {
     await recovered;
     if (threadId && runs.has(threadId)) return null;
     const name = text.trim().replace(/\s+/g, " ").slice(0, 60) || "Untitled";
@@ -690,8 +700,12 @@ function createEngine(db, { tools = TOOLS, workspaces = null, host = null, clien
       const notice = await ws?.describeChanges(parentHeads, liveErrors);
       // A retry or edit keeps the original's attachments.
       const kept = forked ? forked.content.filter(c => c.image || c.document) : [];
+      const keptFiles = forked?.content.find(c => c.metadata)?.metadata.attachments ?? [];
       const [typed, ...attached] = await getMessageContent(text, files);
-      const content = [...(notice ? [{ text: notice, harness: true }] : []), typed, ...kept, ...attached];
+      const thread = await db.get("threads", threadId);
+      const metadata = userMetadata({ thread, client: screen, files, kept: keptFiles, changes: notice, ws });
+      if (metadata.client) await db.put("threads", { ...thread, client: metadata.client });
+      const content = [typed, ...kept, ...attached, { metadata }];
       const userMessage = { role: "user", content, parentId, createdAt: Date.now() };
       userMessage.id = await db.add("messages", { ...userMessage, agentId, threadId, heads: workspaces ? await projectHeads(db, threadId) : null });
 
@@ -1234,12 +1248,22 @@ const PRE_DIRECTOR_RULES = [
   { id: "unplanned", at: "step", every: "turn", note: s => s.has("write_file") && s.ws && unplannedTask(s.messages, s.start, s.files, s.shown) },
   ...["silent", "failing", "untested", "unadopted"].map(ruleOf),
 ];
+// Notes of the harness's own, read with or without the director. "turn": read once when the user's message arrives.
+// date: the system prompt keeps the day the conversation started, so a message on a later day says so once.
+const CHANNEL_RULES = [
+  { id: "date", at: "turn", every: "turn", note: s => newDayNote(s.messages, s.start, s.started) },
+];
+function newDayNote(messages, start, started) {
+  const days = messages.slice(0, start).filter(m => m.role === "user").map(m => m.content?.find(b => b?.metadata?.timestamp)?.metadata.timestamp.slice(0, 10)).filter(Boolean);
+  const today = days.at(-1), before = days.at(-2) ?? started;
+  return today && before && today > before ? `The user's date is now ${today}, a later day than ${before}: the date in the system prompt is the day this conversation started.` : null;
+}
 // The plan-keeping note, said after PLAN_AFTER calls: the director's goal note, or, with no plan tool, the plan file.
 const PLAN_RULES = ["goal", "unplanned"];
 // The rules a run reads, by the flags: director=off, rule.<id>=off, and plan.where=prompt (the plan note is in the
 // system prompt instead, so it isn't injected too).
 function activeRules() {
-  const rules = flag("director") === "off" ? PRE_DIRECTOR_RULES : DIRECTOR_RULES;
+  const rules = [...(flag("director") === "off" ? PRE_DIRECTOR_RULES : DIRECTOR_RULES), ...CHANNEL_RULES];
   return rules.filter(r => flag("rule." + r.id) !== "off" && !(flag("plan.where") === "prompt" && PLAN_RULES.includes(r.id)));
 }
 // plan.where=prompt (E7): the note the plan rule would inject, in WORKING instead, said for when it applies.
@@ -1251,8 +1275,8 @@ function planInPrompt(tools) {
 }
 
 // One per run (a turn): the thread's contract, the rules, and what they have said. messages: the run's messages as
-// they stand. tools: the names of the tools the run has.
-async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules() } = {}) {
+// they stand. tools: the names of the tools the run has. started: the day the conversation started.
+async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules(), started = null } = {}) {
   const thread = threadId != null ? await db.get("threads", threadId) : null;
   const contract = { ...emptyContract(), ...structuredClone(thread?.contract ?? {}) };
   const has = name => tools.includes(name);
@@ -1387,21 +1411,26 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
     };
   };
 
-  function fire(at, s) {
-    const notes = [];
+  // The rules read at this point, through the one channel (envelope.js steer): their notes and any delivered from
+  // outside (deliver), ranked and capped. Returns the blocks to put on the message, capped ones included, logged. A
+  // rule counts as having spoken only when its note was delivered. A delivered-in note (a result) that was capped
+  // waits for the next step: unlike advice, it is the only copy.
+  let delivering = [];
+  function fire(at, s, { step: n = null, max = STEER_MAX } = {}) {
+    const queued = at === "step" || at === "stop" || at === "deliver" ? delivering.splice(0) : [];
+    const candidates = [...queued];
     for (const rule of rules.filter(r => r.at === at)) {
       if (rule.every !== "event" && reminded.has(rule.id)) continue;
-      const said = [rule.note(s)].flat().filter(Boolean);
-      if (!said.length) continue;
-      if (rule.every !== "event") reminded.add(rule.id);
-      notes.push(...said);
-      if (at === "stop") break;
+      candidates.push(...[rule.note(s)].flat().filter(Boolean).map(text => note(rule.id, text)));
     }
-    return notes;
+    const blocks = steer(candidates, { step: n, max });
+    for (const b of delivered(blocks)) reminded.add(b.instruction.rule);
+    delivering.push(...queued.filter(q => blocks.some(b => b.instruction.status === "capped" && b.instruction.rule === q.rule && b.instruction.text === q.text)));
+    return blocks;
   }
 
-  // After a step's results: run the checks the step bears on, then the rules. Returns the notes to append.
-  function step({ messages: all, start: startAt = start, ws = null, signal = null }) {
+  // After a step's results: run the checks the step bears on, then the rules. Returns the note blocks to append.
+  function step({ messages: all, start: startAt = start, ws = null, signal = null, step: n = null }) {
     return serial(async () => {
       workspace = ws ?? workspace;
       const results = (all.at(-1)?.content ?? []).map(resultOf).filter(r => r && typeof r === "object");
@@ -1425,16 +1454,24 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       idle = s.events.done.length || learned || !contract.items.some(i => i.status !== "done" && runnable(i)) ? 0 : idle + 1;
       Object.assign(s, { idle, current: currentItem(contract) });
       await save();
-      return fire("step", s);
+      return fire("step", s, { step: n });
     });
   }
 
   return {
     contract, plan, step,
-    // The note for a model that stopped, or null; one at a time, each once a turn.
-    stop: ({ messages: all, start: startAt = start }) => fire("stop", stateFor(all, startAt))[0] ?? null,
-    // The note after a summary ran: the contract, re-injected. The context-budget note may speak again.
-    summarized: () => { reminded.delete("budget"); return fire("summary", stateFor(messages(), start))[0] ?? null; },
+    // When the user's message arrives (not on a resume): the notes for it, e.g. a new day.
+    begin: () => resume ? [] : fire("turn", stateFor(messages(), start, { started }), { step: 0 }),
+    // The note blocks for a model that stopped, empty for none; one delivered at a time, each rule once a turn.
+    stop: ({ messages: all, start: startAt = start, step: n = null }) => fire("stop", stateFor(all, startAt), { step: n, max: STOP_MAX }),
+    // The notes after a summary ran: the contract, re-injected. The context-budget note may speak again.
+    summarized: ({ step: n = null } = {}) => { reminded.delete("budget"); return fire("summary", stateFor(messages(), start), { step: n }); },
+    // The hook for notes from outside the rules (an async sub-agent's result): { rule, text, priority } from
+    // envelope.js note(), delivered with the next step's or stop's notes, through the same cap and log.
+    deliver: n => { delivering.push(n); },
+    // Only what was delivered in, for a step with no results and no rules to read (a sub-agent's result while the lead
+    // waits for it): ranked and capped like any step's.
+    flush: ({ step: n = null } = {}) => fire("deliver", null, { step: n }),
     save: () => serial(save),
   };
 }
@@ -1468,25 +1505,25 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   let parentId = lastMessageId;
   let streaming = null;
   const start = store.messages.length;
-  let director = null;
-  // The director's notes ride after the results, each a block of its own: the tail of the next request.
+  let director = null, tz = null, step = 0;
+  // The director's notes ride after the results, in the message's metadata (envelope.js): the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
-    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director, ...(background && { background }) };
+    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director, tz, ...(background && { background }) };
     const results = await getToolResults(store.messages.at(-1).content, toolMap, context);
-    // Sub-agents that finished meanwhile: after the results, in blocks of their own.
-    if (background) results.content.push(...subagentResultBlocks(background.take()));
-    for (const text of await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal })) results.content.push({ text, harness: true });
+    // Sub-agents that finished meanwhile: through the director's channel, so they ride this step's notes, after the
+    // results, never inside one.
+    if (background) deliverSubagents(director, background.take());
+    const notes = await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal, step });
+    const rich = stepMetadata(director.contract, ws);
+    results.content.push(...(Object.keys(rich).length ? [{ metadata: rich }] : []), ...notes);
     return push({ ...results, parentId: callsId, createdAt: Date.now() });
   };
-  // A note for a message not yet sent goes on it, before the user's own words: the user's request stays last.
-  const amendLast = async text => {
+  // Notes for a message not yet sent go on it, in its metadata, apart from the user's own words.
+  const amendLast = async blocks => {
     const i = store.messages.length - 1, last = store.messages[i];
-    if (last?.role !== "user" || last.id == null) return;
-    const content = unwrap(last.content);
-    const typed = content.some(c => c?.toolResult) ? -1 : content.findIndex(c => typeof c?.text === "string" && !c.harness);
-    const at = typed < 0 ? content.length : typed;
-    const next = [...content.slice(0, at), { text, harness: true }, ...content.slice(at)];
+    if (last?.role !== "user" || last.id == null || !blocks.length) return;
+    const next = [...unwrap(last.content), ...blocks];
     setStore("messages", i, "content", next);
     const row = await db.get("messages", last.id);
     if (row?.threadId === params.threadId) await db.put("messages", { ...row, content: next });
@@ -1495,14 +1532,20 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   try {
     // Resolved here so a missing key becomes an error reply instead of a stuck request.
     if (typeof client === "function") client = await client();
-    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume });
     const thread = await db.get("threads", params.threadId);
+    tz = thread?.client?.tz ?? null;
+    // The day the conversation started, in the user's time zone, taken once: the system prompt never changes with it.
+    const started = thread?.started ?? localDate(thread?.createdAt ?? Date.now(), tz);
+    if (thread && !thread.started) await db.put("threads", { ...(await db.get("threads", params.threadId)), started });
+    setStore("started", started);
+    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume, started });
     let summary = thread?.summary ?? null;
     let memories = thread?.memories ?? null;
     if (memories == null && store.tools.some(t => t.toolSpec.name === "editor")) {
       memories = await memoriesBlock(db, params.agentId);
       if (thread) await db.put("threads", { ...(await db.get("threads", params.threadId)), memories });
     }
+    await amendLast(director.begin());
     // Calls made and never answered run first; a reply that had finished has nothing to add.
     const last = store.messages.at(-1);
     if (resume && last?.role === "assistant") {
@@ -1511,6 +1554,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     }
     for (let turn = 0; ; turn++) {
       signal?.throwIfAborted();
+      step = turn;
       if (turn === maxTurns) {
         const note = { text: `(Paused after ${maxTurns} steps. Say "continue" to go on.)` };
         setStore("activeLeafId", await push({ role: "assistant", content: [note], parentId, createdAt: Date.now() }));
@@ -1519,8 +1563,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
       const before = summary;
       summary = await compactHistory(store, client, db, params.threadId, summary, memories, signal);
       // Why: cheap models lose the thread after a summary; the goal and the current item come back with it.
-      const restated = summary !== before && director.summarized();
-      if (restated) await amendLast(restated);
+      if (summary !== before) await amendLast(director.summarized({ step }));
       const request = { ...unwrap(store), summary, memories, messages: store.messages.map(({ id, role, modelId, content }) => ({ id, role, modelId, content: unwrap(content) })) };
       const output = await watchedSend(client, getConverseCommand(request), signal);
 
@@ -1536,11 +1579,16 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
       }
 
       if (stopReason) setStore("messages", streaming, "stopReason", stopReason);
+      // A declined request ends the turn in a plain line: no calls run, no stop rule asks again.
+      const refused = declined(stopReason);
+      if (refused) setStore("messages", streaming, m => ({ ...m, content: [{ text: REFUSAL_TEXT }], refused: true }));
       const savedId = await saveMsg(store.messages.at(-1));
       setStore("messages", streaming, "id", savedId);
       setStore("activeLeafId", savedId);
       streaming = null;
       parentId = savedId;
+      step = turn + 1;
+      if (refused) break;
 
       // Calls run whatever the stop reason says: a stream can close without one, and an unanswered call ends the turn.
       if (!store.messages.at(-1).content.some(c => c?.toolUse)) {
@@ -1548,18 +1596,20 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
         if (background?.running.size || background?.finished.size) {
           if (!background.finished.size && !toldRunning) {
             toldRunning = true;
-            parentId = await push({ role: "user", content: [{ text: stillRunning(background), harness: true }], parentId, createdAt: Date.now() });
+            director.deliver(note("running", stillRunning(background)));
+            parentId = await push({ role: "user", content: director.flush({ step }), parentId, createdAt: Date.now() });
             continue;
           }
           if (!background.finished.size) await background.next(signal);
           signal?.throwIfAborted();
-          parentId = await push({ role: "user", content: subagentResultBlocks(background.take()), parentId, createdAt: Date.now() });
+          deliverSubagents(director, background.take());
+          parentId = await push({ role: "user", content: director.flush({ step }), parentId, createdAt: Date.now() });
           continue;
         }
         // Each stop rule speaks once a turn; then the model's word stands.
-        const note = director.stop({ messages: unwrap(store.messages), start });
-        if (!note) break;
-        parentId = await push({ role: "user", content: [{ text: note, harness: true }], parentId, createdAt: Date.now() });
+        const notes = director.stop({ messages: unwrap(store.messages), start, step });
+        if (!delivered(notes).length) break;
+        parentId = await push({ role: "user", content: notes, parentId, createdAt: Date.now() });
         continue;
       }
 
@@ -1598,6 +1648,33 @@ async function projectHeads(db, threadId) {
   return project ? { ...project.heads } : null;
 }
 
+// The <metadata> a user message carries (envelope.js renders it): the user's local time, the client when it changed,
+// this message's attachments and the changes since the last turn. metadata=rich adds the contract's state and the
+// project's files.
+function userMetadata({ thread = null, client = null, files = [], kept = [], changes = null, ws = null, now = Date.now() } = {}) {
+  const attachments = [...kept, ...files.map(f => ({ name: f.name, type: f.type || null, bytes: f.size ?? null }))];
+  return {
+    timestamp: isoLocal(now, client?.tz ?? thread?.client?.tz),
+    ...(client && !sameClient(client, thread?.client) && { client }),
+    ...(attachments.length && { attachments }),
+    ...(changes && { changes }),
+    ...stepMetadata(thread?.contract, ws),
+  };
+}
+
+// What metadata=rich adds after every step and on every user message; nothing at the default.
+function stepMetadata(contract, ws) {
+  if (flag("metadata", "minimal") !== "rich") return {};
+  return { state: contractState({ ...emptyContract(), ...contract }), files: Object.keys(ws?.state?.files ?? {}).sort() };
+}
+
+// Stop reasons that mean the model declined: the turn ends with a plain line, and isn't retried. Bedrock Converse
+// says guardrail_intervened or content_filtered, the Anthropic API refusal; the Gemini client maps its safety stops
+// to refusal.
+const REFUSALS = ["refusal", "guardrail_intervened", "content_filtered"];
+const REFUSAL_TEXT = "The model declined this request.";
+const declined = stopReason => REFUSALS.includes(stopReason);
+
 function getConverseCommand(config) {
   const model = modelInfo(config.modelId);
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
@@ -1605,7 +1682,7 @@ function getConverseCommand(config) {
   const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec }));
   // subagents=async: wait comes with task.
   if (flag("subagents") === "async" && tools.some(t => t.toolSpec.name === "task") && !tools.some(t => t.toolSpec.name === "wait")) tools.push({ toolSpec: WAIT_TOOL.toolSpec });
-  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId });
+  const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId, started: config.started });
   return {
     modelId: config.modelId,
     messages: prepareMessages(config.messages, { documents: model.documents, beside: model.beside, cache: model.cache, summary: config.summary, tail: config.tail, modelId: config.modelId }),
@@ -1624,7 +1701,12 @@ function getConverseCommand(config) {
 // Cache points ride the last two user messages: the newest writes, the one before is where the previous
 // request (or the parent of a fork) wrote, so the read is exact however many blocks the last turn added.
 // Reasoning goes back only to the model that wrote it: another model can't read its signature and rejects the turn.
+// Each message is first rendered in the envelope (envelope.js renderTurn): the user's words, their metadata, the notes
+// that fired, each result's times.
 function prepareMessages(messages, { documents = true, beside = false, cache = false, summary = null, tail = [], modelId = null } = {}) {
+  const envelope = flag("envelope", "xml");
+  messages = messages.map(m => renderTurn(m, { envelope }));
+  tail = tail.map(m => renderTurn(m, { envelope }));
   const through = summary ? messages.findIndex(m => m.id === summary.throughId) : -1;
   if (through >= 0) messages = [{ role: "user", content: [{ text: `<summary>\n${summary.text}\n</summary>` }] }, ...messages.slice(through + 1)];
   const results = messages.flatMap((m, i) => (m.content.some(b => b?.toolResult) ? [i] : []));
@@ -1719,7 +1801,7 @@ async function compactHistory(store, client, db, threadId, summary, memories, si
 
   // The summary request is the history so far, with the instruction added to its last (user) message.
   const head = messages.slice(0, cut).map(({ id, role, content }) => ({ id, role, content }));
-  head[cut - 1] = { ...head[cut - 1], content: [...head[cut - 1].content, { text: SUMMARY_PROMPT }] };
+  head[cut - 1] = { ...head[cut - 1], content: [...head[cut - 1].content, ...steer([note("summarize", SUMMARY_PROMPT)])] };
   try {
     const output = await watchedSend(client, getConverseCommand({ ...unwrap(store), memories, summary, messages: head }), signal);
     const content = [];
@@ -1849,9 +1931,13 @@ function getEchoClient() {
   async function* stream(input, signal) {
     yield { messageStart: { role: "assistant" } };
 
-    // The last text block is what the user typed; workspace notices come before it.
+    // What the user typed: the envelope's <contents>, unescaped; under envelope=plain, the first text that isn't the
+    // harness's (its metadata and notes follow the user's words).
     const lastUserMsg = input.messages?.filter(m => m.role === "user").pop();
-    const userText = lastUserMsg?.content?.findLast(c => c.text)?.text || "";
+    const texts = (lastUserMsg?.content ?? []).filter(c => c.text).map(c => c.text);
+    const wrapped = texts.find(t => t.startsWith("<message><contents>"))?.match(/^<message><contents>([\s\S]*)<\/contents><\/message>$/)?.[1];
+    const userText = wrapped != null ? wrapped.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+      : texts.find(t => !/^(<metadata>|<workspace>|Sent \d{4}-)/.test(t)) || "";
 
     // Try to parse as JSON instruction
     let instruction;
@@ -1910,6 +1996,8 @@ function getEchoClient() {
   return { send: (input, { signal } = {}) => Promise.resolve({ stream: stream(input, signal) }) };
 }
 
+// Gemini's finish reasons for a reply it declined or withheld.
+const GEMINI_REFUSALS = ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION"];
 export function getGeminiClient(client) {
   const toB64 = b => btoa(b.reduce((s, x) => s + String.fromCharCode(x), ""));
   const MIME = { png: "image/png", jpeg: "image/jpeg", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf" };
@@ -1965,6 +2053,8 @@ export function getGeminiClient(client) {
     let idx = 0, active = null, calledTools = false, usage = null;
 
     for await (const chunk of response) {
+      // A prompt Gemini blocks comes back with no candidate at all.
+      if (chunk.promptFeedback?.blockReason && !chunk.candidates?.length) { yield { messageStop: { stopReason: "refusal" } }; return; }
       const parts = chunk.candidates?.[0]?.content?.parts ?? [];
       const done = chunk.candidates?.[0]?.finishReason;
       if (chunk.usageMetadata) usage = chunk.usageMetadata;
@@ -2001,7 +2091,7 @@ export function getGeminiClient(client) {
         const cached = usage?.cachedContentTokenCount || 0;
         if (usage) yield { metadata: { usage: { inputTokens: (usage.promptTokenCount || 0) - cached, outputTokens: (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0), cacheReadInputTokens: cached } } };
         // A call Gemini couldn't form ends the reply with nothing in it; the model is told why, not just that.
-        const reason = { MAX_TOKENS: "max_tokens", MALFORMED_FUNCTION_CALL: "malformed_tool_call" }[done];
+        const reason = { MAX_TOKENS: "max_tokens", MALFORMED_FUNCTION_CALL: "malformed_tool_call" }[done] ?? (GEMINI_REFUSALS.includes(done) ? "refusal" : null);
         yield { messageStop: { stopReason: reason ?? (calledTools ? "tool_use" : "end_turn") } };
       }
     }
@@ -2021,6 +2111,8 @@ const storedJSON = key => { try { return JSON.parse(setting(key) || "null"); } c
 // A feature flag, or its default. Set per eval run (eval.js --flags) so an ablation needs no code change; each flag
 // is a no-op at its default. director=off, rule.<id>=off, plan.where=prompt: activeRules and systemPrompt.
 // effort=<level>: getConverseCommand. context=<tokens>: modelInfo. noProjectError=old: workspaceFor.
+// envelope=plain: loose text blocks instead of <message>/<metadata> (envelope.js renderTurn). metadata=rich: the
+// contract's state and the file list on every user message and after every step (userMetadata, stepMetadata).
 const flag = (name, fallback = null) => { const value = storedJSON(FLAGS_KEY)?.[name]; return value == null ? fallback : String(value); };
 const snapshotSettings = () => ({ items: Object.fromEntries(SETTING_KEYS.map(key => [key, setting(key)])), proxy: storedProxyConfig() });
 const applySettings = ({ items, proxy }) => Object.assign(settings, { items, proxy });
@@ -2604,10 +2696,11 @@ function createBackground(parent) {
   };
 }
 
-// Finished sub-agents' results for the lead, each a harness text block of its own: never inside a tool result, never
-// merged with the user's words. One place builds them, so a message envelope (E17) can route them.
-const subagentResultBlocks = entries => entries.map(({ id, type, result }) =>
-  ({ text: `Sub-agent ${id} (${type}) finished. Its result:\n${JSON.stringify(result)}`, harness: true, subagent: { id, result } }));
+// Finished sub-agents' results for the lead, each a note of its own through the director's channel (envelope.js):
+// in the message's metadata, never inside a tool result, never merged with the user's words. The result rides the
+// note as data, so it counts as its task's result (resultOf). A capped one waits for the next step.
+const deliverSubagents = (director, entries) => entries.forEach(({ id, type, result }) =>
+  director.deliver({ ...note("subagent", `Sub-agent ${id} (${type}) finished. Its result:\n${JSON.stringify(result)}`), data: { subagent: { id, result } } }));
 
 const STARTED_NOTE = "Running. Its result will arrive in a later message; call wait({ id }) to wait for it.";
 const stillRunning = background => {
@@ -2718,12 +2811,12 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
         general: [fill(GENERAL_PROMPT, { folder: folderName }), ["code", "think", "editor", "mcp"]],
         review: [REVIEW_PROMPT, ["code", "think", "view_file", "run_app", "history", "diff"]],
       }[type];
-      request = { systemPrompt: system };
+      request = { systemPrompt: system, started: conversation?.request?.started ?? localDate(Date.now(), context.tz) };
       subTools = TOOLS.filter(t => [...names, ...webToolNames()].includes(t.toolSpec.name));
       toolMap = Object.fromEntries(subTools.map(t => [t.toolSpec.name, t.fn]));
       // A reviewer starts from what the caller's turn would see: the files and the last run.
       const files = type === "review" && workspace?.state?.project ? await workspace.describeChanges(null) : null;
-      messages = [{ role: "user", content: [...(files ? [{ text: files }] : []), { text: prompt }] }];
+      messages = [{ role: "user", content: [{ text: prompt }, ...(files ? [{ metadata: { changes: files } }] : [])] }];
     }
 
     const effectiveModelId = (model && !forked && MODELS.find(m => m.label === model)?.id) || modelId || DEFAULT_MODEL;
@@ -2736,7 +2829,7 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
       signal?.throwIfAborted();
       const input = forked
         ? getConverseCommand({ ...request, tail: messages })
-        : getConverseCommand({ modelId: effectiveModelId, reasoningMode, systemPrompt: request.systemPrompt, tools: subTools, messages });
+        : getConverseCommand({ modelId: effectiveModelId, reasoningMode, systemPrompt: request.systemPrompt, tools: subTools, messages, started: request.started });
       const output = await watchedSend(client, input, signal);
       const assistantMsg = { role: "assistant", content: [], createdAt: Date.now(), modelId: effectiveModelId };
       let stopReason = null;
@@ -2746,15 +2839,16 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
         if (msg.metadata?.usage) assistantMsg.usage = msg.metadata.usage;
         update({ currentMessage: { ...assistantMsg } });
       }
+      if (declined(stopReason)) Object.assign(assistantMsg, { content: [{ text: REFUSAL_TEXT }], refused: true });
       messages.push(assistantMsg);
       await save(assistantMsg);
       update(entry => ({ messages: [...entry.messages, { ...assistantMsg }], currentMessage: null }));
 
       if (!assistantMsg.content.some(c => c?.toolUse)) { capped = false; break; }
 
-      const toolResults = await getToolResults(assistantMsg.content, toolMap, { ...subContext, cutOff: stopReason === "max_tokens" });
+      const toolResults = await getToolResults(assistantMsg.content, toolMap, { ...subContext, tz: context.tz, cutOff: stopReason === "max_tokens" });
       // Work cut off at the cap is lost to the caller, so the last turn is for the answer.
-      if (turn === most - 2) toolResults.content.push({ text: "One turn left: answer now with what you have, and say what you didn't get to.", harness: true });
+      if (turn === most - 2) toolResults.content.push(...steer([note("last-turn", "One turn left: answer now with what you have, and say what you didn't get to.")], { step: turn + 1 }));
       messages.push(toolResults);
       await save(toolResults);
       update(entry => ({ messages: [...entry.messages, { ...toolResults }] }));
@@ -2794,11 +2888,16 @@ async function runTask({ prompt, type, folder, model, owned }, context) {
   };
 }
 
+// Each result keeps when its call started and ended (in context.tz, the user's), rendered inside it (envelope.js).
 async function getToolResults(toolUseContent, tools, context = {}) {
   const calls = toolUseContent.filter(c => c.toolUse);
+  const timed = run => async (call, i) => {
+    const started = Date.now(), block = await run(call, i);
+    return { ...block, timing: timing(started, Date.now(), context.tz) };
+  };
   const content = await Promise.all(
     calls
-      .map(async ({ toolUse }, i) => {
+      .map(timed(async ({ toolUse }, i) => {
         const { toolUseId, name, input } = toolUse;
         // Output that hit the length limit ends inside its last call, so that call's input is incomplete.
         if (context.cutOff && i === calls.length - 1) return { toolResult: { toolUseId, content: [{ json: { result: { error: "Your output hit the length limit before this call was complete, so it did not run. Send less per call: edit rather than rewrite, or split the file." } } }] } };
@@ -2815,7 +2914,7 @@ async function getToolResults(toolUseContent, tools, context = {}) {
           console.error("Tool error:", error);
           return { toolResult: { toolUseId, content: [{ json: { result: error.stack || error.message || String(error) } }] } };
         }
-      })
+      }))
   );
   return { role: "user", content };
 }
@@ -3501,7 +3600,8 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     if (!project || parentHeads === undefined) return null;
     const heads = unwrap(project.heads);
     const used = liveErrors.length ? `\nWhile the user used ${shownPath()}, it logged errors:\n${liveErrors.map(e => "- " + e).join("\n")}` : "";
-    const block = body => `<workspace>\n${body}${used}\n</workspace>`;
+    // The text of a message's <changes> (envelope.js renders it, escaped, or as a <workspace> block under envelope=plain).
+    const block = body => body + used;
     if (parentHeads === null) {
       const paths = Object.keys(heads).sort();
       if (!paths.length) return null;
@@ -4577,7 +4677,7 @@ if (inSharedWorker) {
 // #endregion
 
 export {
-  CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, FLAGS_KEY, PRE_DIRECTOR_RULES, activeRules, flag, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
+  CAPTURE_CHOICE_KEY, CDN, CHANNEL_RULES, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, FLAGS_KEY, REFUSAL_TEXT, newDayNote, stepMetadata, userMetadata, PRE_DIRECTOR_RULES, activeRules, flag, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
   PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
   countLines, countRepeats, createDirector, createWorkspace, describeCheck, editFile, editor, renderPlan, runCheck, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
   getConverseClient, getConverseCommand, getProxyConfig, getToolResults, guardLoops, initDB, inspectArgs, isHtml, isLocalHost,
