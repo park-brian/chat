@@ -341,15 +341,19 @@ function createRun({ base = "", log = console.log } = {}) {
 }
 
 // Runs the tests registered so far (by files already imported) and starts afresh. broken: files that failed to load,
-// counted as failures. Sets window.TESTS_DONE, as test/index.html in the swe repositories expects.
-export async function run({ broken = 0, base = "" } = {}) {
+// counted as failures. Sets window.TESTS_DONE, as test/index.html in the swe repositories expects. log: where each
+// PASS and FAIL line goes (the shell's node --test prints them as Node does).
+export async function run({ broken = 0, base = "", log = console.log } = {}) {
   const top = root;
   root = current = group("", null);
-  const { passed, failed, skipped, todo } = await createRun({ base }).run(top);
+  const { passed, failed, skipped, todo } = await createRun({ base, log }).run(top);
   const result = { passed, failed: failed + broken, skipped, todo };
   if (typeof window !== "undefined") window.TESTS_DONE = result;
   return result;
 }
+
+// How many tests and suites are registered and not yet run: `node file.test.js` runs them when the file settles.
+export const registered = () => root.tests.length;
 
 // Imports each file (a URL relative to base) and runs its tests before the next, as `node --test` runs each file on
 // its own. Answers the totals, and each file's when there are several.
