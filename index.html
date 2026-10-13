@@ -938,6 +938,7 @@
             const started = await engine.send({
               agentId: params.agentId, threadId: params.threadId, projectId: workspace?.state.project?.id ?? null,
               leafId: agent.activeLeafId, forkFromId, text, files, modelId, reasoningMode, liveErrors: workspace?.liveErrors() ?? [],
+              client: clientInfo(),
             });
             if (!started) throw new Error(RUNNING);
             if (pending.stopped) engine.stop(started.threadId);
@@ -1562,9 +1563,17 @@
         `;
       }
 
+      // The user's screen as the model is told it (envelope.js <client>): a device class by width and pointer, the
+      // viewport, the time zone and the locale.
+      function clientInfo() {
+        const width = innerWidth, coarse = matchMedia("(pointer: coarse)").matches;
+        const device = width < 768 ? "mobile" : coarse && width < 1200 ? "tablet" : "desktop";
+        return { device, viewport: `${width}x${innerHeight}`, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language };
+      }
+
       // Whether a block puts anything on screen. A result shows in its call's card; a blank block, or thought that
       // left nothing to read, takes no room.
-      const showsBlock = c => !!(c?.harness || c?.text?.trim() || c?.toolUse || c?.reasoningContent?.reasoningText?.text || c?.reasoningContent?.redactedContent != null);
+      const showsBlock = c => !!(c?.harness || c?.instruction || c?.text?.trim() || c?.toolUse || c?.reasoningContent?.reasoningText?.text || c?.reasoningContent?.redactedContent != null);
 
       // A reply as Markdown, a block at a time: the blocks above the one still streaming keep their DOM, and only the
       // last renders again.
@@ -1595,6 +1604,12 @@
               <details class="small text-muted harness-note">
                 <summary class="cursor-pointer"><i class="bi bi-info-circle"></i> Note to the agent</summary>
                 <pre class="md-code">${() => c().text}</pre>
+              </details>
+            <//>
+            <${Match} when=${() => c().instruction}>
+              <details class="small text-muted harness-note" data-rule=${() => c().instruction.rule}>
+                <summary class="cursor-pointer"><i class="bi bi-info-circle"></i> Note to the agent: ${() => c().instruction.rule}${() => c().instruction.status === "capped" ? " (capped, not sent)" : ""}</summary>
+                <pre class="md-code">${() => c().instruction.text}</pre>
               </details>
             <//>
             <${Match} when=${() => isText() && m().role === "user"}>
@@ -3341,7 +3356,7 @@
       if (new URLSearchParams(window.location.search).get("test") === "1" || window.__HARNESS__?.test) {
         // The engine's internals the tests reach for, beside what the app imports.
         const {
-          DIRECTOR_RULES, FLAGS_KEY, PRE_DIRECTOR_RULES, activeRules, flag, modelInfo, snapshotSettings, MEMORY_BUDGET, TOOLS, appendReasoning, applyEdits, blobCache, buildMessageTree, contradictedClaim,
+          CHANNEL_RULES, DIRECTOR_RULES, FLAGS_KEY, PRE_DIRECTOR_RULES, REFUSAL_TEXT, activeRules, newDayNote, userMetadata, flag, modelInfo, snapshotSettings, MEMORY_BUDGET, TOOLS, appendReasoning, applyEdits, blobCache, buildMessageTree, contradictedClaim,
           createDirector, editFile, editor, runCheck,
           failingReport, forkOf, getBlob, getContentBlock, getConverseClient, getConverseCommand, getGeminiClient,
           getMostRecentPath, getToolResults, listHistory, mcp, memoriesBlock, missingFiles, normalizePath, outline,
@@ -3351,6 +3366,8 @@
           watchedSend, webSearch, writeFile,
         } = await import("./engine.js");
         const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        // The director's notes a message delivered (envelope.js steer), by text.
+        const noteTexts = m => (m.content ?? m).filter(c => c?.instruction?.status === "delivered").map(c => c.instruction.text);
         // Tests that reach third-party sites run only when asked (npm test -- --net adds net=1).
         const NET = new URLSearchParams(location.search).has("net");
         const assert = (cond, msg) => { if (!cond) throw new Error(msg || "Assertion failed"); };
@@ -4359,7 +4376,8 @@
             for (let i = 0; i < 5; i++) await ui.send({ text: "turn " + i, usage: { inputTokens: 190_000, outputTokens: 10 } });
             const thread = (await db.getAll("threads")).find(t => t.summary?.createdAt >= start);
             assert(thread, "the thread has a summary");
-            assert(thread.summary.text.includes("Older messages are about to be dropped"), `the summary came from the model: ${thread.summary.text.slice(0, 80)}`);
+            // The summary instruction rides in the last turn's metadata; echo answers that turn's words.
+            assert(/^turn \d$/.test(thread.summary.text), `the summary came from the model: ${thread.summary.text.slice(0, 80)}`);
           } finally {
             ui.cleanup();
           }
@@ -4441,7 +4459,7 @@
             const { content: both } = await getToolResults([shotCall, { toolUse: { ...call.toolUse, toolUseId: "p2" } }], { view_file: input => viewFile(input, context) });
             const [moved] = prepareMessages([{ role: "user", content: [...both, { text: "after" }] }], { beside: true });
             const kinds = moved.content.map(b => b.toolResult ? "result:" + b.toolResult.content.length : b.image ? "image" : b.document ? "document" : b.text);
-            assert(JSON.stringify(kinds) === '["result:1","result:1","screenshots/plain.webp","image","docs/spec v1.pdf","document","after"]', `a model that sees files only beside results gets each after the results, after its label: ${JSON.stringify(kinds)}`);
+            assert(JSON.stringify(kinds) === '["result:2","result:2","screenshots/plain.webp","image","docs/spec v1.pdf","document","after"]', `a model that sees files only beside results gets each after the results, after its label: ${JSON.stringify(kinds)}`);
             await sandboxFiles("write", { path: "docs/data.bin", content: new Blob([new Uint8Array([1, 2])]) }, context);
             const binary = await viewFile({ path: "docs/data.bin" }, context);
             assert(/can't be viewed/.test(binary.error) && !binary.__media, `other bytes are read in code: ${JSON.stringify(binary)}`);
@@ -4790,9 +4808,11 @@
             await ui.workspace.userEdit("index.html", fixtureApp("better"));
             await ui.send("What changed?");
             const user = [...ui.chat.agent.messages].filter(m => m.role === "user").at(-1);
-            const notice = user.content.find(c => c.harness)?.text || "";
-            assert(notice.startsWith("<workspace>") && notice.includes("(user)"), `the next message carries the edit: ${notice.slice(0, 200)}`);
+            const notice = user.content.find(c => c.metadata)?.metadata.changes || "";
+            assert(notice.includes("(user)"), `the next message carries the edit in its metadata: ${notice.slice(0, 200)}`);
             assert(notice.includes('+<p id="v">better</p>'), "the notice includes the diff");
+            const sent = prepareMessages([user]).at(-1).content.find(b => b.text?.startsWith("<metadata>"))?.text ?? "";
+            assert(sent.includes("<changes>\n") && sent.includes('+&lt;p id="v"&gt;better&lt;/p&gt;'), `and the model gets it as <changes>, escaped: ${sent.slice(0, 300)}`);
             assert(ui.chat.agent.messages.at(-1).content[0].text.includes("What changed?"), "the agent answers the typed text, not the notice");
           } finally {
             ui.cleanup();
@@ -5274,7 +5294,7 @@ if (window.__HARNESS__?.test) (async () => {
             const out = await task({ type: "review", prompt }, context);
             const saved = await db.getAllFromIndex("messages", "threadId", out.subagentThreadId);
             const [ran, edit] = saved.find(m => m.content.some(c => c.toolResult)).content.map(c => JSON.stringify(c.toolResult));
-            assert(saved[0].content[0].text.includes("<workspace>") && saved[0].content[0].text.includes("index.html"), "the reviewer starts from the files and the last run");
+            assert(saved[0].content.find(c => c.metadata)?.metadata.changes.includes("index.html"), "the reviewer starts from the files and the last run");
             assert(ran.includes("report") && !ran.includes('"error"'), `it runs the artifact: ${ran.slice(0, 160)}`);
             assert(edit.includes("error"), `it cannot edit: ${edit.slice(0, 160)}`);
             const bad = await task({ type: "explore", prompt: "p", model: "GPT-2" }, context);
@@ -5498,7 +5518,7 @@ if (window.__HARNESS__?.test) (async () => {
           const plain = systemPrompt("P", { tools: ["code"] });
           assert(!plain.includes("## Artifacts"), "no artifact docs without artifact tools");
           // Why: Haiku gets no context-budget tags, so with a 100k budget it rushed to finish; and it can't know the date
-          assert(plain.includes(`Today is ${new Date().toLocaleDateString("en-CA")}. Older messages are summarized automatically`) && plain.includes("keep working rather than wrapping up early"), "the date and the compaction line");
+          assert(systemPrompt("P", { tools: ["code"], started: "2026-10-13" }).includes("This conversation started on 2026-10-13. Older messages are summarized automatically") && plain.includes("keep working rather than wrapping up early"), "the conversation's start date and the compaction line");
           assert(systemPrompt("P", { tools: [], modelId: "global.anthropic.claude-opus-5-5" }).includes("What you know comes from data up to June 2026.") && !plain.includes("What you know comes from"), "a knowledge cutoff only where it is known");
           assert(plain.includes("Keep working until everything the user asked for is done, then stop and report") && plain.includes("A syntax check doesn't count as verifying a change: run it."), "keep working, and verify by running");
           assert(systemPrompt("P", { tools: ["plan"] }).includes("### plan") && !plain.includes("### plan"), "the plan tool's docs come with it");
@@ -5874,8 +5894,8 @@ if (window.__HARNESS__?.test) (async () => {
           const [store, setStore] = createStore({ modelId: "echo", systemPrompt: "P", tools: [fake], messages: [{ id: userId, role: "user", content: [{ text: "go" }] }] });
           const client = createMockClient([{ blocks: mockToolUseBlock("fake", {}, "f"), stopReason: "tool_use" }, { blocks: mockTextBlock("Done.") }, { blocks: mockTextBlock("Still no tests; stopping.") }]);
           await runAgentWithBranching(store, setStore, client, userId, { threadId, agentId: 1 }, db);
-          const notes = store.messages.filter(m => m.role === "user" && m.content[0]?.harness);
-          assert(notes.length === 1 && notes[0].content[0].text.includes("No in-file tests ran"), `one reminder naming the problem: ${JSON.stringify(notes)}`);
+          const notes = store.messages.filter(m => m.role === "user" && m.content[0]?.instruction);
+          assert(notes.length === 1 && notes[0].content[0].instruction.text.includes("No in-file tests ran"), `one reminder naming the problem: ${JSON.stringify(notes)}`);
           assert(store.messages.at(-1).content[0]?.text === "Still no tests; stopping.", "after one reminder the model's word stands");
         }
 
@@ -5902,7 +5922,7 @@ if (window.__HARNESS__?.test) (async () => {
             const client = createMockClient([...script.map(([name, input = {}], i) => ({ blocks: mockToolUseBlock(name, input, "t" + i), stopReason: "tool_use" })), { blocks: mockTextBlock("Done.") }]);
             await runAgentWithBranching(store, setStore, client, userId, { threadId, agentId: 1 }, db, { workspace });
             const results = store.messages.filter(m => m.content.some(c => c.toolResult));
-            return results.map(m => m.content.filter(c => c.harness).map(c => c.text)).map((notes, i) => [i, notes]).filter(([, notes]) => notes.length);
+            return results.map(noteTexts).map((notes, i) => [i, notes]).filter(([, notes]) => notes.length);
           };
           const probes = n => Array.from({ length: n }, () => ["probe"]);
           const once = await turn([...probes(3), ["think", { thought: "hm" }], ...probes(9)]);
@@ -6031,10 +6051,10 @@ if (window.__HARNESS__?.test) (async () => {
             const run = ui.workspace.run;
             let runs = 0;
             ui.workspace.run = (...args) => (runs++, run(...args));
-            const notes = await director.step({ ws: ui.workspace, start: 0, messages: [
+            const notes = noteTexts(await director.step({ ws: ui.workspace, start: 0, messages: [
               { role: "assistant", content: [{ toolUse: { toolUseId: "f", name: "edit_file", input: {} } }] },
               { role: "user", content: [{ toolResult: { toolUseId: "f", content: [{ json: { result: { ...fixed, __media: undefined } } }] } }] },
-            ] });
+            ] }));
             ui.workspace.run = run;
             assert(director.contract.items[0].status === "done" && notes[0]?.startsWith("Item 1's check passed, so it is done") && runs === 0, `the edit's own report passes the check: ${runs} runs, ${JSON.stringify(notes)}`);
             // The names are the harness's: the model's request carries the counts.
@@ -6065,7 +6085,7 @@ if (window.__HARNESS__?.test) (async () => {
                 results.push({ toolResult: { toolUseId: id, content: [{ json: { result: { version: ws.state.project.heads[path], path, change: "+1 -0" } } }] } });
               }
               history.push({ role: "assistant", content: calls }, { role: "user", content: results });
-              return director.step({ messages: history, start: 0, ws });
+              return noteTexts(await director.step({ messages: history, start: 0, ws }));
             };
             const items = () => director.contract.items.map(i => i.status).join(" ");
             const entries = director.contract.ledger.length;
@@ -6104,7 +6124,7 @@ if (window.__HARNESS__?.test) (async () => {
           const mock = createMockClient(script);
           const client = { send: (input, o) => (sent.push(input), mock.send(input, o)) };
           await runAgentWithBranching(store, setStore, client, messages.at(-1).id, { threadId, agentId: 1 }, db, { workspace });
-          const notes = store.messages.flatMap(m => m.content.filter(c => c.harness).map(c => c.text));
+          const notes = store.messages.flatMap(noteTexts);
           return { store, notes, sent, thread: await db.get("threads", threadId) };
         }
         const calls = (n, name = "probe", input = {}) => Array.from({ length: n }, (_, i) => ({ blocks: mockToolUseBlock(name, input, `${name}${i}`), stopReason: "tool_use" }));
@@ -6166,11 +6186,11 @@ if (window.__HARNESS__?.test) (async () => {
           const count = (notes, start) => notes.filter(n => n.startsWith(start)).length;
           const stuck = withItems(item(1, { kind: "source", text: "never seen" }));
           assert(flag("director", "on") === "on" && flag("effort") === null, "no flags: the defaults");
-          assert(eq(activeRules().map(r => r.id), DIRECTOR_RULES.map(r => r.id)), "no flags: every director rule");
+          assert(eq(activeRules().map(r => r.id), [...DIRECTOR_RULES, ...CHANNEL_RULES].map(r => r.id)), "no flags: every director rule, and the channel's own");
 
           // director=off: the six reminders from before the director, no contract notes, and no plan tool offered.
           await withFlags({ director: "off" }, async () => {
-            assert(eq(activeRules().map(r => r.id), ["polished", "unplanned", "silent", "failing", "untested", "unadopted"]), `the old reminders: ${activeRules().map(r => r.id)}`);
+            assert(eq(activeRules().map(r => r.id), ["polished", "unplanned", "silent", "failing", "untested", "unadopted", "date"]), `the old reminders, and the channel's date note: ${activeRules().map(r => r.id)}`);
             const long = await directedTurn({ script: [...calls(9), reply("Done.")] });
             assert(count(long.notes, GOAL) === 0, `no goal note: ${JSON.stringify(long.notes)}`);
             assert(long.sent.every(r => !r.toolConfig.tools.some(t => t.toolSpec.name === "plan") && !r.system[0].text.includes("### plan")), "the plan tool is not offered");
@@ -6187,7 +6207,7 @@ if (window.__HARNESS__?.test) (async () => {
             assert(count(notes, "No check has passed") === 0 && count(notes, "Item 1 is open") === 1, `stalled is silent, open still speaks: ${JSON.stringify(notes)}`);
           });
           await withFlags({ "rule.goal": "off" }, async () => assert(count((await directedTurn({ script: [...calls(9), reply("Done.")] })).notes, GOAL) === 0, "rule.goal=off"));
-          await withFlags({ director: "off", "rule.unplanned": "off" }, async () => assert(!activeRules().some(r => r.id === "unplanned") && activeRules().length === 5, "an old reminder by its id"));
+          await withFlags({ director: "off", "rule.unplanned": "off" }, async () => assert(!activeRules().some(r => r.id === "unplanned") && activeRules().length === 6, "an old reminder by its id"));
 
           // effort=<level>: every request at that level, whatever the run asked for.
           const haiku = reasoningMode => getConverseCommand({ modelId: "global.anthropic.claude-haiku-5-5", reasoningMode, systemPrompt: "P", tools: [], messages: [] }).additionalModelRequestFields;
@@ -6274,9 +6294,10 @@ if (window.__HARNESS__?.test) (async () => {
           const NOTE = 'A summary replaced older messages; the contract still holds. Goal: The user\'s goal. Done: item 1. Current: item 2, "Item 2"; check: b.md exists and contains "Sources". Notes: b.md cites three pages (https://example.com).';
           const request = sent.find(r => !JSON.stringify(r.messages).includes("Older messages are about to be dropped")), last = request.messages.at(-1);
           assert(request.messages[0].content[0].text.includes("Summary: halfway."), "the request starts from the summary");
-          assert(eq(last.content.filter(b => b.text).map(b => b.text), ["files", NOTE, "go on"]), `the contract comes back at the tail, before the user's words: ${JSON.stringify(last.content)}`);
+          const texts = last.content.filter(b => b.text).map(b => b.text);
+          assert(texts[1] === "<message><contents>go on</contents></message>" && texts[2].startsWith("<metadata>") && texts[2].includes(`<instruction rule="summary">${NOTE}</instruction>`), `the contract comes back at the tail, in the metadata after the user's words: ${JSON.stringify(last.content)}`);
           const saved = await db.get("messages", userId);
-          assert(saved.content[1].text === NOTE && saved.content[1].harness, "and stays on the message, so later requests keep it");
+          assert(saved.content.find(c => c.instruction)?.instruction.text === NOTE, "and stays on the message, so later requests keep it");
           assert(sent.at(-1).messages.flatMap(m => m.content).filter(b => b.text?.includes("the contract still holds")).length === 1, "once per summary");
         }
 
@@ -6290,7 +6311,7 @@ if (window.__HARNESS__?.test) (async () => {
             { role: "assistant", modelId: "m", content: [{ text: "\n" }] },
           ], { modelId: "m", cache: true });
           assert(sent.length === 3 && JSON.stringify(sent[1].content) === '[{"text":"(empty)"}]', `a turn left with nothing in the middle says so in a word: ${JSON.stringify(sent)}`);
-          assert(JSON.stringify(sent[2].content) === '[{"text":"go on"},{"cachePoint":{"type":"default"}}]', `a blank block goes, and so does a reply at the end with nothing in it: ${JSON.stringify(sent[2])}`);
+          assert(JSON.stringify(sent[2].content) === '[{"text":"<message><contents>go on</contents></message>"},{"cachePoint":{"type":"default"}}]', `a blank block goes, and so does a reply at the end with nothing in it: ${JSON.stringify(sent[2])}`);
           let asked;
           const client = getGeminiClient({ models: { generateContentStream: async request => { asked = request; return []; } } });
           const messages = [{ role: "user", content: [{ text: "hi" }] }, { role: "assistant", content: [{ reasoningContent: { redactedContent: new Uint8Array([1]) } }] }, { role: "user", content: [{ text: "go" }] }, { role: "assistant", content: [] }];
