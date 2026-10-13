@@ -6915,7 +6915,7 @@ if (window.__HARNESS__?.test) (async () => {
             const md = ws.state.files["PLAN.md"];
             assert(md.includes("- [x] 2. Todo") && md.includes("- [ ] 1. Notes") && md.includes("1 of 2 items done"), `PLAN.md follows the checks: ${md}`);
             const all = await step([["notes.md", "alpha"]]);
-            assert(all[0].includes("Every item is done: compare the work with the goal, then tell the user what was done and what wasn't, in their terms (they don't see the plan's items or checks)."), JSON.stringify(all));
+            assert(all[0].includes("The items you listed all pass, but they are only your steps: check the goal itself"), JSON.stringify(all));
           } finally {
             ws.dispose();
           }

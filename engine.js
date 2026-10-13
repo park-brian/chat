@@ -154,7 +154,8 @@ const MODELS = [
   { id: "global.anthropic.claude-fable-5-1", label: "Fable 5.1", group: "AWS Bedrock", ...CLAUDE_5 },
   { id: "global.anthropic.claude-opus-5-5", label: "Opus 5.5", group: "AWS Bedrock", ...CLAUDE_5, cutoff: "June 2026" },
   { id: "global.anthropic.claude-sonnet-5-5", label: "Sonnet 5.5", group: "AWS Bedrock", ...CLAUDE_5 },
-  { id: "global.anthropic.claude-haiku-5-5", label: "Haiku 5.5", group: "AWS Bedrock", ...CLAUDE_5, context: 100_000, levels: ["off", ...CLAUDE_5.levels], off: { thinking: { type: "disabled" } } },
+  // Haiku 5.5 takes 128k out, and thinking counts toward it: at 64k it thought through the whole budget twice (E15).
+  { id: "global.anthropic.claude-haiku-5-5", label: "Haiku 5.5", group: "AWS Bedrock", ...CLAUDE_5, maxTokens: 128_000, context: 100_000, levels: ["off", ...CLAUDE_5.levels], off: { thinking: { type: "disabled" } } },
   // Bedrock's OpenAI models take no cache points and no documents. They see a tool result's image only beside it,
   // in the same message, never inside it (evals/NOTES.md).
   { id: "global.openai.gpt-6.1-sol", label: "Sol 6.1", group: "AWS Bedrock", ...GPT_6, levels: ["low", "medium", "high", "xhigh", "max"], cache: false, documents: false, beside: true },
@@ -983,7 +984,10 @@ const PLAN_NOTE = "This task is long. Write PLAN.md now with write_file (SPEC.md
 // The note for a reply that ended in thought alone, with no text and no call, or null.
 function silentReply(messages) {
   const last = messages.at(-1);
-  if (last?.role !== "assistant" || (last.content ?? []).some(c => c?.text?.trim() || c?.toolUse)) return null;
+  const silent = m => m?.role === "assistant" && !(m.content ?? []).some(c => c?.text?.trim() || c?.toolUse);
+  if (!silent(last)) return null;
+  const assistants = messages.filter(m => m.role === "assistant");
+  if (assistants.length >= 3 && assistants.slice(-3).every(silent)) return null;
   // Why: Gemini wrote a whole game in one call twice; each came back malformed and empty, and it was told only "no text"
   if (last.stopReason === "malformed_tool_call") return "Your tool call came back malformed, so nothing ran: a call that large fails as a whole. Write the file in parts: write_file with the skeleton, then edit_file to fill each part.";
   if (last.stopReason === "max_tokens") return "Your reply reached the output limit before any text or tool call. Write the file in parts: write_file with the skeleton, then edit_file to fill each part.";
@@ -1220,7 +1224,7 @@ function doneNote(done, contract) {
   const next = currentItem(contract), ids = done.map(i => i.id), so = done.length > 1 ? "they are" : "it is";
   const head = `${itemsLabel(ids)}'s check${done.length > 1 ? "s" : ""} passed, so ${so} done (${progressLine(contract)}).`;
   return next ? `${head} Next: item ${next.id}, "${next.title}"; its check: ${describeCheck(next.check)}.`
-    : `${head} Every item is done: compare the work with the goal, then tell the user what was done and what wasn't, in their terms (they don't see the plan's items or checks). For a fix, say what caused the problem, which files changed, and how you checked it.`;
+    : `${head} The items you listed all pass, but they are only your steps: check the goal itself, everything the user asked for. If something is missing or doesn't work yet, add it as an item and go on. If it is all there, tell the user what was done and what wasn't, in their terms (they don't see the plan's items or checks); for a fix, what caused the problem, which files changed, and how you checked it.`;
 }
 
 function resummaryNote(contract) {
@@ -1256,7 +1260,8 @@ const DIRECTOR_RULES = [
   { id: "same", at: "step", every: "event", note: s => s.events.same.map(({ item, evidence }) => `Item ${item.id}'s check failed twice the same way (${evidence}), so the approach isn't working yet. Read the code and the error again before the next edit, or split the item with plan({ edit }) and plan({ add }).`) },
   { id: "stalled", at: "step", every: "event", note: s => s.idle && s.idle % STALL_STEPS === 0 && s.current && runnable(s.current) && `No check has passed in ${s.idle} steps, and item ${s.current.id}, "${s.current.title}", is still open. Change the approach, split the item, or ask the user.` },
   { id: "budget", at: "step", every: "summary", note: s => s.has("plan") && s.used >= s.summaryAt * NOTES_AT && `The context is at ${Math.round(s.used / 1000)}k tokens, near the ${Math.round(s.summaryAt / 1000)}k at which older messages are summarized and earlier tool results cleared. Write what you learned to notes now with plan({ note, source }), then keep working: the summary and the notes carry the work on.` },
-  { id: "silent", at: "stop", every: "turn", note: s => silentReply(s.messages) },
+  // Per stop, not per turn: a second empty reply would otherwise end the run (E15). silentReply stops after two in a row.
+  { id: "silent", at: "stop", every: "event", note: s => silentReply(s.messages) },
   { id: "failing", at: "stop", every: "turn", note: s => failingReport(s.messages.slice(s.start)) },
   { id: "untested", at: "stop", every: "turn", note: s => untestedChange(s.messages, s.start) },
   { id: "unadopted", at: "stop", every: "turn", note: s => unadoptedVariants(s.messages, s.start) },
