@@ -60,6 +60,8 @@ Check kinds the harness runs, after each change to the files a check names:
 - probe: { "kind": "probe", "file": "index.html", "script": "return ..." } the script returns true in the page
 - file: { "kind": "file", "file": "report.md", "contains": "## Sources", "min_words": 800 } also exists, max_words, matches
 - source: { "kind": "source", "text": "a quote or number" } the text appears in a tool result in this chat
+- command: { "kind": "command", "run": "npm test", "exit": 0 } the command, run in the bash tool's shell from
+  /project, exits with that code; stdout: text its output must contain
 An item is done when the harness sees its check pass, never by your say. A new check runs at once and should fail,
 since the work isn't done yet; one that already passes doesn't test the work. Add the items in the order you will do
 them, the one you are least sure of first, and edit the plan when the work teaches you something.
@@ -192,9 +194,8 @@ Artifact tools:
   inspect the DOM, return a value), viewport to change size, and screenshot to force or skip a screenshot.
   A screenshot wider than a phone's shows the page at a phone's width beside it, so one run sees both.
   Edits already report; run_app is for what they don't show.
-  There is no Node.js, npm or shell here; code runs in the browser. To run a project's tests, call run_app on the
-  test file or folder (node:test, node:assert and the common runners work); it returns pass and fail counts. A test
-  in a page's own script runs when the page runs.
+  On a test file or folder, run_app runs the tests as node --test would (node:test, node:assert and the common
+  runners work) and returns pass and fail counts. A test in a page's own script runs when the page runs.
 - history, diff, restore: every version is kept; restore any of them.
 The editor tool is for notes, skills, and memories, not for artifacts.
 
@@ -266,12 +267,10 @@ on disk, by a restore, or errors while the user used the page). Treat it as the 
 
 export const ENVIRONMENT = `
 ## Environment
-You run in a browser tab on the user's own machine, with the user's own keys. No server, no Node.js, no shell, no
-build step: the web platform is the machine.
+You run in a browser tab on the user's own machine, with the user's own keys. No server and no build step: the web
+platform is the machine.
 
-There is no Node.js, npm or shell here; code runs in the browser. To run a project's tests, call run_app on the test
-file or folder (node:test, node:assert and the common runners work); it returns pass and fail counts. A test in a
-page's own script runs when the page runs.
+{shell}
 
 This conversation started on {started}.{cutoff} Older messages are summarized automatically when the context fills, so long work can go on
 past that point: keep working rather than wrapping up early.
@@ -302,6 +301,28 @@ Pin the version you read. "Not a function", "not a constructor", "is not defined
 means the draft was wrong: read the source, don't guess again. In code, Object.keys(await import(url)) lists what
 a module really exports.
 `;
+
+// ENVIRONMENT's {shell} paragraph, with the bash tool and without it (a sub-agent that has none).
+export const SHELL_PRESENT = `The bash tool is a shell over the project's files, in the browser: node, npm, npx, git, python3, pip and pytest
+run there, and node --test, npm test and pytest return real pass and fail counts. run_app on a test file or folder
+runs it as node --test would, too. A test in a page's own script runs when the page runs.`;
+export const SHELL_ABSENT = `There is no Node.js, npm or shell here; code runs in the browser. To run a project's tests, call run_app on the test
+file or folder (node:test, node:assert and the common runners work); it returns pass and fail counts. A test in a
+page's own script runs when the page runs.`;
+
+// The bash tool's description: what is there, what isn't, so a model neither plans around a missing tool nor
+// spends turns on one that can't work (docs/specs/2026-10-13-shell.md).
+export const BASH_DESCRIPTION = `Run a command in bash over this project's files, in the browser (just-bash; the project is at /project). cwd and env carry over between calls; restart: true starts a fresh shell. Files a command writes become versions of the project, as edit_file's do; node_modules, .git and binary files stay in the shell.
+Commands: coreutils (ls, cat, grep, rg, sed, awk, find, xargs, sort, uniq, wc, diff, jq, sqlite3, tar, gzip, …) and
+- node file.js, node -e/-p (CommonJS and ESM; fetch, and child_process.exec of this shell's commands), node --test
+- npm install/test/run/ls/init -y, npx (npx tsc for TypeScript); packages come from the npm registry
+- python3, pip install, pytest: Pyodide (CPython in WebAssembly), loaded on first use (several seconds)
+- git: init, add, commit, status, diff, log, branch, checkout, reset; clone and push only through the local proxy
+- curl, wget: the same proxy rules as read_url
+- open FILE: runs it as run_app does, after the command, and returns its report
+pip installs Pyodide's builds and pure-Python wheels: numpy, scipy, pandas, polars, duckdb, pyarrow, scikit-learn, xgboost, lightgbm, statsmodels, sympy, matplotlib (figures come back as images), networkx, opencv-python, scikit-image, Pillow, biopython, astropy, geopandas, shapely and more.
+Not here: native addons and compilers, sudo and apt, cmp; PyTorch, TensorFlow and JAX in Python (for neural networks use TensorFlow.js or ONNX Runtime Web from node). The network is reached only by the proxy rules: a site that sends no CORS headers needs the local proxy.
+node --test, npm test and pytest return real pass and fail counts. Output past 12000 characters keeps its start and end, and the whole is saved to a file the output names. Default timeout 60 s (300 for Python), up to 600.`;
 
 // ENVIRONMENT's {fetch} line: what fetch() and read_url reach, with the local CORS proxy and without it.
 export const FETCH_PROXIED = `- fetch() reaches any URL: requests to other sites go through the local CORS proxy, as read_url's do`;

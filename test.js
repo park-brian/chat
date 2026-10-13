@@ -239,8 +239,9 @@ async function run(config = options(process.argv.slice(2))) {
           );
           continue;
         }
-        // index.html's suite takes about two minutes on this machine; the limit is for a suite that hangs.
-        await page.waitForFunction(() => window.TESTS_DONE, null, { timeout: 180000 });
+        // index.html's suite takes about two and a half minutes on this machine (the shell's tests, Python's first boot
+        // among them, take about 50 s); the limit is for a suite that hangs.
+        await page.waitForFunction(() => window.TESTS_DONE, null, { timeout: 300000 });
         const result = await page.evaluate(() => window.TESTS_DONE);
         if (
           typeof result !== "object" ||

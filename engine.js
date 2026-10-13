@@ -5,12 +5,15 @@
 // #region 1. IMPORTS & DEFINITIONS
 import {
   DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FETCH_DIRECT, FETCH_PROXIED, FORK_BRIEF, FRONTEND_SKILL,
-  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SUMMARY_PROMPT,
-  TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
+  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
+  SUMMARY_PROMPT, TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
 import {
   STOP_MAX, STEER_MAX, delivered, envelopeGuide, isoLocal, localDate, note, renderTurn, sameClient, steer, timing,
 } from "./envelope.js";
+import { BASH_TOOL_SPEC, createShellTool } from "./shell/tool.js";
+// The tab's half, for index.html: it loads only this file.
+export { createShellHost } from "./shell/host.js";
 
 // A SharedWorker's console is its own; what the engine logs, and what it throws, goes to the tabs' consoles too. The
 // first tab connects while the imports below are still loading: its port waits for the engine.
@@ -73,6 +76,7 @@ function systemPrompt(persona, { tools = [], memories = null, modelId = null, st
     fetch: getProxyConfig()?.endpoint ? FETCH_PROXIED : FETCH_DIRECT,
     started: started ?? localDate(Date.now()),
     cutoff: cutoff ? ` What you know comes from data up to ${cutoff}.` : "",
+    shell: tools.includes("bash") ? SHELL_PRESENT : SHELL_ABSENT,
   });
   const working = fill(WORKING, { changes }) + (planInPrompt(tools) ?? "");
   const envelope = envelopeGuide({ envelope: flag("envelope", "xml"), metadata: flag("metadata", "minimal") });
@@ -100,20 +104,23 @@ const PATCH_FORMAT = "<<<<<<< SEARCH\nexact lines from the file\n=======\nthe li
 const SEARCH_MARK = /^\s*<{5,9}\s*(SEARCH)?\s*$/i, DIVIDER_MARK = /^\s*={5,9}\s*$/, REPLACE_MARK = /^\s*>{5,9}\s*(REPLACE)?\s*(ALL)?\s*$/i;
 
 // Tools every agent gets, independent of its saved tool list.
-const WORKSPACE_TOOL_NAMES = ["view_file", "edit_file", "write_file", "run_app", "history", "diff", "restore"];
+const WORKSPACE_TOOL_NAMES = ["view_file", "edit_file", "write_file", "run_app", "bash", "history", "diff", "restore"];
 // A fork reads and reports; changes and further sub-agents stay with the caller.
 const FORK_REFUSES = ["task", "edit_file", "write_file", "restore"];
 const VARIANT_REFUSES = ["task"];
 const PATH_PROPERTY = { type: "string", description: "File path, e.g. index.html, notes.md, logo.svg. Defaults to the shown artifact." };
 const SCREENSHOT_PROPERTY = { type: "boolean", description: "true forces a screenshot, false skips it. By default one is attached when the user lets you see the page and it changed." };
-// The harness runs test, probe, file and source checks itself; the other kinds are named so a plan can hold them.
-const CHECK_KINDS = ["test", "probe", "file", "source", "compute", "consistency", "judge", "user"];
-const HARNESS_CHECKS = ["test", "probe", "file", "source"];
+// The harness runs test, probe, file, source and command checks itself; the other kinds are named so a plan can hold them.
+const CHECK_KINDS = ["test", "probe", "file", "source", "command", "compute", "consistency", "judge", "user"];
+const HARNESS_CHECKS = ["test", "probe", "file", "source", "command"];
 const CHECK_SCHEMA = {
   type: "object",
   description: "How the harness tells the item is done",
   properties: {
-    kind: { type: "string", enum: CHECK_KINDS, description: "test, probe, file and source are run by the harness" },
+    kind: { type: "string", enum: CHECK_KINDS, description: "test, probe, file, source and command are run by the harness" },
+    run: { type: "string", description: "command: the bash command to run from /project, e.g. npm test" },
+    exit: { type: "integer", description: "command: the exit code it must return (default 0)" },
+    stdout: { type: "string", description: "command: text its output must contain" },
     file: { type: "string", description: "test, probe: the page to run (default: the shown one), or a test file it runs. file: the file to check" },
     name: { type: "string", description: "test: the name of a test that must be among those passing" },
     script: { type: "string", description: "probe: JS run in the page after it settles, true when the item is done, e.g. return app.items().length === 3" },
@@ -445,7 +452,7 @@ Examples:
     fn: runApp,
     toolSpec: {
       name: "run_app",
-      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included. There is no Node.js, npm or shell here: on a test file or folder (test/index.test.js, test/), it runs the tests as node --test would (node:test, node:assert and the common runners work) and returns pass and fail counts.",
+      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included. On a test file or folder (test/index.test.js, test/), it runs the tests as node --test would (node:test, node:assert and the common runners work) and returns pass and fail counts.",
       inputSchema: {
         json: {
           type: "object",
@@ -460,6 +467,8 @@ Examples:
       },
     },
   },
+  // The shell runs in a tab (shell/host.js); shell/tool.js keeps the sessions and commits what commands change.
+  { fn: (input, context) => shellTool.bash(input, context), toolSpec: BASH_TOOL_SPEC },
   {
     fn: listHistory,
     toolSpec: {
@@ -511,9 +520,13 @@ Examples:
   },
 ];
 
+const shellTool = createShellTool({ workspaceFor: (...a) => workspaceFor(...a), runApp: (...a) => runApp(...a) });
+
 // A copy of this app run as an artifact (the chat, worked on in the chat) keeps a database of its own: its tests
 // would otherwise write over the chats of the app it runs in.
 const DB_NAME = /\/__ws\//.test(globalThis.location?.pathname ?? "") ? "chat-workspace" : "chat";
+// The shell's own store, beside it: node_modules, .git, binary files (shell/store.js).
+const SHELL_DB = DB_NAME + "-shell";
 
 // One schema, no migrations: a database made by any other version starts over empty.
 // blocking: a newer version wants to upgrade; the owner lets go of its work, then this connection closes.
@@ -787,7 +800,7 @@ function createWorkspaces(db, host) {
 // A call a tab took with it when it closed goes to the next.
 // Bump when a command, event, or host call changes. The worker's URL carries it and DB_VERSION, so a page of
 // another version gets a worker of its own; hello checks it too.
-const PROTOCOL = 4;
+const PROTOCOL = 5;
 let served = null;
 function serve(port) {
   const starting = served ??= startEngine();
@@ -841,6 +854,7 @@ async function startEngine() {
     run: ask("run"),
     code: ask("code"),
     readUrl: ask("readUrl"),
+    shell: ask("shell"),
     release: (projectId, branch = null) => tabs.forEach(t => t.port.postMessage({ type: "release", projectId, branch })),
   };
   const workspaces = createWorkspaces(db, host);
@@ -1010,6 +1024,7 @@ function describeCheck(c) {
       return `${c.file} ${andList(parts)}`;
     }
     case "source": return `"${clip(c.text, 80)}" appears in a tool result`;
+    case "command": return `\`${clip(c.run, 100)}\` exits ${c.exit ?? 0}${c.stdout != null ? ` with "${clip(c.stdout, 60)}" in its output` : ""}`;
     default: return `${c.kind}: ${clip(c.text ?? "", 80)}`;
   }
 }
@@ -1021,9 +1036,11 @@ function toCheck(c) {
   if (c.kind === "probe" && !String(c.script ?? "").trim()) return { error: "has a probe check without a script" };
   if (c.kind === "file" && !c.file) return { error: "has a file check without a file" };
   if (c.kind === "source" && !String(c.text ?? "").trim()) return { error: "has a source check without the text to find" };
+  if (c.kind === "command" && !String(c.run ?? "").trim()) return { error: 'has a command check without the command: { "kind": "command", "run": "npm test", "exit": 0 }' };
+  if (c.kind === "command" && c.exit != null && !Number.isInteger(+c.exit)) return { error: "has a command check whose exit isn't a number" };
   if (c.matches) try { new RegExp(c.matches, "m"); } catch (e) { return { error: `has a pattern that doesn't parse: ${e.message}` }; }
-  const fields = ["kind", "file", "name", "script", "exists", "contains", "matches", "min_words", "max_words", "text"];
-  return { check: Object.fromEntries(fields.filter(k => c[k] != null).map(k => [k, k === "file" ? normalizePath(c[k]) : c[k]])) };
+  const fields = ["kind", "file", "name", "script", "exists", "contains", "matches", "min_words", "max_words", "text", "run", "exit", "stdout"];
+  return { check: Object.fromEntries(fields.filter(k => c[k] != null).map(k => [k, k === "file" ? normalizePath(c[k]) : k === "exit" ? +c[k] : c[k]])) };
 }
 
 // The strings in every tool result of this chat but the plan's own, with the call that returned each.
@@ -1094,13 +1111,15 @@ async function probeCheck(c, ws, signal) {
 }
 
 // { result: pass | fail | "not run", evidence }. A check that throws fails, with the reason as its evidence.
-async function runCheck(check, { ws = null, messages = [], fresh = [], signal = null } = {}) {
+// host and threadId: for a command check, the tab that runs the shell, and the run whose shell it is.
+async function runCheck(check, { ws = null, messages = [], fresh = [], signal = null, host = null, threadId = null } = {}) {
   try {
     switch (check.kind) {
       case "file": return fileCheck(check, ws?.readFile ? await ws.readFile(check.file) : null);
       case "source": return sourceCheck(check, messages);
       case "test": return await testCheck(check, ws, fresh, signal);
       case "probe": return await probeCheck(check, ws, signal);
+      case "command": return await shellTool.runCommandCheck(check, { ws, host, threadId, signal });
       default: return { result: "not run", evidence: `not run by the harness yet: it runs ${andList(HARNESS_CHECKS)} checks, so this item stays open` };
     }
   } catch (e) {
@@ -1113,7 +1132,7 @@ async function runCheck(check, { ws = null, messages = [], fresh = [], signal = 
 function watches(check, path) {
   if (isPlanFile(path)) return false;
   if (check.kind === "file") return check.file === path;
-  if (check.kind === "test" || check.kind === "probe") return !isScratch(path) || check.file === path;
+  if (check.kind === "test" || check.kind === "probe" || check.kind === "command") return !isScratch(path) || check.file === path;
   return false;
 }
 
@@ -1212,7 +1231,7 @@ function resummaryNote(contract) {
 }
 
 const GOAL_NOTE = "This is long work, so the harness keeps a contract for it that outlasts summaries. Before more work, state the goal in the user's words, your assumptions, and what done means with plan({ goal, assumptions, done }).";
-const ITEMS_NOTE = "The goal is set and the plan has no items. Add the steps with plan({ add: { title, check } }), each with a check the harness can run (test, probe, file or source), so it can tell when each one is done.";
+const ITEMS_NOTE = "The goal is set and the plan has no items. Add the steps with plan({ add: { title, check } }), each with a check the harness can run (test, probe, file, source or command), so it can tell when each one is done.";
 
 // Each rule: when it is read (at a step's results, when the model stops, after a summary), how often it may speak
 // (once a turn, at every event, or once between summaries), and what it says. A stop takes one note at a time. The
@@ -1281,7 +1300,7 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
   const contract = { ...emptyContract(), ...structuredClone(thread?.contract ?? {}) };
   const has = name => tools.includes(name);
   const reminded = new Set(), seen = new Set();
-  let pending = [], idle = 0, asked = false, dirty = false, workspace = null;
+  let pending = [], idle = 0, asked = false, dirty = false, workspace = null, host = null;
   const sources = new Set();
   let queue = Promise.resolve();
   const serial = fn => { const p = queue.then(fn); queue = p.catch(() => {}); return p; };
@@ -1356,7 +1375,8 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
     return serial(async () => {
       if (!input || typeof input !== "object" || Array.isArray(input)) return { error: "plan takes an object: { goal }, { add }, { edit }, { note } or { ask }." };
       workspace = context.workspace ?? workspace;
-      const env = { ws: workspace, messages: messages(), signal: context.signal };
+      host = context.host ?? host;
+      const env = { ws: workspace, messages: messages(), signal: context.signal, host, threadId };
       const said = [];
       const statusGiven = "status" in input || [input.add].flat().some(a => a && "status" in a) || (input.check && "status" in input.check);
       if (statusGiven) said.push("Status is the harness's: an item is done when its check passes, so the status given was ignored.");
@@ -1430,12 +1450,14 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
   }
 
   // After a step's results: run the checks the step bears on, then the rules. Returns the note blocks to append.
-  function step({ messages: all, start: startAt = start, ws = null, signal = null, step: n = null }) {
+  function step({ messages: all, start: startAt = start, ws = null, signal = null, step: n = null, host: tab = null }) {
     return serial(async () => {
       workspace = ws ?? workspace;
+      host = tab ?? host;
       const results = (all.at(-1)?.content ?? []).map(resultOf).filter(r => r && typeof r === "object");
-      const changed = new Set(results.filter(r => r.version != null && r.path).map(r => normalizePath(r.path)));
-      const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal };
+      // A tool's version, or the files a bash command changed.
+      const changed = new Set(results.flatMap(r => [...(r.version != null && r.path ? [r.path] : []), ...(Array.isArray(r.files) ? r.files.map(f => f?.path).filter(Boolean) : [])]).map(normalizePath));
+      const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal, host, threadId };
       const s = stateFor(all, startAt, { ws: workspace, files: Object.keys(workspace?.state?.files ?? {}), shown: workspace?.shownPath?.() ?? null });
       s.events.red = pending.splice(0);
       for (const item of contract.items.filter(i => i.status !== "done" && runnable(i))) {
@@ -1514,7 +1536,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     // Sub-agents that finished meanwhile: through the director's channel, so they ride this step's notes, after the
     // results, never inside one.
     if (background) deliverSubagents(director, background.take());
-    const notes = await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal, step });
+    const notes = await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal, step, host });
     const rich = stepMetadata(director.contract, ws);
     results.content.push(...(Object.keys(rich).length ? [{ metadata: rich }] : []), ...notes);
     return push({ ...results, parentId: callsId, createdAt: Date.now() });
@@ -2624,7 +2646,10 @@ async function mcp({ command, server, tool, uri, name, args, filename }, context
 // wants each one answered) and finds its question in its own. It reads; the caller changes things.
 function forkOf({ request, turn }, toolUseId, question, { brief = q => fill(FORK_BRIEF, { question: q }), refuses = FORK_REFUSES } = {}) {
   const refuse = name => () => ({ error: `A fork does not ${name === "task" ? "start sub-agents" : "change files"}. Put what should change in your answer; the caller makes the change.` });
-  const toolMap = Object.fromEntries(request.tools.map(({ toolSpec: { name }, fn }) => [name, refuses.includes(name) ? refuse(name) : fn]));
+  // A fork that reads may still run commands (the tests, say): in a shell of its own, whose changes aren't saved.
+  const readOnly = refuses.includes("write_file");
+  const shellOf = fn => (input, context) => fn(input, { ...context, shell: { session: `fork-${toolUseId}`, commit: false } });
+  const toolMap = Object.fromEntries(request.tools.map(({ toolSpec: { name }, fn }) => [name, refuses.includes(name) ? refuse(name) : readOnly && name === "bash" ? shellOf(fn) : fn]));
   toolMap.wait = () => ({ error: "Only the caller waits for sub-agents." }); // offered with task under subagents=async
   // The brief rides in the fork's own result, after a line that says so: read as the result, a fork took itself for the
   // caller and called the task it was; sent as the user's words, it made Haiku drop the caller's thinking, and the cache.
@@ -2647,7 +2672,9 @@ function ownedTools(toolMap, owned, ws, db) {
     if (path && !ownsPath(owned, path)) return { error: `${path} isn't yours: this part owns ${owned.join(", ")}. The rest is the contract: read it, build against it, and say in your final message what it lacks.` };
     return fn(input, context);
   };
-  return Object.fromEntries(Object.entries(toolMap).map(([name, fn]) => [name, ["write_file", "edit_file", "restore"].includes(name) ? guard(name, fn) : fn]));
+  // Its commands run, and only what they change in its own files is saved.
+  const shellOwned = fn => (input, context) => fn(input, { ...context, shell: { owns } });
+  return Object.fromEntries(Object.entries(toolMap).map(([name, fn]) => [name, ["write_file", "edit_file", "restore"].includes(name) ? guard(name, fn) : name === "bash" ? shellOwned(fn) : fn]));
 }
 
 // The files the other parts called in the same turn own.
@@ -3578,6 +3605,16 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     return { version, changed: true, before };
   }
 
+  // A file goes from the heads; its versions stay in the history. Call it inside exclusive, as commit.
+  async function remove(path) {
+    path = normalizePath(path);
+    if (!state.project || !(path in state.project.heads)) return false;
+    const { [path]: _, ...heads } = unwrap(state.project.heads);
+    await saveProject({ heads }, { quiet: !!host });
+    setState("files", path, undefined);
+    return true;
+  }
+
   async function checkout(heads) {
     if (!state.project || !heads) return false;
     const current = { ...unwrap(state.project.heads) };
@@ -3787,7 +3824,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
 
   return {
     id, state, setState, notify, shownPath, show, select, rememberCapture: runner?.rememberCapture, captureView,
-    open, close, createProject, ensureProject, commit, checkout, describeChanges,
+    open, close, createProject, ensureProject, commit, remove, checkout, describeChanges,
     readFile, readVersion, listFiles, listVersions, diff, restore, userEdit, exclusive,
     run, preview: versionId => run({ versionId }),
     setContext: value => { context = { ...context, ...value }; },
@@ -4678,13 +4715,13 @@ if (inSharedWorker) {
 
 export {
   CAPTURE_CHOICE_KEY, CDN, CHANNEL_RULES, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, FLAGS_KEY, REFUSAL_TEXT, newDayNote, stepMetadata, userMetadata, PRE_DIRECTOR_RULES, activeRules, flag, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
-  PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
+  PROXY_CONFIG_KEY, SHELL_DB, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
   countLines, countRepeats, createDirector, createWorkspace, describeCheck, editFile, editor, renderPlan, runCheck, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
   getConverseClient, getConverseCommand, getProxyConfig, getToolResults, guardLoops, initDB, inspectArgs, isHtml, isLocalHost,
   isPlanFile, isRenderable, isScratch, listHistory, loopGuard, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
   ownedTools, parseJSON, parsePatch, plainError, polishedTake, preflight, prepareMessages, processStreamChunk,
   providerOf, proxyFetch, proxyRewrite, readUrl, reasoningFields, reasoningLevel, relayUrl, restoreVersion,
-  runAgentWithBranching, runApp, runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent,
+  runAgentWithBranching, runApp, runningSubagents, sameView, shellTool, sandboxFiles, sandboxResources, serve, setSubagent,
   siblingFiles, silentReply, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, systemPrompt,
   task, think, timeAgo, toDocument, toError, toResultValue, unadoptedVariants, unmuteScripts, unplannedTask, untestedChange,
   viewFile, waitSubagents, watchedSend, webSearch, webToolNames, writeFile,
