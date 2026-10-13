@@ -352,6 +352,24 @@ experiments, each against the noise floor from E5.
   hands on to the snapshot. The spike measures those two now.
 - **Next:** whether models stop squeezing content (the spec's "Then").
 
+### E15 result, and two failures it exposed (9ac8abd, Haiku ×2 per arm)
+
+- **Scores:** blocking 0.61 (game-ambitious 0.55, hard-ssg-report 0.83, long-novella 0.44); async 0.64 over 5
+  graded (ssg 0.96 in 223 s against 329 s; game 0.55; novella 0.17, plus one unfinished whose files pass 16/18).
+- **Inconclusive.** ×2 per arm is below the noise floor for single tasks, and both arms were dominated by two
+  failures unrelated to sub-agents. The faster, better ssg report under async is the only hint; it needs ×3+.
+- **Failure 1: the director declared an unfinished game done.** Haiku's contract had one item ("the rules
+  engine"); its check passed; the director said "Every item is done: compare the work with the goal, then tell the
+  user…"; Haiku stopped with nothing playable ("The game is not finished… Nothing is playable yet"). Items don't
+  define done; the goal does. Fix (E20's premise): a goal's done criteria are checks on the goal itself, and the
+  all-done note never fires while the goal's own checks are red or absent.
+- **Failure 2: thinking used the whole output budget.** On the same task, Haiku at effort high produced 64,000
+  output tokens with no text and no call, twice (thinking counts toward max_tokens on Haiku 5.5); the silent-reply
+  note fired once and the turn ended. Next (E24): Haiku's max_tokens at its 128k ceiling against effort medium,
+  on game-ambitious and long, ×3.
+- **Also:** game-ambitious scored 0.94-0.98 in early October and 0.55 here; these two failures account for the
+  four lowest runs. A regression check after the fixes will show whether anything else is going on.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
