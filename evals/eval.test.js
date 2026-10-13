@@ -1,7 +1,7 @@
 // eval.js's pure helpers and the graders' CDN check, without a browser or a model.
 import assert from "node:assert/strict";
 import path from "node:path";
-import { bounded, dialogue, filePath, flagsText, MAX_UNCONFIRMED, meanLine, options, parseFlags, partialNote, passK, ruleIds, summarize } from "../eval.js";
+import { bounded, dialogue, filePath, flagsText, MAX_UNCONFIRMED, meanLine, metrics, options, parseFlags, partialNote, passK, ruleIds, summarize, transcript } from "../eval.js";
 import TASKS, { numbers, pinsJsdelivr, replies } from "./tasks.js";
 import { criteriaOf, judge, judgedChecks, judgePrompt, JUDGE_MODEL, PLAIN } from "./judge.js";
 import { FLOURISHES, mannered, wordCount } from "./style.js";
@@ -181,5 +181,27 @@ const down = await judge(run, task, { send: async () => { throw new Error("Expir
 assert.deepEqual([judgedChecks(down), down.unjudged.length, down.error], [[], 2, "ExpiredTokenException: token expired"]);
 assert.ok(down.unjudged.every(u => u.reason === "judge failed: ExpiredTokenException: token expired"));
 assert.deepEqual(await judge(run, {}, { send: () => assert.fail("no rubric, no call") }), { graded: [], unjudged: [], tokens: { input: 0, output: 0 }, error: null });
+
+
+// The director's channel in eval output: notes counted by rule (delivered and capped), and shown in the transcript
+// with their rule, step and status; each tool result with its times.
+{
+  const note = (rule, status, step = 1) => ({ instruction: { rule, text: `${rule} note`, priority: 50, step, status } });
+  const messages = [
+    { role: "user", content: [{ text: "go" }, { metadata: { timestamp: "2026-10-13T14:05:00-04:00" } }] },
+    { role: "assistant", content: [{ toolUse: { toolUseId: "call-000001", name: "probe", input: {} } }] },
+    { role: "user", content: [{ toolResult: { toolUseId: "call-000001", content: [{ json: { result: "ok" } }] }, timing: { started: "14:05:02", ended: "14:05:05", ms: 3200 } }, note("done", "delivered"), note("same", "delivered"), note("stalled", "capped")] },
+    { role: "assistant", content: [{ text: "Done." }] },
+    { role: "user", content: [note("open", "delivered", 2)] },
+  ];
+  const m = metrics(messages, [], 1000);
+  assert.deepEqual([m.steered, m.capped], [{ done: 1, same: 1, open: 1 }, { stalled: 1 }]);
+  const text = await transcript(messages, dir);
+  assert.ok(text.includes("> **director** `done` step 1, delivered: done note") && text.includes("> **director** `stalled` step 1, capped: stalled note"), text);
+  assert.ok(text.includes("**← 000001** 14:05:02–14:05:05, 3200 ms") && text.includes("```metadata\ntimestamp: 2026-10-13T14:05:00-04:00"), text);
+  assert.deepEqual(parseFlags("envelope=plain,metadata=rich"), { envelope: "plain", metadata: "rich" });
+  for (const bad of ["envelope=json", "metadata=full"]) assert.throws(() => parseFlags(bad), undefined, bad);
+  assert.ok(ruleIds().includes("date"), "the channel's date rule is a rule");
+}
 
 console.log("eval helpers: ok");
