@@ -6,7 +6,7 @@
 import {
   DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FETCH_DIRECT, FETCH_PROXIED, FORK_BRIEF, FRONTEND_SKILL,
   GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SUMMARY_PROMPT,
-  TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
+  TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
 
 // A SharedWorker's console is its own; what the engine logs, and what it throws, goes to the tabs' consoles too. The
@@ -56,7 +56,9 @@ const fill = (template, values) => template.replace(/\{(\w+)\}/g, (match, name) 
 // Assembled per request: the agent's own prompt and memories, then how this harness works, for the tools it has.
 // The date is the day the request is built, so the cached prefix changes once a day.
 function systemPrompt(persona, { tools = [], memories = null, modelId = null } = {}) {
-  const guide = TOOL_DOCUMENTATION.split(/\n(?=### )/).filter(part => !part.startsWith("### ") || tools.includes(part.match(/^### (\w+)/)[1]));
+  const guide = TOOL_DOCUMENTATION.split(/\n(?=### )/).filter(part => !part.startsWith("### ") || tools.includes(part.match(/^### (\w+)/)[1]))
+    // subagents=async: the task section says how results come back.
+    .map(part => part.startsWith("### task") && flag("subagents") === "async" ? part.trimEnd() + "\n" + TASK_ASYNC : part);
   const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && HARNESS_DOCUMENTATION;
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
@@ -183,7 +185,8 @@ function setSubagent(toolUseId, entry) {
   return entry;
 }
 // The answer a tool result block carries.
-const resultOf = block => block?.toolResult?.content?.[0]?.json?.result;
+// One delivered later (subagents=async) rides a harness block of its own, and counts as its task's result.
+const resultOf = block => block?.toolResult?.content?.[0]?.json?.result ?? block?.subagent?.result;
 
 const TOOLS = [
   {
@@ -1444,6 +1447,18 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   // Each message records the file heads it left behind, so a branch can restore the code it saw.
   const saveMsg = async msg => db.add("messages", { ...unwrap(msg), agentId: params.agentId, threadId: params.threadId, heads: workspace ? await projectHeads(db, params.threadId) : null });
   const toolMap = Object.fromEntries(store.tools.map(t => [t.toolSpec.name, t.fn]));
+  // subagents=async: task returns at once, results come in later messages, and a running part's files are its own.
+  const background = flag("subagents") === "async" && toolMap.task ? createBackground(signal) : null;
+  let toldRunning = false;
+  if (background) {
+    toolMap.wait = WAIT_TOOL.fn;
+    const locked = (name, fn) => async (input, context) => {
+      const path = background.running.size && await changedPath(name, input, context.workspace, db).catch(() => null);
+      const owner = path && background.owner(path);
+      return owner ? { error: `${path} belongs to a running part (${owner}); wait for it or work on other files.` } : fn(input, context);
+    };
+    for (const name of ["write_file", "edit_file", "restore"]) if (toolMap[name]) toolMap[name] = locked(name, toolMap[name]);
+  }
   const push = async msg => {
     setStore("messages", store.messages.length, msg);
     const id = await saveMsg(msg);
@@ -1457,8 +1472,10 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   // The director's notes ride after the results, each a block of its own: the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
-    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director };
+    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director, ...(background && { background }) };
     const results = await getToolResults(store.messages.at(-1).content, toolMap, context);
+    // Sub-agents that finished meanwhile: after the results, in blocks of their own.
+    if (background) results.content.push(...subagentResultBlocks(background.take()));
     for (const text of await director.step({ messages: [...unwrap(store.messages), results], start, ws, signal })) results.content.push({ text, harness: true });
     return push({ ...results, parentId: callsId, createdAt: Date.now() });
   };
@@ -1527,6 +1544,18 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
 
       // Calls run whatever the stop reason says: a stream can close without one, and an unanswered call ends the turn.
       if (!store.messages.at(-1).content.some(c => c?.toolUse)) {
+        // A turn doesn't end with sub-agents in flight: the lead hears once that they run, then their results as they land.
+        if (background?.running.size || background?.finished.size) {
+          if (!background.finished.size && !toldRunning) {
+            toldRunning = true;
+            parentId = await push({ role: "user", content: [{ text: stillRunning(background), harness: true }], parentId, createdAt: Date.now() });
+            continue;
+          }
+          if (!background.finished.size) await background.next(signal);
+          signal?.throwIfAborted();
+          parentId = await push({ role: "user", content: subagentResultBlocks(background.take()), parentId, createdAt: Date.now() });
+          continue;
+        }
         // Each stop rule speaks once a turn; then the model's word stands.
         const note = director.stop({ messages: unwrap(store.messages), start });
         if (!note) break;
@@ -1553,6 +1582,8 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
       setStore("activeLeafId", await push({ role: "assistant", content: [note], parentId, createdAt: Date.now(), ...flags }));
     }
   } finally {
+    // A run that ends with sub-agents in flight (a pause, an error) stops them: nothing is left to take their results.
+    background?.stop();
     const allMessages = await db.getAllFromIndex("messages", "threadId", params.threadId);
     const tree = buildMessageTree(allMessages);
     setStore("messageTree", tree);
@@ -1572,6 +1603,8 @@ function getConverseCommand(config) {
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
   // director=off: no plan tool, as before the director.
   const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec }));
+  // subagents=async: wait comes with task.
+  if (flag("subagents") === "async" && tools.some(t => t.toolSpec.name === "task") && !tools.some(t => t.toolSpec.name === "wait")) tools.push({ toolSpec: WAIT_TOOL.toolSpec });
   const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId });
   return {
     modelId: config.modelId,
@@ -1663,7 +1696,7 @@ function fillEmpty(messages, key, reply) {
 // again reruns the whole task.
 function stubResult(part, call) {
   const size = JSON.stringify(part.json ?? part.text ?? "").length;
-  if (size < 1500 || call?.name === "task") return part;
+  if (size < 1500 || call?.name === "task" || call?.name === "wait") return part;
   const what = call ? `${call.name} ${JSON.stringify(call.input).slice(0, 200)}` : "tool result";
   const report = part.json?.result?.report;
   const verdict = report && { ok: report.ok, tests: report.tests && { passed: report.tests.passed, failed: report.tests.failed } };
@@ -2500,6 +2533,7 @@ async function mcp({ command, server, tool, uri, name, args, filename }, context
 function forkOf({ request, turn }, toolUseId, question, { brief = q => fill(FORK_BRIEF, { question: q }), refuses = FORK_REFUSES } = {}) {
   const refuse = name => () => ({ error: `A fork does not ${name === "task" ? "start sub-agents" : "change files"}. Put what should change in your answer; the caller makes the change.` });
   const toolMap = Object.fromEntries(request.tools.map(({ toolSpec: { name }, fn }) => [name, refuses.includes(name) ? refuse(name) : fn]));
+  toolMap.wait = () => ({ error: "Only the caller waits for sub-agents." }); // offered with task under subagents=async
   // The brief rides in the fork's own result, after a line that says so: read as the result, a fork took itself for the
   // caller and called the task it was; sent as the user's words, it made Haiku drop the caller's thinking, and the cache.
   const answers = turn.filter(b => b?.toolUse).map(({ toolUse }) => ({ toolResult: { toolUseId: toolUse.toolUseId, content:
@@ -2510,14 +2544,15 @@ function forkOf({ request, turn }, toolUseId, question, { brief = q => fill(FORK
 
 // A part changes only the files it owns. Why: Luna's three parts each rebuilt the whole game in index.html first,
 // then wrote one another's modules and restored one another's versions, and two ran out of turns.
+const ownsPath = (owned, path) => owned.some(f => f.endsWith("/") ? path.startsWith(f) : path === f);
+// The file a write_file, edit_file or restore call changes.
+const changedPath = async (name, input, ws, db) => name === "restore"
+  ? (await db.get("versions", +input?.version))?.path
+  : normalizePath(input?.path || ws?.shownPath() || ws?.state.project?.entry);
 function ownedTools(toolMap, owned, ws, db) {
-  const owns = path => owned.some(f => f.endsWith("/") ? path.startsWith(f) : path === f);
-  const target = async (name, input) => name === "restore"
-    ? (await db.get("versions", +input?.version))?.path
-    : normalizePath(input?.path || ws.shownPath() || ws.state.project.entry);
   const guard = (name, fn) => async (input, context) => {
-    const path = await target(name, input);
-    if (path && !owns(path)) return { error: `${path} isn't yours: this part owns ${owned.join(", ")}. The rest is the contract: read it, build against it, and say in your final message what it lacks.` };
+    const path = await changedPath(name, input, ws, db);
+    if (path && !ownsPath(owned, path)) return { error: `${path} isn't yours: this part owns ${owned.join(", ")}. The rest is the contract: read it, build against it, and say in your final message what it lacks.` };
     return fn(input, context);
   };
   return Object.fromEntries(Object.entries(toolMap).map(([name, fn]) => [name, ["write_file", "edit_file", "restore"].includes(name) ? guard(name, fn) : fn]));
@@ -2533,8 +2568,89 @@ const overlap = (mine, theirs) => mine.find(a => theirs.some(b => a === b || (a.
 
 // A part builds a whole piece, so it gets more turns than an answer or a take.
 const SUBAGENT_TURNS = 15, PART_TURNS = 30;
+
+// subagents=async (E15): the lead goes on while its sub-agents run. A run's background holds what is in flight
+// (each by its task call's id, with the files a part owns) and what finished and is not yet delivered.
+function createBackground(parent) {
+  const controller = new AbortController();
+  const abort = () => controller.abort(parent.reason);
+  if (parent?.aborted) abort();
+  else parent?.addEventListener("abort", abort, { once: true });
+  const running = new Map(), finished = new Map(), delivered = new Set();
+  let tick = Promise.withResolvers();
+  const settle = (id, result) => {
+    finished.set(id, { ...running.get(id), result });
+    running.delete(id);
+    tick.resolve();
+    tick = Promise.withResolvers();
+  };
+  return {
+    signal: controller.signal, running, finished, delivered,
+    start(id, type, files, job) {
+      running.set(id, { id, type, files });
+      job.then(result => settle(id, result), error => settle(id, { error: error?.message || String(error) }));
+    },
+    // The running part that owns a path, or null.
+    owner: path => [...running.values()].find(e => ownsPath(e.files, path))?.id ?? null,
+    // The finished ones (of ids, or all), marked delivered.
+    take(ids = null) {
+      const out = [...finished.values()].filter(e => !ids || ids.includes(e.id));
+      for (const e of out) { finished.delete(e.id); delivered.add(e.id); }
+      return out;
+    },
+    // Resolves when the next one finishes, or the signal aborts.
+    next: (signal = parent) => Promise.race([tick.promise, ...(signal ? [new Promise(resolve => signal.aborted ? resolve() : signal.addEventListener("abort", resolve, { once: true }))] : [])]),
+    stop() { parent?.removeEventListener("abort", abort); controller.abort(); },
+  };
+}
+
+// Finished sub-agents' results for the lead, each a harness text block of its own: never inside a tool result, never
+// merged with the user's words. One place builds them, so a message envelope (E17) can route them.
+const subagentResultBlocks = entries => entries.map(({ id, type, result }) =>
+  ({ text: `Sub-agent ${id} (${type}) finished. Its result:\n${JSON.stringify(result)}`, harness: true, subagent: { id, result } }));
+
+const STARTED_NOTE = "Running. Its result will arrive in a later message; call wait({ id }) to wait for it.";
+const stillRunning = background => {
+  const types = [...background.running.values()].map(e => e.type), n = types.length;
+  return `${n} sub-agent${n === 1 ? " is" : "s are"} still running (${types.join(", ")}). Their results will arrive here; continue with other work or call wait.`;
+};
+
+async function waitSubagents({ id, ids, timeout_s } = {}, { background, signal } = {}) {
+  if (!background) return { error: "Nothing runs in the background here: task returns its result itself." };
+  const want = Array.isArray(ids) && ids.length ? ids.map(String) : id != null ? [String(id)] : null;
+  const unknown = want?.find(i => !background.running.has(i) && !background.finished.has(i));
+  if (unknown) return { error: background.delivered.has(unknown) ? `${unknown}'s result was delivered already, in an earlier message.` : `No sub-agent ${unknown} is running. Running: ${[...background.running.keys()].join(", ") || "none"}.` };
+  const pending = () => [...background.running.keys()].filter(i => !want || want.includes(i));
+  const deadline = Number(timeout_s) > 0 ? Date.now() + Number(timeout_s) * 1000 : Infinity;
+  while (pending().length && Date.now() < deadline) {
+    signal?.throwIfAborted();
+    await Promise.race([background.next(signal), ...(deadline < Infinity ? [sleep(deadline - Date.now())] : [])]);
+  }
+  signal?.throwIfAborted();
+  const results = background.take(want).map(({ id, result }) => ({ id, result }));
+  const still = pending();
+  return { results, ...(still.length && { running: still, note: `Still running after ${timeout_s} s; their results will arrive in a later message.` }) };
+}
+const WAIT_TOOL = {
+  fn: waitSubagents,
+  toolSpec: {
+    name: "wait",
+    description: "Block until running sub-agents finish, and return their results. With no id, waits for all of them.",
+    inputSchema: {
+      json: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "A sub-agent's id: the started value task returned" },
+          ids: { type: "array", items: { type: "string" }, description: "Several ids" },
+          timeout_s: { type: "number", description: "Return after this many seconds with what has finished" },
+        },
+      },
+    },
+  },
+};
+
 async function task({ prompt, type, folder, model, files }, context = {}) {
-  const { db, threadId, agentId, modelId, reasoningMode, signal, toolUseId, conversation, workspace, host } = context;
+  const { db, toolUseId, conversation, workspace, background } = context;
   if (!db) return { error: "Database not available" };
   if (!SUBAGENT_TYPES.includes(type)) return { error: `Unknown type: ${type}. Use ${SUBAGENT_TYPES.map(t => `"${t}"`).join(", ")}.` };
   const forked = ["fork", "variant", "part"].includes(type), branched = type === "variant" || type === "part";
@@ -2544,9 +2660,22 @@ async function task({ prompt, type, folder, model, files }, context = {}) {
   if (type === "part" && !owned.length) return { error: "A part owns files: list them in files, as paths or folders ending in /." };
   const shared = type === "part" && overlap(owned, siblingFiles(conversation?.turn, toolUseId));
   if (shared) return { error: `${shared} is another part's in this turn too: give each file to one part.` };
+  const busy = type === "part" && background && [...background.running.values()].find(e => overlap(owned, e.files));
+  if (busy) return { error: `${overlap(owned, busy.files)} belongs to a running part (${busy.id}); give each file to one part.` };
   if (branched && !workspace) return { error: `A ${type} branches the project, and there is no workspace here.` };
   if (model && !SUBAGENT_MODELS.includes(model)) return { error: `Unknown model: ${model}. Use one of ${SUBAGENT_MODELS.join(", ")}, or leave it out for yours.` };
 
+  const job = runTask({ prompt, type, folder, model, owned }, background ? { ...context, signal: background.signal } : context);
+  if (!background || !toolUseId) return job;
+  // Registered before task's first await, so a wait later in the same turn finds it.
+  background.start(toolUseId, type, type === "part" ? owned : [], job);
+  return { started: toolUseId, type, note: STARTED_NOTE };
+}
+
+// The sub-agent's run, from its thread to its result: what task returns, blocking, or delivers later.
+async function runTask({ prompt, type, folder, model, owned }, context) {
+  const { db, threadId, agentId, modelId, reasoningMode, signal, toolUseId, conversation, workspace, host } = context;
+  const forked = ["fork", "variant", "part"].includes(type), branched = type === "variant" || type === "part";
   const folderName = folder || "findings";
   // A call with an id gets a thread of its own, and an entry the tabs show while it runs.
   const subagentThreadId = toolUseId ? await db.add("threads", { agentId, parentThreadId: threadId, parentToolUseId: toolUseId, type: "subagent", subagentType: type, status: "running", createdAt: Date.now() }) : null;
@@ -4458,5 +4587,5 @@ export {
   runAgentWithBranching, runApp, runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent,
   siblingFiles, silentReply, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, systemPrompt,
   task, think, timeAgo, toDocument, toError, toResultValue, unadoptedVariants, unmuteScripts, unplannedTask, untestedChange,
-  viewFile, watchedSend, webSearch, webToolNames, writeFile,
+  viewFile, waitSubagents, watchedSend, webSearch, webToolNames, writeFile,
 };
