@@ -473,8 +473,10 @@ const rateMessage = (what, reset) => `${what}: try again after ${clock(reset)} (
 
 // The REST API with a token. Requests that create content are counted, so a push that would pass the minute's
 // allowance fails before it starts, with the time it may go; a rate-limit answer says when the limit resets.
-export function createGitHubClient({ token = null, fetch: fetcher = globalThis.fetch.bind(globalThis), api = GITHUB_API, perMinute = CREATIONS_PER_MINUTE, now = () => Date.now() } = {}) {
-  const created = []; // times of recent creations
+const creations = new Map(); // token -> times of its recent creations, shared by every client in this thread
+export function createGitHubClient({ token = null, fetch: fetcher = (...args) => globalThis.fetch(...args), api = GITHUB_API, perMinute = CREATIONS_PER_MINUTE, now = () => Date.now() } = {}) {
+  if (!creations.has(token)) creations.set(token, []);
+  const created = creations.get(token);
   const recent = () => { while (created.length && now() - created[0] >= 60_000) created.shift(); return created.length; };
 
   function reserve(count) {
@@ -549,12 +551,12 @@ const DEFAULT_BRANCH = branch => `${branch} is the repository's default branch: 
 // files() is the working copy: { path: text } for every file the journal holds (the rest are as the base has them).
 // Local commits wait in record.commits until push turns them into commits on a branch. current(): the stored
 // record now, when it can change under the root.
-export function createGitHubRoot(record, { token = () => null, fetch: fetcher, patch, save = async () => {}, files: working = async () => ({}), current = null } = {}) {
+export function createGitHubRoot(record, { token = () => null, fetch: fetcher, patch, save = async () => {}, files: working = async () => ({}), current = null, perMinute = CREATIONS_PER_MINUTE } = {}) {
   let state = record;
   let client = null, clientToken;
   const github = () => {
     const t = typeof token === "function" ? token() : token;
-    if (!client || clientToken !== t) { client = createGitHubClient({ token: t, ...(fetcher && { fetch: fetcher }) }); clientToken = t; }
+    if (!client || clientToken !== t) { client = createGitHubClient({ token: t, perMinute, ...(fetcher && { fetch: fetcher }) }); clientToken = t; }
     return client;
   };
   const repoPath = () => `/repos/${state.owner}/${state.repo}`;

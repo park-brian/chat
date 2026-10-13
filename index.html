@@ -395,6 +395,7 @@
         loadAgents();
 
         const openSettings = (options = {}) => setSettings({ tab: "agents", agentId: params.agentId, ...options });
+        const [connecting, setConnecting] = createSignal(false); // the Connect a GitHub repository dialog
         // Settings writes its own changes; the app follows them.
         async function handleSettingsSaved({ created }) {
           setSettings(null);
@@ -507,7 +508,16 @@
                 onSwitchAgent=${id => { chat.switchAgent(id); closeSidebarIfNarrow(); }}
                 onManageAgents=${options => openSettings(options)}
                 onOpenThread=${id => { chat.openThread(id); closeSidebarIfNarrow(); }}
-                onNewChat=${_ => { chat.newChat({ projectId: null }); closeSidebarIfNarrow(); }} />
+                onNewChat=${_ => { chat.newChat({ projectId: null }); closeSidebarIfNarrow(); }}
+                folders=${!!globalThis.showDirectoryPicker}
+                onOpenFolder=${_ => act(workspace, async () => {
+                  const handle = await showDirectoryPicker({ id: "chat-harness", mode: "readwrite" }).catch(e => e.name === "AbortError" ? null : Promise.reject(e));
+                  if (!handle) return;
+                  await chat.newChat({ projectId: null });
+                  await workspace.openFolderProject({ handle, agentId: params.agentId });
+                  closeSidebarIfNarrow();
+                })()}
+                onConnectRepository=${_ => { setConnecting(true); closeSidebarIfNarrow(); }} />
             </aside>
             <div class="sidebar-scrim" onClick=${_ => setSidebarOpen(false)}></div>
 
@@ -640,6 +650,66 @@
                   onSaved=${handleSettingsSaved} />
               `}
             <//>
+
+            <${Show} when=${connecting}>
+              <${ConnectRepositoryModal} onClose=${_ => setConnecting(false)} onOpenSettings=${_ => { setConnecting(false); openSettings({ tab: "network" }); }}
+                onConnect=${async target => { await chat.newChat({ projectId: null }); await workspace.connectRepository({ ...target, agentId: params.agentId }); setConnecting(false); }} />
+            <//>
+          </div>
+        `;
+      }
+
+      // owner/repo, or a github.com URL, and a branch (blank: the default one).
+      function ConnectRepositoryModal(props) {
+        const [error, setError] = createSignal(null);
+        const [busy, setBusy] = createSignal(false);
+        async function submit(e) {
+          e.preventDefault();
+          const form = e.currentTarget;
+          const match = form.repository.value.trim().replace(/\.git$/, "").match(/^(?:https?:\/\/github\.com\/)?([\w.-]+)\/([\w.-]+)/);
+          if (!match) return setError("Name the repository as owner/repo.");
+          setBusy(true);
+          setError(null);
+          try {
+            await props.onConnect({ owner: match[1], repo: match[2], branch: form.branch.value.trim() || null });
+          } catch (err) {
+            setError(err.message);
+          } finally {
+            setBusy(false);
+          }
+        }
+        return html`
+          <div class="modal-backdrop show"></div>
+          <div class="modal show d-block" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="connect-title" data-connect-repository
+            onClick=${e => e.target === e.currentTarget && props.onClose()} onKeyDown=${e => e.key === "Escape" && props.onClose()}>
+            <div class="modal-dialog">
+              <form class="modal-content shadow-lg" onSubmit=${submit}>
+                <div class="modal-header">
+                  <h1 class="modal-title fs-5 fw-semibold" id="connect-title"><i class="bi bi-github me-2"></i>Connect a GitHub repository</h1>
+                  <button type="button" class="btn-close" aria-label="Close" onClick=${_ => props.onClose()}></button>
+                </div>
+                <div class="modal-body d-flex flex-column gap-2">
+                  <div class="form-floating">
+                    <input class="form-control" id="connect-repository" name="repository" placeholder="owner/repo" required autofocus />
+                    <label for="connect-repository">Repository (owner/repo)</label>
+                  </div>
+                  <div class="form-floating">
+                    <input class="form-control" id="connect-branch" name="branch" placeholder="main" />
+                    <label for="connect-branch">Branch (blank: the default one)</label>
+                  </div>
+                  <p class="small text-body-secondary mb-0">
+                    The files come from the branch's tip, fetched as the agent reads them. Changes stay here until you push them to a
+                    branch and open a pull request. ${() => storedJSON("github-config")?.token ? "" : html`<span>Without a token
+                    (<a href="#" onClick=${e => { e.preventDefault(); props.onOpenSettings(); }}>Settings</a>) only public repositories connect, and nothing pushes.</span>`}
+                  </p>
+                  <${Show} when=${error}><div class="alert alert-danger small py-2 mb-0">${error}</div><//>
+                </div>
+                <div class="modal-footer">
+                  <button type="button" class="btn btn-sm btn-link text-secondary" onClick=${_ => props.onClose()}>Cancel</button>
+                  <button type="submit" class="btn btn-sm btn-dark" disabled=${busy}>${() => busy() ? "Connecting…" : "Connect"}</button>
+                </div>
+              </form>
+            </div>
           </div>
         `;
       }
@@ -1067,6 +1137,16 @@
             <button type="button" class="btn btn-sm btn-dark mb-2" onClick=${_ => props.onNewChat()}>
               <i class="bi bi-pencil-square"></i> New chat
             </button>
+            <div class="d-flex gap-1 mb-2">
+              <${Show} when=${() => props.folders}>
+                <button type="button" class="btn btn-sm btn-light flex-fill text-nowrap" data-open-folder title="Open a folder on this computer as a project: the agent works on its files" onClick=${_ => props.onOpenFolder()}>
+                  <i class="bi bi-folder2-open"></i> Folder
+                </button>
+              <//>
+              <button type="button" class="btn btn-sm btn-light flex-fill text-nowrap" data-connect-github title="Connect a GitHub repository as a project: the agent works on a branch, you push it and open a pull request" onClick=${_ => props.onConnectRepository()}>
+                <i class="bi bi-github"></i> GitHub
+              </button>
+            </div>
             <${Show} when=${() => threads().length}>
               <div class="text-muted text-uppercase mb-1 px-2" style="font-size: 0.7rem">Recent</div>
             <//>
@@ -1094,7 +1174,8 @@
       function ArtifactPanel(props) {
         const ws = props.workspace;
         const s = ws.state;
-        const tabs = [["preview", "Preview", "bi-play-circle"], ["code", "Code", "bi-code-slash"], ["history", "History", "bi-clock-history"]];
+        const tabs = () => [["preview", "Preview", "bi-play-circle"], ["code", "Code", "bi-code-slash"], ["history", "History", "bi-clock-history"],
+          ...(s.project?.root ? [["project", s.project.root.kind === "github" ? "Repository" : "Folder", s.project.root.kind === "github" ? "bi-github" : "bi-folder2"]] : [])];
         const shown = () => ws.shownPath();
         const fixed = () => !!VIEWPORTS[s.viewport];
         // A viewport larger than the panel shrinks to fit, as devtools does: the page lays out at its own size, and a
@@ -1117,7 +1198,8 @@
         const seeLabel = () => live() ? "Sharing" : s.captureChoice === "allowed" ? "Resume" : "Share tab";
         const seeTitle = () => live() ? `The agent sees this tab (${s.capture} capture). Click to stop.` : "Share this tab so the agent can screenshot what it makes";
         const attachView = act(ws, async () => { props.onAttach?.(await ws.captureView()); ws.notify("Attached the current view to your message."); });
-        const folderTitle = () => !s.folder ? "Open a local folder" : s.folder.status === "permission" ? `Reconnect ${s.folder.name}` : `Synced with ${s.folder.name}`;
+        const rootTitle = () => !s.root ? "Save this project to a local folder" : s.root.status === "permission" ? `Reconnect ${s.root.name}` : s.root.status === "missing" ? `${s.root.name} isn't available in this browser` : s.root.kind === "github" ? `${s.root.name} on ${s.root.branch}` : `Synced with ${s.root.name}`;
+        const onRoot = act(ws, () => s.root?.status === "permission" ? ws.reconnect() : s.root ? ws.setState("tab", "project") : ws.openFolder());
         // The plan, and how far the work has got: PLAN.md, which the harness writes from the contract and ticks as
         // checks pass, else the agent's own SPEC.md.
         const planPath = () => ["PLAN.md", "SPEC.md"].find(p => s.files[p] != null) ?? null;
@@ -1160,9 +1242,9 @@
                     ${() => VIEWPORTS[s.viewport].join("×")} <i class="bi bi-x"></i>
                   </button>
                 <//>
-                <button type="button" class="btn btn-sm btn-link p-1" classList=${() => ({ "text-success": s.folder?.status === "connected", "text-warning": s.folder?.status === "permission", "text-secondary": !s.folder })}
-                  title=${folderTitle} disabled=${() => !s.project} onClick=${act(ws, () => s.folder ? ws.reconnect() : ws.openFolder())}>
-                  <i class="bi bi-folder2-open"></i>
+                <button type="button" class="btn btn-sm btn-link p-1" data-root=${() => s.root?.status ?? "none"} classList=${() => ({ "text-success": s.root?.status === "connected", "text-warning": s.root && s.root.status !== "connected", "text-secondary": !s.root })}
+                  title=${rootTitle} disabled=${() => !s.project || (!s.root && !globalThis.showDirectoryPicker)} onClick=${onRoot}>
+                  <i class=${() => s.root?.kind === "github" ? "bi bi-github" : "bi bi-folder2-open"}></i>
                 </button>
                 <button type="button" class="btn btn-sm btn-link text-secondary p-1" title="Re-run" disabled=${() => !shown() || s.running} onClick=${act(ws, () => ws.run())}>
                   <i class="bi bi-arrow-repeat" classList=${() => ({ spin: s.running })}></i>
@@ -1182,6 +1264,18 @@
                 <span class="flex-grow-1"><strong>Show the agent what it made.</strong> Share this tab once and it can screenshot its work and refine it visually.</span>
                 <button type="button" class="btn btn-sm btn-dark" onClick=${letSee}>Share tab</button>
                 <button type="button" class="btn btn-sm btn-link text-secondary p-0" onClick=${_ => ws.rememberCapture("dismissed")}>Not now</button>
+              </div>
+            <//>
+
+            <${Show} when=${() => s.root && s.root.status !== "connected"}>
+              <div class="wb-banner small" data-banner="root">
+                <i class="bi bi-folder-x fs-5 text-warning"></i>
+                <span class="flex-grow-1">${() => s.root.status === "permission"
+                  ? `The agent can't reach ${s.root.name} until you allow it again. Chrome can remember: choose "Allow on every visit".`
+                  : `${s.root.name} isn't available in this browser. Open the folder again to reconnect it.`}</span>
+                <button type="button" class="btn btn-sm btn-dark" onClick=${act(ws, () => s.root.status === "permission" ? ws.reconnect() : ws.openFolder())}>
+                  ${() => s.root.status === "permission" ? "Reconnect" : "Open folder"}
+                </button>
               </div>
             <//>
 
@@ -1216,6 +1310,9 @@
               </div>
               <div class="wb-panel" classList=${() => ({ active: s.tab === "history" })}>
                 <${HistoryPanel} workspace=${ws} />
+              </div>
+              <div class="wb-panel" classList=${() => ({ active: s.tab === "project" })}>
+                <${Show} when=${() => s.project?.root}><${ProjectPanel} workspace=${ws} /><//>
               </div>
             </div>
             <${Show} when=${() => s.notice}>
@@ -1349,6 +1446,142 @@
                 onBlur=${_ => save()}
                 onScroll=${_ => gutter.scrollTop = textarea.scrollTop}></textarea>
             </div>
+          </div>
+        `;
+      }
+
+      // A folder or repository project: where its files are, git's status, and for GitHub, push and pull request.
+      function ProjectPanel(props) {
+        const ws = props.workspace;
+        const s = ws.state;
+        const r = () => s.root;
+        const github = () => r()?.kind === "github";
+        const [rows, setRows] = createSignal(null); // git status rows, or { error }
+        const [busy, setBusy] = createSignal(null);
+        const [said, setSaid] = createSignal(null);
+        const [message, setMessage] = createSignal("");
+        const [target, setTarget] = createSignal("");
+        const [title, setTitle] = createSignal("");
+        const [body, setBody] = createSignal("");
+        const [branches, setBranches] = createSignal(null);
+        // A new branch per piece of work: the default branch only with a yes.
+        createEffect(() => { if (github() && !target()) setTarget(r().branch !== r().defaultBranch ? r().branch : `agent/${new Date().toISOString().slice(0, 16).replace(/[-T:]/g, "")}`); });
+        async function refresh() {
+          if (r()?.status !== "connected" || !r().git) { setRows(null); setBranches(null); return; }
+          try {
+            setRows(await ws.git.status());
+            if (!github()) setBranches(await ws.git.branch());
+          } catch (e) {
+            setRows({ error: e.message });
+          }
+        }
+        createEffect(() => { if (s.tab === "project") { s.project?.rev; r()?.status; refresh(); } });
+        const run = (name, fn) => async () => {
+          setBusy(name);
+          setSaid(null);
+          try { setSaid(await fn()); await refresh(); } catch (e) { setSaid({ error: e.message }); } finally { setBusy(null); }
+        };
+        const commit = run("commit", async () => {
+          const done = await ws.git.commit({ message: message() });
+          setMessage("");
+          return `Committed ${done.oid.slice(0, 7)}: ${done.files.length} file${done.files.length === 1 ? "" : "s"}.`;
+        });
+        const push = run("push", async () => {
+          const branch = target().trim() || r().branch;
+          const onDefault = branch === r().defaultBranch;
+          if (onDefault && !confirm(`${branch} is the repository's default branch. Push there anyway?`)) return "Not pushed.";
+          const done = await ws.git.push({ branch, message: message().trim() || null, confirmDefault: onDefault });
+          setMessage("");
+          return html`Pushed ${done.commits} commit${done.commits === 1 ? "" : "s"} to <a href=${done.url} target="_blank" rel="noopener">${done.branch}</a>.`;
+        });
+        const openPr = run("pr", async () => {
+          const done = await ws.git.openPullRequest({ title: title(), body: body() });
+          return html`Opened <a href=${done.url} target="_blank" rel="noopener">pull request #${done.number}</a>.`;
+        });
+        const initGit = run("init", async () => { await ws.git.init(); return "Made a git repository in the folder."; });
+        const mark = { modified: "M", added: "A", deleted: "D", untracked: "?" };
+        // The root's files; one opens in Code, taken into the journal as it is.
+        const [files, setFiles] = createSignal([]);
+        const [filter, setFilter] = createSignal("");
+        createEffect(() => { if (s.tab === "project" && r()?.status === "connected") { r().files; s.project?.rev; ws.listFiles().then(setFiles); } });
+        const matching = () => { const q = filter().trim().toLowerCase(); return q ? files().filter(p => p.toLowerCase().includes(q)) : files(); };
+        const shownFiles = () => matching().slice(0, 200);
+        async function openFile(path) {
+          if (!(path in s.files) && !(await ws.adopt(path))) throw new Error(`${path} isn't a text file.`);
+          ws.setState({ selected: path, tab: "code" });
+        }
+        const changed = () => Array.isArray(rows()) ? rows() : [];
+        return html`
+          <div class="p-3 small d-flex flex-column gap-3" data-project-panel>
+            <div class="d-flex align-items-center gap-2">
+              <i class=${() => `bi ${github() ? "bi-github" : "bi-folder2"} fs-5`}></i>
+              <div class="flex-grow-1 min-w-0">
+                <div class="fw-semibold text-truncate">${() => r()?.name ?? s.project?.root?.name ?? s.project?.name}</div>
+                <div class="text-muted">${() => !r() ? "Not connected" : r().status !== "connected" ? (r().status === "permission" ? "Needs your permission again" : "Not available in this browser")
+                  : github() ? `${r().files} file${r().files === 1 ? "" : "s"} at ${r().base.slice(0, 7)} (${r().from}) · pushes to ${r().branch}${r().commits ? ` · ${r().commits} local commit${r().commits === 1 ? "" : "s"}` : ""}`
+                  : `${r().files} file${r().files === 1 ? "" : "s"}${r().large ? ` · ${r().large} over the size cap left out` : ""} · synced with the disk${branches()?.current ? ` · on ${branches().current}` : ""}`}</div>
+              </div>
+              <${Show} when=${() => r()?.status === "connected" && !github()}>
+                <button type="button" class="btn btn-sm btn-link text-secondary p-1" title="Scan the folder again" onClick=${run("scan", async () => { const c = await ws.rescan(); return c.length ? `${c.length} change${c.length === 1 ? "" : "s"} found.` : "No changes."; })}>
+                  <i class="bi bi-arrow-clockwise"></i>
+                </button>
+              <//>
+            </div>
+
+            <${Show} when=${() => r()?.status === "connected" && !r().git}>
+              <div class="text-muted">Not a git repository. <button type="button" class="btn btn-sm btn-link p-0 align-baseline" onClick=${initGit}>Make one</button> to commit the agent's work here.</div>
+            <//>
+
+            <${Show} when=${() => r()?.status === "connected" && r().git}>
+              <div>
+                <div class="fw-semibold mb-1">${() => github() ? "Changes from the base" : "Changes"}</div>
+                <${Show} when=${() => rows()?.error}><div class="text-danger">${() => rows().error}</div><//>
+                <${Show} when=${() => Array.isArray(rows()) && !rows().length}><div class="text-muted">Nothing changed.</div><//>
+                <div class="font-monospace" data-git-status>
+                  <${For} each=${changed}>${row => html`<div class="text-truncate"><span class=${`me-2 ${row.status === "deleted" ? "text-danger" : row.status === "modified" ? "text-warning" : "text-success"}`}>${mark[row.status] ?? "?"}</span>${row.path}</div>`}<//>
+                </div>
+              </div>
+              <div class="d-flex flex-column gap-2">
+                <input class="form-control form-control-sm" placeholder="Commit message" value=${message} onInput=${e => setMessage(e.target.value)} data-commit-message />
+                <${Show} when=${github}>
+                  <div class="input-group input-group-sm">
+                    <span class="input-group-text">Branch</span>
+                    <input class="form-control" value=${target} onInput=${e => setTarget(e.target.value)} data-push-branch />
+                  </div>
+                <//>
+                <div class="d-flex gap-2">
+                  <button type="button" class="btn btn-sm btn-outline-dark" disabled=${() => !!busy() || !message().trim() || !changed().length} onClick=${commit}>Commit</button>
+                  <${Show} when=${github} fallback=${html`<span class="text-muted align-self-center">Push and pull from your own terminal.</span>`}>
+                    <button type="button" class="btn btn-sm btn-dark" disabled=${() => !!busy()} onClick=${push} data-push>${() => busy() === "push" ? "Pushing…" : "Push"}</button>
+                  <//>
+                </div>
+              </div>
+              <${Show} when=${() => github() && r().branch !== r().from}>
+                <div class="d-flex flex-column gap-2">
+                  <div class="fw-semibold">Pull request into ${() => r().from}</div>
+                  <${Show} when=${() => r().pullRequest} fallback=${html`
+                    <input class="form-control form-control-sm" placeholder="Title" value=${title} onInput=${e => setTitle(e.target.value)} />
+                    <textarea class="form-control form-control-sm" rows="3" placeholder="Description" value=${body} onInput=${e => setBody(e.target.value)}></textarea>
+                    <div><button type="button" class="btn btn-sm btn-outline-dark" disabled=${() => !!busy() || !title().trim()} onClick=${openPr}>Open pull request</button></div>
+                  `}>
+                    <a href=${() => r().pullRequest.url} target="_blank" rel="noopener">#${() => r().pullRequest.number}</a>
+                  <//>
+                </div>
+              <//>
+            <//>
+            <${Show} when=${said}>
+              <div classList=${() => ({ "text-danger": !!said()?.error })} data-git-said>${() => said()?.error ?? said()}</div>
+            <//>
+
+            <${Show} when=${() => r()?.status === "connected"}>
+              <div class="d-flex flex-column gap-1">
+                <input class="form-control form-control-sm" type="search" placeholder="Find a file" value=${filter} onInput=${e => setFilter(e.target.value)} />
+                <div class="font-monospace" data-root-files>
+                  <${For} each=${shownFiles}>${p => html`<button type="button" class="btn btn-sm btn-link p-0 d-block text-start text-truncate w-100" onClick=${act(ws, () => openFile(p))}>${p}</button>`}<//>
+                </div>
+                <${Show} when=${() => matching().length > shownFiles().length}><div class="text-muted">${() => matching().length - shownFiles().length} more</div><//>
+              </div>
+            <//>
           </div>
         `;
       }
@@ -2071,6 +2304,7 @@
           sessionToken: aws.credentials?.sessionToken || "",
           googleApiKey: stored("google-config").apiKey || "",
           braveApiKey: stored("brave-config").apiKey || "",
+          githubToken: stored("github-config").token || "",
           proxyEndpoint: proxy.endpoint || "",
           proxyHeaderName: proxy.headerName || "",
           proxyHeaderValue: proxy.headerValue || "",
@@ -2088,6 +2322,8 @@
           else localStorage.removeItem("google-config");
           if (k.braveApiKey) localStorage.setItem("brave-config", JSON.stringify({ apiKey: k.braveApiKey }));
           else localStorage.removeItem("brave-config");
+          if (k.githubToken) localStorage.setItem("github-config", JSON.stringify({ token: k.githubToken }));
+          else localStorage.removeItem("github-config");
           const config = k.proxyEndpoint ? { endpoint: k.proxyEndpoint, headerName: k.proxyHeaderName, headerValue: k.proxyHeaderValue } : null;
           if (config) localStorage.setItem(PROXY_CONFIG_KEY, JSON.stringify(config));
           else localStorage.removeItem(PROXY_CONFIG_KEY);
@@ -2317,6 +2553,16 @@
                 <h6 class="card-title d-flex align-items-center gap-2"><i class="bi bi-search"></i> Brave Search ${status(() => !!keys.braveApiKey.trim())}</h6>
                 <p class="small text-body-secondary">With a key, every agent gets the web_search tool. Requests go through the proxy above.</p>
                 ${floating("brave-key", "API key", "braveApiKey")}
+              </div>
+            </div>
+            <div class="card mt-3">
+              <div class="card-body">
+                <h6 class="card-title d-flex align-items-center gap-2"><i class="bi bi-github"></i> GitHub ${status(() => !!keys.githubToken.trim())}</h6>
+                <p class="small text-body-secondary">
+                  For GitHub projects: connecting a repository, pushing a branch, opening a pull request. Use a fine-grained token scoped to the
+                  repositories, with Contents and Pull requests read and write. Requests go straight to api.github.com.
+                </p>
+                ${floating("github-token", "Token", "githubToken")}
               </div>
             </div>
           </div>
@@ -5088,6 +5334,299 @@
           }
         }
 
+        // Projects whose files live elsewhere: a folder on disk, a GitHub repository (projects.js).
+        const P = await import("./projects.js");
+        const diskWrite = async (dir, path, text) => { const file = await P.handleAt(dir, path, { create: true }); const w = await file.createWritable(); await w.write(text); await w.close(); };
+        const diskRead = async (dir, path) => (await (await P.handleAt(dir, path)).getFile()).text();
+        const eventually = async (check, what, timeout = 4000) => {
+          for (const end = performance.now() + timeout; !(await check()); await sleep(20)) if (performance.now() > end) throw new Error("Timed out waiting for " + what);
+        };
+
+        // Why: a folder project lists what git would track, not node_modules or a build
+        async function testIgnoreRules() {
+          const rules = P.createIgnore([]).add("*.log\n/build\ndocs/**/*.md\n!keep.log\ntmp/\n# a comment\n\\#hash\nsrc/*.gen.js\n");
+          const cases = [["a.log", false, true], ["deep/x/a.log", false, true], ["keep.log", false, false], ["build", true, true], ["src/build", true, false],
+            ["docs/a.md", false, true], ["docs/x/y/a.md", false, true], ["docs/a.txt", false, false], ["tmp", true, true], ["tmp", false, false], ["#hash", false, true],
+            ["src/a.gen.js", false, true], ["src/x/a.gen.js", false, false], ["# a comment", false, false]];
+          for (const [path, dir, want] of cases) assert(rules.ignores(path, dir) === want, `${path}${dir ? "/" : ""} ${want ? "is" : "isn't"} ignored`);
+          const nested = P.createIgnore([]).add("*.tmp\n/gen/", "src/");
+          assert(nested.ignores("src/a.tmp") && nested.ignores("src/x/b.tmp") && !nested.ignores("a.tmp") && nested.ignores("src/gen", true) && !nested.ignores("src/x/gen", true),
+            "a nested .gitignore speaks for its own folder");
+          const defaults = P.createIgnore();
+          assert(P.excluded(defaults, "node_modules/x/index.js") && P.excluded(defaults, ".git/HEAD") && P.excluded(defaults, "dist/app.js") && !P.excluded(defaults, "src/index.js"),
+            "the defaults leave out dependencies, build output and git's files, with whatever is inside them");
+        }
+
+        // Why: the folder is the source of truth: the root lists it at once, reads on demand, writes through, and hears the user's edits
+        async function testFolderRoot() {
+          const dir = await P.memoryDirectory("app", {
+            "package.json": `{"name":"app"}`, "index.html": "<h1>hi</h1>", "src/app.js": "export const a = 1;\n", "src/.gitignore": "*.tmp\ngen/\n",
+            "src/gen/out.js": "gen", "src/x.tmp": "tmp", "node_modules/lib/index.js": "lib", "dist/bundle.js": "bundle", ".git/HEAD": "ref: refs/heads/main\n",
+            "data/big.json": "x".repeat(3000), "logo.png": "\x89PNG\x00\x00",
+          });
+          const root = P.createFolderRoot(dir, { maxSize: 2000, Observer: P.MemoryObserver });
+          await root.ready();
+          assert(eq(root.list(), ["index.html", "logo.png", "package.json", "src/.gitignore", "src/app.js"]), `listed without ignored files, dependencies, build output, git's files or files over the cap: ${root.list()}`);
+          assert(eq(root.large, ["data/big.json"]), `a file over the cap is named as left out: ${root.large}`);
+          assert(await root.read("src/app.js") === "export const a = 1;\n" && await root.read("logo.png") === null && await root.read("gone.js") === null, "reads text, not a binary or what isn't there");
+          const heard = [];
+          root.watch(changes => heard.push(...changes));
+          await root.write("src/app.js", "export const a = 2;\n");
+          assert(await diskRead(dir, "src/app.js") === "export const a = 2;\n", "a write goes to disk at once");
+          await diskWrite(dir, "index.html", "<h1>edited</h1>");
+          await diskWrite(dir, "src/new.js", "new");
+          await diskWrite(dir, "src/y.tmp", "ignored");
+          await (await P.handleAt(dir, "src", { folder: true })).removeEntry("app.js");
+          await eventually(() => heard.length >= 3, "the observer's records");
+          await sleep(120);
+          assert(eq(heard.map(c => `${c.type} ${c.path}`).sort(), ["added src/new.js", "modified index.html", "removed src/app.js"]), `the user's edits arrive; the root's own write and an ignored file don't: ${JSON.stringify(heard)}`);
+
+          // Records the browser lost ("unknown"): the root scans again.
+          heard.length = 0;
+          const top = dir.node.top(), observers = [...top.observers];
+          top.observers.clear();
+          await diskWrite(dir, "lost.js", "missed");
+          for (const o of observers) top.observers.add(o);
+          P.MemoryObserver.lose(dir);
+          await eventually(() => heard.some(c => c.path === "lost.js"), "a re-scan after an unknown record");
+          assert(eq(heard.map(c => `${c.type} ${c.path}`), ["added lost.js"]), `the re-scan finds what was missed, and only that: ${JSON.stringify(heard)}`);
+          root.unwatch();
+
+          // No observer, or one the browser refuses: a poll.
+          for (const Observer of [null, class { observe() { return Promise.reject(new Error("too many observers")); } disconnect() {} }]) {
+            const polled = P.createFolderRoot(dir, { Observer, poll: 30 });
+            await polled.ready();
+            const seen = [];
+            polled.watch(changes => seen.push(...changes));
+            await sleep(10);
+            await diskWrite(dir, "package.json", `{"name":"${Observer ? "refused" : "polled"}"}`);
+            await eventually(() => seen.some(c => c.path === "package.json" && c.type === "modified"), `a poll ${Observer ? "after a refused observer" : "without an observer"}`);
+            polled.unwatch();
+          }
+        }
+
+        // Why: a user's own folder is the project: the agent reads what it needs, runs it, its edits land on disk, the user's edits come
+        // back as changes, a lapsed permission takes one click, and the folder's git works
+        async function testFolderWorkspace() {
+          const ui = createTestUI();
+          try {
+            const dir = await P.memoryDirectory("site", {
+              "index.html": `<!doctype html>\n<h1></h1>\n<script type="module" src="./src/app.js"><\/script>`,
+              "src/app.js": `import { greet } from "./greet.js";\ndocument.querySelector("h1").textContent = greet("disk");\n`,
+              "src/greet.js": `export const greet = name => "hi " + name;\n`,
+              "README.md": "# Site\n", "notes.txt": "first\n", "node_modules/x/index.js": "x",
+            });
+            const ws = ui.workspace, context = { workspace: ws, agentId: 1, threadId: null, db };
+            await ws.openFolderProject({ handle: dir, agentId: 1 });
+            assert(ws.state.root?.kind === "folder" && ws.state.root.status === "connected" && ws.state.root.files === 5 && ws.state.project.root?.kind === "folder", `the folder's files are listed at once: ${JSON.stringify(ws.state.root)}`);
+            assert(!Object.keys(ws.state.project.heads).length && !(await ws.listVersions()).length, "and none is read before it is needed");
+            assert(eq(await ws.listFiles(), ["README.md", "index.html", "notes.txt", "src/app.js", "src/greet.js"]), `the agent's file list is the folder's: ${await ws.listFiles()}`);
+            assert(JSON.stringify(await viewFile({ path: "src/greet.js" }, context)).includes("hi "), "view_file reads from the disk");
+            assert((await ws.describeChanges(null))?.includes(`the folder "site" on the user's disk: 5 files`), "the first message says where the files are");
+
+            const ran = await runApp({ path: "index.html", screenshot: false }, context);
+            assert(!ran.error && !ran.report?.errors?.length && previewDocument(ui)?.querySelector("h1")?.textContent === "hi disk", `a page runs with its folder's files, read from disk: ${JSON.stringify(ran)}`);
+            assert((await diskRead(dir, "index.html")).startsWith("<!doctype html>\n<h1></h1>") && (await ws.listVersions({ path: "index.html" }))[0]?.source === "base", "running it takes it into the journal as it is, and leaves the disk alone");
+            assert(!(await ws.describeChanges({}))?.includes("index.html"), "which is no change");
+
+            const edit = await editFile({ path: "src/greet.js", patch: `<<<<<<< SEARCH\n"hi "\n=======\n"hello "\n>>>>>>> REPLACE` }, context);
+            assert(await diskRead(dir, "src/greet.js") === `export const greet = name => "hello " + name;\n`, "the agent's edit is on disk at once");
+            assert(eq((await ws.listVersions({ path: "src/greet.js" })).map(v => v.source), ["agent", "base"]), "its history starts from the file as it was, to restore");
+            assert(edit.report?.path === "index.html" && previewDocument(ui)?.querySelector("h1")?.textContent === "hello disk", `the page that loads it runs again: ${JSON.stringify(edit.report)}`);
+
+            const seen = { ...unwrap(ws.state.project.heads) };
+            await diskWrite(dir, "src/greet.js", `export const greet = name => "hey " + name;\n`);
+            assert(await ws.readFile("notes.txt") === "first\n", "a file read, not edited");
+            await diskWrite(dir, "notes.txt", "second\n");
+            await diskWrite(dir, "README.md", "# Site, edited\n");
+            await eventually(() => ws.state.files["src/greet.js"]?.includes("hey") && ws.state.files["notes.txt"] === "second\n", "the user's edits in the journal");
+            await sleep(120);
+            assert(!("README.md" in ws.state.files), "a file nobody has read stays on disk until it is");
+            const told = await ws.describeChanges(seen);
+            assert(told?.includes("src/greet.js: v") && told.includes("(disk)") && told.includes(`-export const greet = name => "hello "`) && told.includes(`+export const greet = name => "hey "`),
+              `the next message tells the agent what the user changed on disk: ${told}`);
+            assert(told.includes("notes.txt: v") && told.includes("-first") && told.includes("+second") && !told.includes("README.md"), `a file it had read shows as a change from what it read; an unread one isn't news: ${told}`);
+            await dir.removeEntry("notes.txt");
+            await eventually(() => !("notes.txt" in ws.state.files), "a file the disk lost leaving the heads");
+            assert(!(await ws.listFiles()).includes("notes.txt"), "and the list");
+
+            // A later session: the permission lapsed, and the user edited a file meanwhile.
+            const projectId = ws.state.project.id;
+            ws.close();
+            dir.node.top().permission = "prompt";
+            await diskWrite(dir, "src/greet.js", `export const greet = name => "yo " + name;\n`);
+            await ws.open(projectId);
+            assert(ws.state.root?.status === "permission" && ui.container.querySelector('[data-banner="root"]'), `a folder whose permission lapsed asks again, in a banner: ${JSON.stringify(ws.state.root)}`);
+            assert(/needs your permission/.test((await ws.git.status().catch(e => e)).message), "and git says why it can't");
+            await ws.reconnect();
+            assert(ws.state.root?.status === "connected" && ws.state.files["src/greet.js"]?.includes("yo"), "one click reconnects it, and what changed while it was closed comes in from the disk");
+
+            // git on the folder: isomorphic-git over the directory handle.
+            assert(ws.state.root.git === false && /no \.git/.test((await ws.git.status().catch(e => e)).message), "a folder without .git says so");
+            await ws.git.init();
+            assert(ws.state.root.git === true, "git init makes it a repository");
+            const untracked = await ws.git.status();
+            assert(untracked.every(r => r.status === "untracked") && eq(untracked.map(r => r.path), ["README.md", "index.html", "src/app.js", "src/greet.js"]), `git status sees the folder's files, not its dependencies: ${JSON.stringify(untracked)}`);
+            const first = await ws.git.commit({ message: "Start" });
+            assert(/^[0-9a-f]{40}$/.test(first.oid) && first.files.length === 4 && !(await ws.git.status()).length, `git commit takes every change: ${JSON.stringify(first)}`);
+            await writeFile({ path: "src/greet.js", content: `export const greet = name => "howdy " + name;\n` }, context);
+            assert(eq(await ws.git.status(), [{ path: "src/greet.js", status: "modified", staged: false }]), `the agent's write shows in git status: ${JSON.stringify(await ws.git.status())}`);
+            const diff = await ws.git.diff();
+            assert(diff.startsWith("diff --git a/src/greet.js b/src/greet.js") && diff.includes(`-export const greet = name => "yo "`) && diff.includes(`+export const greet = name => "howdy "`), `git diff against HEAD: ${diff}`);
+            await ws.git.commit({ message: "Howdy" });
+            const log = await ws.git.log();
+            assert(eq(log.map(c => c.message), ["Howdy", "Start"]) && log[0].author.name === "Chat agent", `git log: ${JSON.stringify(log)}`);
+            const branches = await ws.git.branch({ name: "feature" });
+            assert(branches.current === "main" && eq(branches.branches, ["feature", "main"]), `git branch: ${JSON.stringify(branches)}`);
+            for (const name of ["push", "pull"]) assert(/isn't supported on a folder project/.test((await ws.git[name]().catch(e => e)).message), `git ${name} says it isn't here`);
+
+            // An app made here, saved to a folder: its files are written out, and it becomes a folder project.
+            await ws.createProject({ name: "App" });
+            await writeFile({ path: "index.html", content: "<h1>app</h1>" }, context);
+            const out = await P.memoryDirectory("export");
+            await ws.openFolder({ handle: out });
+            assert(await diskRead(out, "index.html") === "<h1>app</h1>" && ws.state.root?.name === "export" && ws.state.project.root?.kind === "folder", "saving a project to a folder writes its files there");
+          } finally {
+            ui.cleanup();
+          }
+        }
+
+        // GitHub's API in memory: a repository's tree and blobs, and every request made of it.
+        async function fakeGitHub({ files = {}, isPrivate = true, defaultBranch = "main", limited = null } = {}) {
+          const blobs = {}, tree = [];
+          for (const [path, text] of Object.entries(files)) {
+            const sha = await P.gitBlobSha(text);
+            blobs[sha] = text;
+            tree.push({ path, type: "blob", sha, size: text.length, mode: "100644" });
+          }
+          const api = { calls: [], refs: { [defaultBranch]: "c0" }, moved: [] };
+          let n = 0;
+          const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
+          api.fetch = async (url, init = {}) => {
+            const method = init.method ?? "GET", u = new URL(url), body = init.body ? JSON.parse(init.body) : undefined;
+            api.calls.push({ method, host: u.hostname, path: u.pathname + u.search, body, auth: new Headers(init.headers).get("Authorization") });
+            if (u.hostname === "raw.githubusercontent.com") {
+              const entry = tree.find(e => u.pathname === `/o/r/c0/${e.path}`);
+              return entry ? new Response(blobs[entry.sha]) : new Response("404: Not Found", { status: 404 });
+            }
+            if (limited?.(method, u.pathname)) return json({ message: "API rate limit exceeded" }, 403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 600) });
+            const p = u.pathname.replace("/repos/o/r", "");
+            if (method === "GET" && p === "") return json({ default_branch: defaultBranch, private: isPrivate });
+            if (method === "GET" && p.startsWith("/branches/")) {
+              const sha = api.refs[decodeURIComponent(p.slice(10))];
+              return sha ? json({ commit: { sha, commit: { tree: { sha: "t-" + sha } } } }) : json({ message: "Branch not found" }, 404);
+            }
+            if (method === "GET" && p.startsWith("/git/trees/")) return json({ tree, truncated: false });
+            if (method === "GET" && p.startsWith("/git/blobs/")) return blobs[p.slice(11)] != null ? new Response(blobs[p.slice(11)]) : json({ message: "Not Found" }, 404);
+            if (method === "GET" && p.startsWith("/git/ref/heads/")) { const sha = api.refs[p.slice(15)]; return sha ? json({ object: { sha } }) : json({ message: "Not Found" }, 404); }
+            if (method === "GET" && p === "/commits") return json([{ sha: "c0", commit: { message: "Initial", author: { name: "Owner", email: "owner@example.com", date: "2026-10-01T00:00:00Z" } } }]);
+            if (method === "POST" && p === "/git/trees") return json({ sha: "t" + ++n }, 201);
+            if (method === "POST" && p === "/git/commits") return json({ sha: "c" + ++n }, 201);
+            if (method === "POST" && p === "/git/refs") { api.refs[body.ref.slice(11)] = body.sha; return json({ ref: body.ref }, 201); }
+            if (method === "PATCH" && p.startsWith("/git/refs/heads/")) {
+              const branch = p.slice(16);
+              if (api.moved.includes(branch)) return json({ message: "Update is not a fast forward" }, 422);
+              api.refs[branch] = body.sha;
+              return json({ object: { sha: body.sha } });
+            }
+            if (method === "POST" && p === "/pulls") return json({ number: 7, html_url: "https://github.com/o/r/pull/7" }, 201);
+            return json({ message: `unexpected ${method} ${p}` }, 500);
+          };
+          return api;
+        }
+
+        // Why: a repository is a project too: its files come through the API as they are needed, and the work leaves as a branch and a
+        // pull request, never on the default branch without a yes, within GitHub's limits
+        async function testGitHubRoot() {
+          const gh = await fakeGitHub({ files: { "README.md": "# R\n", "src/a.js": "export const a = 1;\n", "node_modules/x/index.js": "x" } });
+          const realFetch = globalThis.fetch, saved = localStorage.getItem("github-config");
+          globalThis.fetch = gh.fetch;
+          localStorage.setItem("github-config", JSON.stringify({ token: "test-token" }));
+          const ui = createTestUI();
+          try {
+            const ws = ui.workspace, context = { workspace: ws, agentId: 1, threadId: null, db };
+            const gets = () => gh.calls.every(c => c.method === "GET");
+            await ws.connectRepository({ owner: "o", repo: "r", agentId: 1 });
+            assert(ws.state.root?.kind === "github" && ws.state.root.branch === "main" && ws.state.root.base === "c0" && ws.state.root.files === 2, `connected at the branch's tip: ${JSON.stringify(ws.state.root)}`);
+            assert(eq(await ws.listFiles(), ["README.md", "src/a.js"]), `the tree, without dependencies: ${await ws.listFiles()}`);
+            assert(gets() && gh.calls.length === 3 && gh.calls.every(c => c.auth === "Bearer test-token"), `connecting is three reads, with the token: ${JSON.stringify(gh.calls.map(c => c.path))}`);
+            assert(await ws.readFile("src/a.js") === "export const a = 1;\n" && await ws.readFile("src/a.js") === "export const a = 1;\n", "a file comes on first read");
+            assert(gh.calls.length === 4 && gh.calls[3].path.startsWith("/repos/o/r/git/blobs/"), `once, from the blob API for a private repository: ${JSON.stringify(gh.calls.map(c => c.path))}`);
+
+            await editFile({ path: "src/a.js", patch: "<<<<<<< SEARCH\n= 1\n=======\n= 2\n>>>>>>> REPLACE" }, context);
+            await writeFile({ path: "docs/new.md", content: "# New\n" }, context);
+            assert(gets(), "the work stays here until it is pushed");
+            assert(eq((await ws.git.status()).map(r => `${r.status} ${r.path}`), ["added docs/new.md", "modified src/a.js"]), `git status against the base: ${JSON.stringify(await ws.git.status())}`);
+            const diff = await ws.git.diff({ path: "src/a.js" });
+            assert(diff.includes("-export const a = 1;") && diff.includes("+export const a = 2;"), `git diff against the base: ${diff}`);
+            const log = await ws.git.log();
+            assert(log[0]?.oid === "c0" && log[0].message === "Initial", `git log is the branch's: ${JSON.stringify(log)}`);
+
+            const refused = await ws.git.push({ branch: "main", message: "Edit" }).catch(e => e);
+            assert(/default branch/.test(refused.message) && /confirmDefault/.test(refused.message) && gets(), `the default branch needs a yes, and nothing is sent without one: ${refused.message}`);
+
+            // Two commits: a tree with the files inline and a commit each, on the base; then the new branch.
+            await ws.git.commit({ message: "Two" });
+            assert(ws.state.root.commits === 1, "a commit waits here");
+            await writeFile({ path: "README.md", content: "# R, edited\n" }, context);
+            const before = gh.calls.length;
+            const pushed = await ws.git.push({ branch: "agent/edit", message: "Readme" });
+            const sent = gh.calls.slice(before);
+            assert(eq(sent.map(c => `${c.method} ${c.path}`), ["POST /repos/o/r/git/trees", "POST /repos/o/r/git/commits", "POST /repos/o/r/git/trees", "POST /repos/o/r/git/commits",
+              "GET /repos/o/r/git/ref/heads/agent/edit", "POST /repos/o/r/git/refs"]), `push: trees, commits, then the ref: ${JSON.stringify(sent.map(c => `${c.method} ${c.path}`))}`);
+            const [tree1, commit1, tree2, commit2, , ref] = sent.map(c => c.body);
+            assert(tree1.base_tree === "t-c0" && eq(tree1.tree.map(e => e.path), ["docs/new.md", "src/a.js"]) && tree1.tree.every(e => typeof e.content === "string" && e.mode === "100644"), `the first tree is on the base, its files inline: ${JSON.stringify(tree1)}`);
+            assert(eq(commit1, { message: "Two", tree: "t1", parents: ["c0"] }) && tree2.base_tree === "t1" && eq(tree2.tree.map(e => e.path), ["README.md"]) && eq(commit2, { message: "Readme", tree: "t3", parents: ["c2"] }),
+              `each commit on the one before: ${JSON.stringify([commit1, tree2, commit2])}`);
+            assert(eq(ref, { ref: "refs/heads/agent/edit", sha: "c4" }) && eq(pushed, { branch: "agent/edit", commit: "c4", commits: 2, url: "https://github.com/o/r/tree/agent/edit" }), `the branch is made at the last: ${JSON.stringify([ref, pushed])}`);
+            assert(ws.state.root.base === "c4" && ws.state.root.branch === "agent/edit" && !ws.state.root.commits && !(await ws.git.status()).length, `the pushed commit is the new base: ${JSON.stringify(ws.state.root)}`);
+            assert(/Nothing to push/.test((await ws.git.push().catch(e => e)).message), "a push with nothing new says so");
+
+            const pr = await ws.git.openPullRequest({ title: "Edit a", body: "Why" });
+            assert(pr.number === 7 && eq(gh.calls.at(-1), { method: "POST", host: "api.github.com", path: "/repos/o/r/pulls", body: { title: "Edit a", body: "Why", head: "agent/edit", base: "main", draft: false }, auth: "Bearer test-token" }),
+              `a pull request from the branch into the one connected: ${JSON.stringify(gh.calls.at(-1))}`);
+            assert(ws.state.root.pullRequest?.url === "https://github.com/o/r/pull/7", "the panel can link it");
+
+            // The branch moved on GitHub: no force push.
+            await writeFile({ path: "src/a.js", content: "export const a = 3;\n" }, context);
+            gh.moved.push("agent/edit");
+            assert(/has commits the base .* lacks/.test((await ws.git.push({ message: "Three" }).catch(e => e)).message), "a branch that moved on GitHub isn't overwritten");
+          } finally {
+            ui.cleanup();
+            globalThis.fetch = realFetch;
+            if (saved == null) localStorage.removeItem("github-config"); else localStorage.setItem("github-config", saved);
+          }
+
+          // A public repository's files come from raw.githubusercontent.com, which costs no API request.
+          const open = await fakeGitHub({ files: { "a.txt": "public\n" }, isPrivate: false });
+          const publicRoot = P.createGitHubRoot(await P.connectGitHub({ owner: "o", repo: "r", fetch: open.fetch }), { fetch: open.fetch, patch: () => "" });
+          assert(await publicRoot.read("a.txt") === "public\n" && open.calls.at(-1).host === "raw.githubusercontent.com" && !open.calls.at(-1).auth, `a public file is read raw: ${JSON.stringify(open.calls.at(-1))}`);
+
+          // GitHub's own rate limit: the error says when it resets.
+          const limited = await fakeGitHub({ files: { "a.txt": "a" }, limited: (method, path) => method === "POST" && path.endsWith("/git/trees") });
+          const record = await P.connectGitHub({ owner: "o", repo: "r", fetch: limited.fetch });
+          const hit = await P.createGitHubRoot(record, { fetch: limited.fetch, token: "limited", files: async () => ({ "a.txt": "b" }) }).git.push({ branch: "x", message: "m" }).catch(e => e);
+          assert(hit instanceof P.RateLimitError && /rate limit/.test(hit.message) && /try again after \d\d:\d\d:\d\d \(in \d+s\)/.test(hit.message) && hit.reset > new Date(), `a rate-limit answer names the reset time: ${hit.message}`);
+
+          // The minute's allowance of creations is checked before a push starts, so one never stops halfway.
+          const budget = await fakeGitHub({ files: { "a.txt": "a" } });
+          const small = P.createGitHubRoot(await P.connectGitHub({ owner: "o", repo: "r", fetch: budget.fetch }), { fetch: budget.fetch, token: "small", perMinute: 2, files: async () => ({ "a.txt": "b" }) });
+          const over = await small.git.push({ branch: "x", message: "m" }).catch(e => e);
+          assert(over instanceof P.RateLimitError && /allows 2 content creations a minute and this needs 3/.test(over.message) && budget.calls.every(c => c.method === "GET"), `a push over the allowance is refused before it starts: ${over.message}`);
+        }
+
+        // Why: the same calls against GitHub itself (npm test -- --net), read-only on a public repository; GITHUB_PAT from .env when set
+        async function testGitHubLive() {
+          if (!NET) return;
+          const token = window.__GITHUB_PAT__ ?? null;
+          const record = await P.connectGitHub({ owner: "octocat", repo: "Hello-World", token });
+          const root = P.createGitHubRoot(record, { token, patch: () => "" });
+          assert(record.defaultBranch === "master" && /^[0-9a-f]{40}$/.test(record.base.commit) && root.list().includes("README"), `the tree of a real repository: ${JSON.stringify({ ...record, base: { ...record.base, files: Object.keys(record.base.files) } })}`);
+          assert(/Hello World/i.test(await root.read("README")), "and a file from it");
+          const log = await root.git.log({ depth: 2 });
+          assert(log[0]?.oid === record.base.commit, `and its log: ${JSON.stringify(log)}`);
+        }
+
         // Why: a page can pass every test and still be unreadable; the report names what a person would see wrong
         async function testLayoutChecks() {
           const ui = createTestUI();
@@ -6759,6 +7298,11 @@ if (window.__HARNESS__?.test) (async () => {
           testTestScreenshots,
           testArtifactRenderers,
           testFolderProject,
+          testIgnoreRules,
+          testFolderRoot,
+          testFolderWorkspace,
+          testGitHubRoot,
+          testGitHubLive,
           testRunTestFiles,
           testSweTestFiles,
           testLayoutChecks,
