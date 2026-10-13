@@ -328,6 +328,7 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       "aws-config": JSON.stringify({ region: process.env.AWS_REGION || "us-east-1", credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY, ...(process.env.AWS_SESSION_TOKEN && { sessionToken: process.env.AWS_SESSION_TOKEN }) } }),
       "google-config": JSON.stringify({ apiKey: process.env.GEMINI_API_KEY }),
       "brave-config": JSON.stringify({ apiKey: process.env.BRAVE_SEARCH_API_KEY }),
+      "github-config": JSON.stringify({ token: process.env.GITHUB_PAT }),
       "proxy-config": JSON.stringify({ endpoint: proxyUrl }),
       "harness-flags": JSON.stringify(flags),
     });
@@ -507,7 +508,7 @@ async function main() {
   const persona = o.system && (await readFile(o.system, "utf8"));
   // The page and its own modules, read once; a module that doesn't exist yet is left to the server.
   const app = {};
-  for (const file of ["index.html", "engine.js", "prompts.js"]) {
+  for (const file of ["index.html", "engine.js", "prompts.js", "projects.js"]) {
     const text = await readFile(path.join(root, file), "utf8").catch(e => (e.code === "ENOENT" ? null : Promise.reject(e)));
     if (text !== null) app["/" + file] = [file.endsWith(".html") ? "text/html; charset=utf-8" : "text/javascript; charset=utf-8", text];
   }
