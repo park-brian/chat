@@ -169,8 +169,9 @@ async function run(config = options(process.argv.slice(2))) {
         const where = message.location().url;
         if (message.type() === "error" && !where?.includes(".invalid/")) errors.push(message.text() + (where ? ` (${where})` : ""));
       });
-      // A page a test runs in the workspace throws on purpose; its report is what the test checks.
-      page.on("pageerror", (error) => { if (!error.stack?.includes("/__ws/")) errors.push(error.message); });
+      // A page a test runs in the workspace throws on purpose; its report is what the test checks. So does code a
+      // test runs in the code tool's frame (about:srcdoc), whose result reports what it threw.
+      page.on("pageerror", (error) => { if (!/\/__ws\/|about:srcdoc/.test(error.stack ?? "")) errors.push(error.message); });
       page.on("requestfailed", (request) => {
         if (["script", "stylesheet"].includes(request.resourceType()))
           errors.push("Failed asset: " + request.url());

@@ -3668,6 +3668,67 @@ function parseError(acorn, code, module) {
   catch (e) { return e; }
 }
 
+// Model code runs on the tab's own thread, so an endless loop freezes the tab and no timer can fire to stop it
+// (CodePen's "loop protect"). Every loop body is opened with a call to the guard loopGuard puts in the frame:
+// `for (;;) x()` becomes `for (;;) {G;x()}`. Only insertions, none with a newline, so error lines stay. Optional,
+// so a file also loaded where no guard is (a worker) runs as written. null when the code doesn't parse.
+const LOOP_CALL = "globalThis.__harnessLoop?.();";
+function guardSource(acorn, code, module) {
+  let ast;
+  try { ast = acorn.parse(code, { ecmaVersion: "latest", sourceType: module ? "module" : "script", allowHashBang: true }); } catch { return null; }
+  const edits = [];
+  (function walk(node) {
+    if (/^(For|ForIn|ForOf|While|DoWhile)Statement$/.test(node.type)) {
+      const { body } = node;
+      if (body.type === "BlockStatement") edits.push([body.start + 1, LOOP_CALL]);
+      else edits.push([body.start, "{" + LOOP_CALL], [body.end, "}"]);
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) for (const v of value) v?.type && walk(v);
+      else if (typeof value?.type === "string") walk(value);
+    }
+  })(ast);
+  return edits.sort((a, b) => b[0] - a[0]).reduce((text, [at, insert]) => text.slice(0, at) + insert + text.slice(at), code);
+}
+
+// JS (a module, or else a classic script), or an HTML page's inline scripts. guarded: false when acorn didn't load
+// or something didn't parse, which then runs as written.
+async function guardLoops(source, { html = false } = {}) {
+  const acorn = await loadAcorn();
+  if (!acorn) return { source, guarded: false };
+  if (!html) {
+    const out = guardSource(acorn, source, true) ?? guardSource(acorn, source, false);
+    return { source: out ?? source, guarded: out != null };
+  }
+  let guarded = true;
+  const out = scriptsOf(source).reduceRight((text, s) => {
+    const code = guardSource(acorn, s.code, s.module);
+    if (code == null) guarded = false;
+    return code == null ? text : text.slice(0, s.start) + code + text.slice(s.end);
+  }, source);
+  return { source: out, guarded };
+}
+
+// Stringified into a frame. The guard throws once the code's own timeout has passed, or once the thread has gone
+// `limit` ms without a task turn: a loop that awaits a timer yields, and is left alone. The clock is read every
+// 128th call; a read on every one made a tight loop 25× slower. A MessageChannel isn't throttled in a hidden tab
+// as timers are, so a yield is seen as soon as it happens.
+function loopGuard(limit, timeout = Infinity) {
+  const deadline = Date.now() + timeout, channel = new MessageChannel();
+  let calls = 0, since = 0;
+  channel.port1.onmessage = () => { since = 0; };
+  globalThis.__harnessLoop = () => {
+    if (++calls & 127) return;
+    const now = Date.now();
+    if (!since) { since = now; channel.port2.postMessage(0); }
+    if (now > deadline || now - since > limit) {
+      const message = `Loop ran past ${now > deadline ? timeout : limit} ms: stopped by the harness`;
+      globalThis.__harnessLoopStopped = message;
+      throw new Error(message);
+    }
+  };
+}
+
 // A script cut short by a closing tag in one of its strings parses again once that tag is written <\/script>.
 // Tried over the next few tags; kept only if the joined script parses, so a real syntax error is never "fixed".
 function escapeCloseTags(acorn, html, script) {
@@ -4241,8 +4302,8 @@ export {
   CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
   PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
   countLines, countRepeats, createDirector, createWorkspace, describeCheck, editFile, editor, renderPlan, runCheck, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
-  getConverseClient, getConverseCommand, getProxyConfig, getToolResults, initDB, inspectArgs, isHtml, isLocalHost,
-  isPlanFile, isRenderable, isScratch, listHistory, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
+  getConverseClient, getConverseCommand, getProxyConfig, getToolResults, guardLoops, initDB, inspectArgs, isHtml, isLocalHost,
+  isPlanFile, isRenderable, isScratch, listHistory, loopGuard, mcp, memoriesBlock, missingFiles, modelInfo, normalizePath, outline, overlap,
   ownedTools, parseJSON, parsePatch, plainError, polishedTake, preflight, prepareMessages, processStreamChunk,
   providerOf, proxyFetch, proxyRewrite, readUrl, reasoningFields, reasoningLevel, relayUrl, restoreVersion,
   runAgentWithBranching, runApp, runningSubagents, sameView, sandboxFiles, sandboxResources, serve, setSubagent,

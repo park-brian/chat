@@ -256,8 +256,8 @@
       import {
         CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, LOCAL_PROXY, MODELS, PROTOCOL, PROXY_CONFIG_KEY, VIEWPORTS,
         WORKSPACE_TOOL_NAMES, countLines, countRepeats, createWorkspace, ensureDefaultAgent, escapeHtml, extendPath,
-        getPathToMessage, getProxyConfig, getSiblings, initDB, inspectArgs, isHtml, isLocalHost, isRenderable, isScratch,
-        modelInfo, parseJSON, parsePatch, plainError, proxyRewrite, readUrl, reasoningLevel, sameView, sandboxFiles,
+        getPathToMessage, getProxyConfig, getSiblings, guardLoops, initDB, inspectArgs, isHtml, isLocalHost, isRenderable, isScratch,
+        loopGuard, modelInfo, parseJSON, parsePatch, plainError, proxyRewrite, readUrl, reasoningLevel, sameView, sandboxFiles,
         sandboxResources, serve, sleep, snapshotSettings, storedJSON, storedProxyConfig, summarizeReport, timeAgo,
         toError, toResultValue, unmuteScripts, webSearch, webToolNames,
       } from "./engine.js";
@@ -2393,6 +2393,9 @@
           }
         }
         language = language || "js";
+        const js = ["js", "javascript"].includes(language);
+        const seconds = Math.min(Math.max(+timeout || (usesNetwork(source) ? 30 : 5), 0.05), 60);
+        const { source: guarded, guarded: parsed } = await guardLoops(source || "", { html: !js });
 
         return new Promise(resolve => {
           const logs = [];
@@ -2424,11 +2427,15 @@
             clearTimeout(kill);
             window.removeEventListener("message", onMsg);
             context.signal?.removeEventListener("abort", cancel);
+            const looped = frame.contentWindow?.__harnessLoopStopped;
             frame.remove();
+            // A syntax error says why it didn't parse; anything else unguarded could freeze the tab, and says so.
+            const note = !parsed && !logs.some(l => /SyntaxError/.test(l)) && { note: "The loop guard couldn't parse this code, so it ran unguarded: an endless loop in it would freeze the tab." };
             // A file's source isn't sent back: the caller named it, and a 500KB page once came back whole.
             // Cut off, it says so: its logs alone would read as a run that finished.
-            resolve(stopped === "cancelled" ? { logs, error: "Stopped with the run." }
-              : stopped ? { logs, error: `Stopped after ${seconds}s, unfinished. A longer timeout (up to 60) lets it finish.` } : { logs });
+            const error = stopped === "cancelled" ? "Stopped with the run."
+              : looped ?? (stopped && `Stopped after ${seconds}s, unfinished. A longer timeout (up to 60) lets it finish.`);
+            resolve({ logs, ...(error && { error }), ...note });
           };
 
           // Read proxy config and origin in parent scope, serialize into bridge
@@ -2440,6 +2447,8 @@
         const send=(t,m)=>parent.postMessage({type:t,msg:m},"*");
         ${inspectArgs}
         ${isLocalHost}
+        ${loopGuard}
+        loopGuard(Infinity, ${seconds * 1000});
         const format=a=>{try{return inspectArgs(a)}catch{return a.map(String).join(" ")}};
         ["log","warn","error","info","debug"].forEach(k=>{
           const o=console[k]; console[k]=(...a)=>{try{send("log",(k==="warn"||k==="error"?k+": ":"")+format(a))}catch{}; o&&o.apply(console,a);};
@@ -2503,13 +2512,12 @@
     `;
 
           // The source goes in as a JSON string, so a closing script tag inside it can't end the script early.
-          const module = JSON.stringify((source || "") + `\n;parent.postMessage({type:"done"},"*");`).replaceAll("<", "\\u003c");
+          const module = JSON.stringify(guarded + `\n;parent.postMessage({type:"done"},"*");`).replaceAll("<", "\\u003c");
           const jsDoc = `<!doctype html><meta charset=utf-8><scr` + `ipt>${bridge}</scr` + `ipt><scr` + `ipt>{const s=document.createElement("script");s.type="module";s.textContent=${module};document.head.append(s)}</scr` + `ipt>`;
-          const htmlDoc = `<!doctype html><meta charset=utf-8><scr` + `ipt>${bridge}</scr` + `ipt>${source || ""}<scr` + `ipt async>addEventListener("load",()=>parent.postMessage({type:"done"},"*"));</scr` + `ipt>`;
+          const htmlDoc = `<!doctype html><meta charset=utf-8><scr` + `ipt>${bridge}</scr` + `ipt>${guarded}<scr` + `ipt async>addEventListener("load",()=>parent.postMessage({type:"done"},"*"));</scr` + `ipt>`;
 
-          const seconds = Math.min(Math.max(+timeout || (usesNetwork(source) ? 30 : 5), 0.05), 60);
           const kill = setTimeout(() => cleanup(true), seconds * 1000);
-          frame.srcdoc = !language || ["js", "javascript"].includes(language) ? jsDoc : htmlDoc;
+          frame.srcdoc = js ? jsDoc : htmlDoc;
         });
       }
       let bridgeUrl = null;
@@ -2519,6 +2527,8 @@
       function harnessBridge() {
         const h = window.frameElement && window.frameElement.__harness;
         if (!h) return;
+        // A page has no timeout of its own: a loop is stopped once it has held the thread 10 s, the time a script gets.
+        loopGuard(10000);
         const format = args => { try { return inspectArgs(args); } catch { return args.map(String).join(" "); } };
         for (const level of ["log", "info", "warn", "error", "debug"]) {
           const original = console[level];
@@ -2665,7 +2675,7 @@
       }
 
       function getBridgeUrl() {
-        return bridgeUrl ||= URL.createObjectURL(new Blob([`(() => {\n${inspectArgs}\n${sandboxResources}\n(${harnessBridge})();\n})();`], { type: "text/javascript" }));
+        return bridgeUrl ||= URL.createObjectURL(new Blob([`(() => {\n${inspectArgs}\n${sandboxResources}\n${loopGuard}\n(${harnessBridge})();\n})();`], { type: "text/javascript" }));
       }
 
       // Inserted on the line of the opening tag, so line numbers in errors match the file.
@@ -2745,9 +2755,11 @@
       async function publish(base, path, doc, files) {
         const cache = await serveWorkspace();
         const entry = isHtml(path) ? path : path + ".html";
+        // Served with their loops guarded; the files themselves stay as written.
+        const guarded = async (p, text) => /\.m?js$/i.test(p) && typeof text === "string" ? (await guardLoops(text)).source : text;
         await Promise.all([
-          ...Object.entries(files).filter(([p]) => p !== entry).map(([p, text]) => cache.put(base + p, new Response(text, { headers: { "Content-Type": mimeOf(p) } }))),
-          cache.put(base + entry, new Response(injectBridge(unmuteScripts(doc)), { headers: { "Content-Type": "text/html; charset=utf-8" } })),
+          ...Object.entries(files).filter(([p]) => p !== entry).map(async ([p, text]) => cache.put(base + p, new Response(await guarded(p, text), { headers: { "Content-Type": mimeOf(p) } }))),
+          cache.put(base + entry, new Response(injectBridge(unmuteScripts((await guardLoops(doc, { html: true })).source)), { headers: { "Content-Type": "text/html; charset=utf-8" } })),
         ]);
         return base + entry;
       }
@@ -2870,7 +2882,7 @@
           // resolves a Function's import() against the script that made it, the host's, and the folder went unseen.
           new (win.eval("(async function () {}).constructor"))(script);
           const key = `__harnessScript${++run.seq}`, el = win.document.createElement("script");
-          el.textContent = `window[${JSON.stringify(key)}] = async () => {\n${script}\n};`;
+          el.textContent = (await guardLoops(`window[${JSON.stringify(key)}] = async () => {\n${script}\n};`)).source;
           win.document.documentElement.append(el);
           el.remove();
           const fn = win[key];
@@ -3989,8 +4001,6 @@
         }
 
         async function testCodeTimeout() {
-          // Note: Synchronous infinite loops (while(true){}) block the JS thread
-          // and prevent timeout callbacks from firing. Testing with async delay instead.
           const start = Date.now();
           const result = await code({ source: "await new Promise(r => setTimeout(r, 5000))", timeout: 0.05 });
           const elapsed = Date.now() - start;
@@ -3998,6 +4008,58 @@
           assert(elapsed < 1000, "Should timeout quickly, not wait for full delay");
           assert(/Stopped after 0.05s/.test(result.error), `a run cut off says so: ${JSON.stringify(result)}`);
           assert(!(await code({ source: "console.log(1)" })).error, "a run that finishes has no error");
+        }
+
+        // Why: an endless loop in code froze the tab: the timeout's timer can't fire while the loop holds the thread
+        async function testCodeLoopGuard() {
+          await guardLoops(""); // acorn, loaded before the clock starts
+          const endless = ["while (true) {}", "for (;;);", "let i = 0;\ndo i++; while (true)", "async function spin() { await null; while (true) {} }\nawait spin();", "outer: for (;;) for (;;) continue outer;"];
+          for (const source of endless) {
+            const start = performance.now();
+            const result = await code({ source, timeout: 0.3 });
+            const elapsed = performance.now() - start;
+            assert(result.error === "Loop ran past 300 ms: stopped by the harness" && elapsed < 800, `${source}: stopped by the guard in ${Math.round(elapsed)} ms: ${JSON.stringify(result)}`);
+            const tick = performance.now();
+            await sleep(0);
+            assert(performance.now() - tick < 100, "and the tab answers again");
+          }
+          const page = await code({ language: "html", source: "<p>x</p><script>for (;;) {}<\/script>", timeout: 0.3 });
+          assert(page.error === "Loop ran past 300 ms: stopped by the harness", `a page's inline script is guarded too: ${JSON.stringify(page)}`);
+
+          const normal = await code({ source: [
+            "export const unused = 0;",
+            "function* count(n) { for (let i = 0; i < n; i++) yield i; }",
+            "let sum = 0, n = 0;",
+            "for (const i of count(5)) sum += i;",
+            "for (const k in { a: 1, b: 2 }) sum += k.length;",
+            "outer: for (let i = 0; i < 3; i++) for (let j = 0; ; j++) { if (j === 2) continue outer; sum++; }",
+            "do n++; while (n < 3);",
+            "while (n < 1e6) n++;",
+            "for await (const v of (async function* () { yield 1; yield 2; })()) sum += v;",
+            "await new Promise(r => setTimeout(r, 10));",
+            "if (sum) for (;;) break;",
+            "console.log(sum, n);",
+          ].join("\n") });
+          assert(eq(normal, { logs: ["21 1000000"] }), `loops that end run as written, modules, generators, labels and top-level await included: ${JSON.stringify(normal)}`);
+
+          const typo = await code({ source: "let a = ;", timeout: 0.3 });
+          assert(typo.logs.some(l => /^Uncaught SyntaxError/.test(l)) && !typo.note, `a syntax error is reported as the browser reports it: ${JSON.stringify(typo)}`);
+        }
+
+        async function testLoopGuardSource() {
+          const call = "globalThis.__harnessLoop?.();";
+          const js = await guardLoops("while (a) b();\nfor (;;) { c() }\nx: do d(); while (e)");
+          assert(js.guarded && js.source === `while (a) {${call}b();}\nfor (;;) {${call} c() }\nx: do {${call}d();} while (e)`, `each loop body opens with the guard, on its own lines: ${js.source}`);
+          const html = await guardLoops(`<script type="importmap">{"imports":{}}<\/script><script>while (a) {}<\/script><script type="module">for (;;) {}<\/script>`, { html: true });
+          assert(html.guarded && html.source.includes(`while (a) {${call}}`) && html.source.includes(`for (;;) {${call}}`) && html.source.includes(`{"imports":{}}`), `a page's scripts are guarded, its data left alone: ${html.source}`);
+          assert(eq(await guardLoops("while ("), { source: "while (", guarded: false }), "code that doesn't parse runs as written");
+          // The other half: a page's guard stops a loop that has held the thread past its limit.
+          const frame = document.createElement("iframe");
+          document.body.append(frame);
+          try {
+            const thrown = frame.contentWindow.eval(`(${loopGuard})(50); try { ${(await guardLoops("while (true) {}")).source} } catch (e) { e.message }`);
+            assert(thrown === "Loop ran past 50 ms: stopped by the harness", `a page's loop is stopped after its limit: ${thrown}`);
+          } finally { frame.remove(); }
         }
 
         // =============================================================================
@@ -4849,6 +4911,8 @@
             assert(ui.workspace.state.report?.path === "app.html", `and so does the report on show: ${ui.workspace.state.report?.path}`);
             const again = await runApp({ path: "scratch/spike.html", script: "return document.getElementById('out').textContent" }, context);
             assert(again.report?.path === "scratch/spike.html" && again.report.result === "tested", `run_app runs it again by path: ${JSON.stringify(again.report)}`);
+            const looped = await runApp({ path: "scratch/spike.html", script: "let i = 0; while (i < 1e5) i++; return typeof __harnessLoop + ' ' + i", screenshot: false }, context);
+            assert(looped.report?.result === "function 100000", `a page and its scripts run with their loops guarded: ${JSON.stringify(looped.report)}`);
             assert((await runApp({ path: "scratch/gone.html" }, context)).error === "File not found: scratch/gone.html. Create it with write_file.", "a path that isn't there says so");
             const edited = await editFile({ path: "app.html", patch: "<<<<<<< SEARCH\n<h1>App</h1>\n=======\n<h1>App 2</h1>\n>>>>>>> REPLACE" }, context);
             assert(edited.report?.path === "app.html" && app.report?.ok, "the app still runs as the shown artifact");
@@ -6365,6 +6429,8 @@ if (window.__HARNESS__?.test) (async () => {
           testWebToolNames,
           testCodeHTML,
           testCodeTimeout,
+          testCodeLoopGuard,
+          testLoopGuardSource,
 
           // Think tool test
           testThinkTool,

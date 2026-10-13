@@ -1,7 +1,7 @@
 // eval.js's pure helpers and the graders' CDN check, without a browser or a model.
 import assert from "node:assert/strict";
 import path from "node:path";
-import { dialogue, filePath, MAX_UNCONFIRMED, meanLine, options, passK, summarize } from "../eval.js";
+import { bounded, dialogue, filePath, MAX_UNCONFIRMED, meanLine, options, partialNote, passK, summarize } from "../eval.js";
 import TASKS, { numbers, pinsJsdelivr, replies } from "./tasks.js";
 import { criteriaOf, judge, judgedChecks, judgePrompt, JUDGE_MODEL, PLAIN } from "./judge.js";
 import { FLOURISHES, mannered, wordCount } from "./style.js";
@@ -35,6 +35,18 @@ assert.equal(summarize([]).mean, null);
 assert.equal(meanLine(runs), "mean pass 0.75 over 2 graded runs");
 assert.equal(meanLine(runs, [runs[2]]), "mean pass 0.75 over 2 graded runs (baseline no graded runs)");
 assert.equal(meanLine([runs[3]]), "no graded runs");
+// Its files are still checked, and shown beside the mean, never in it.
+const cut = { task: "z", model: "haiku", passed: 0, total: 1, error: "Timeout 600000ms exceeded.", partial: { passed: 7, total: 8, failed: ["tests pass"] } };
+assert.equal(summarize([...runs, cut]).mean, (0.5 + 1) / 2);
+assert.equal(meanLine([...runs, cut, { ...cut, partial: { passed: 2, total: 4, failed: [] } }]), "mean pass 0.75 over 2 graded runs · 2 unfinished, left out, whose files pass 9/12 checks");
+assert.equal(partialNote(cut), " · its files pass 7/8");
+assert.equal(partialNote({ ...cut, partial: { passed: 0, total: 0, error: "no answer" } }), " · its files can't be checked: no answer");
+assert.equal(partialNote(runs[3]), "");
+
+// A read of a hung page gives up, marked hung, so the run is recorded as crashed and the eval goes on.
+const hung = await bounded(new Promise(() => {}), "Reading the page", 20).then(() => null, e => e);
+assert.ok(hung.hung && hung.message === "Reading the page took over 0.02 s: the page is hung", hung.message);
+assert.equal(await bounded(Promise.resolve(5), "x", 20), 5);
 
 // pass^k: per task·model with two or more graded repeats, the share that passed every check; a crash is no repeat.
 const rep = (task, passed, total = 3, more = {}) => ({ task, model: "haiku", passed, total, ...more });

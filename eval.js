@@ -26,6 +26,13 @@ const MODELS = {
 const TURN_TIMEOUT = 10 * 60_000;
 // A reply may finish before its loading state is seen, so waiting for it to start is only a short grace.
 const START_TIMEOUT = 5_000;
+// A page whose thread is held answers no evaluate, and Playwright gives evaluate no timeout of its own.
+const READ_TIMEOUT = 60_000;
+export const bounded = (promise, what, ms = READ_TIMEOUT) => {
+  let timer;
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(`${what} took over ${ms / 1000} s: the page is hung`), { hung: true })), ms); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+};
 // Every job calls paid APIs: more than this many must be confirmed with --yes.
 export const MAX_UNCONFIRMED = 20;
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -65,7 +72,7 @@ export function filePath(dir, file) {
 }
 
 // Pass rates over the runs that were graded. A run that crashed or didn't finish its turns is a harness failure:
-// it has no score and is reported apart.
+// it has no score and is reported apart. An unfinished run's files are still checked, as partial, to show apart.
 const graded = r => !r.crashed && !r.error && r.total > 0;
 const rowKey = r => `${r.task}·${r.model}`;
 // A run passes when every check it was graded on passed; unjudged criteria are not among them.
@@ -86,8 +93,11 @@ const kLine = s => (s.passK.tasks ? ` · pass^k ${s.passK.every}/${s.passK.tasks
 export function meanLine(results, baseline) {
   const now = summarize(results), was = baseline && summarize(baseline);
   const line = now.mean === null ? "no graded runs" : `mean pass ${now.mean.toFixed(2)} over ${now.scored} graded runs${kLine(now)}`;
-  return line + (was ? ` (baseline ${was.mean === null ? "no graded runs" : was.mean.toFixed(2) + kLine(was)})` : "");
+  const partial = now.unfinished.filter(r => r.partial?.total);
+  const kept = partial.length ? ` · ${partial.length} unfinished, left out, whose files pass ${partial.reduce((n, r) => n + r.partial.passed, 0)}/${partial.reduce((n, r) => n + r.partial.total, 0)} checks` : "";
+  return line + kept + (was ? ` (baseline ${was.mean === null ? "no graded runs" : was.mean.toFixed(2) + kLine(was)})` : "");
 }
+export const partialNote = r => (r.partial ? (r.partial.total ? ` · its files pass ${r.partial.passed}/${r.partial.total}` : ` · its files can't be checked: ${r.partial.error}`) : "");
 const fail = message => { throw new Error(message); };
 
 // The conversation as the user saw it: typed messages and the assistant's text, one entry per reply. Echo turns
@@ -118,7 +128,7 @@ export function dialogue(messages, { writes = false } = {}) {
 
 // Everything the app stored, read straight from IndexedDB. Bytes become base64 so they survive the trip out.
 async function collect(page) {
-  return page.evaluate(async () => {
+  return bounded(page.evaluate(async () => {
     const request = r => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
     const db = await request(indexedDB.open("chat"));
     const all = name => request(db.transaction(name).objectStore(name).getAll());
@@ -129,7 +139,7 @@ async function collect(page) {
     const plain = v => ArrayBuffer.isView(v) || v instanceof ArrayBuffer ? { base64: b64(new Uint8Array(v.buffer ?? v)) }
       : Array.isArray(v) ? v.map(plain) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)])) : v;
     return plain({ threads, messages, projects, versions: versions.map(v => ({ ...v, text: text[v.hash] })), persona: agents.find(a => a.id === 1)?.systemPrompt });
-  });
+  }), "Reading the app's IndexedDB");
 }
 
 // Files the user already has, as if they opened their folder: a project holds them and the chat starts in it,
@@ -304,7 +314,7 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
     const answers = [];
     const say = async text => {
       await send(page, text, modelId, reasoning, task.timeout);
-      answers.push(await page.evaluate(() => document.querySelectorAll(".message-block")[document.querySelectorAll(".message-block").length - 1]?.innerText ?? ""));
+      answers.push(await bounded(page.evaluate(() => document.querySelectorAll(".message-block")[document.querySelectorAll(".message-block").length - 1]?.innerText ?? ""), "Reading the reply"));
     };
     let error = null, user = null;
     try {
@@ -350,7 +360,8 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
     clearInterval(seeing);
     const ms = Date.now() - started;
 
-    const data = await collect(page).catch(e => ({ threads: [], messages: [], versions: [], error: e.message }));
+    // A hung page crashes the run, with why; the context closes below and the eval goes on.
+    const data = await collect(page).catch(e => (e.hung ? Promise.reject(e) : { threads: [], messages: [], versions: [], error: e.message }));
     const main = data.threads.find(t => t.type !== "subagent");
     const messages = data.messages.filter(m => m.threadId === main?.id).sort((a, b) => a.id - b.id);
     const subThreads = new Set(data.threads.filter(t => t.type === "subagent").map(t => t.id));
@@ -385,9 +396,9 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       try {
         await probePage.goto(`http://localhost:${fileServer.address().port}/${file}`);
         await probePage.waitForTimeout(1500);
-        return await probePage.evaluate(fn);
+        return await bounded(probePage.evaluate(fn), "Probing " + file);
       } catch (e) { return "probe error: " + e.message.split("\n")[0]; }
-      finally { await probePage.close(); }
+      finally { await bounded(probePage.close(), "Closing the probe").catch(() => {}); }
     };
     const run = {
       answer: said.flatMap(m => m.content.filter(b => b.text).map(b => b.text)).join("\n"),
@@ -407,7 +418,13 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
     Object.assign(run.metrics, { words: style.words, flourishes: style.count, flourishPer1k: style.per1k });
     // The simulator's tokens are counted apart from the model's, like the judge's.
     if (user) Object.assign(run.metrics, { userTurns: user.userTurns, userDone: user.done, dontMind: user.dontMind, simTokens: user.tokens.input + user.tokens.output });
-    const checks = (error ? [[false, "finished: " + error]] : await task.check(run)).map(([ok, label]) => ({ ok: !!ok, label }));
+    const own = async () => (await task.check(run)).map(([ok, label]) => ({ ok: !!ok, label }));
+    const saved = [...(escaped.length ? [{ ok: false, label: "files stay in the workspace (escaped: " + escaped.join(", ") + ")" }] : []), ...(unwritten.length ? [{ ok: false, label: "files can be saved (failed: " + unwritten.join(", ") + ")" }] : [])];
+    // A run cut off by its turn timeout may still have written what the task needs: its files are checked (not
+    // judged), and the result kept apart from the grade.
+    const tally = cs => ({ passed: cs.filter(c => c.ok).length, total: cs.length, failed: cs.filter(c => !c.ok).map(c => c.label) });
+    const partial = error ? await own().then(cs => tally([...cs, ...saved]), e => ({ passed: 0, total: 0, error: String(e.message || e).split("\n")[0] })) : null;
+    const checks = error ? [{ ok: false, label: "finished: " + error }] : await own();
     // The judge grades a finished run only; its tokens are counted apart from the model's. With a simulated user it
     // also sees where each file was written, to tell asking first from building first.
     const verdict = !error && task.rubric ? await judge(task.user ? { ...run, dialogue: dialogue(messages, { writes: true }) } : run, task) : null;
@@ -416,19 +433,18 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       Object.assign(run.metrics, { judgeInputTokens: verdict.tokens.input, judgeOutputTokens: verdict.tokens.output });
     }
     const unjudged = verdict?.unjudged ?? [];
-    if (escaped.length) checks.push({ ok: false, label: "files stay in the workspace (escaped: " + escaped.join(", ") + ")" });
-    if (unwritten.length) checks.push({ ok: false, label: "files can be saved (failed: " + unwritten.join(", ") + ")" });
+    checks.push(...saved);
 
     const breaks = prefixBreaks(requests.map(r => r.body));
     run.metrics.prefixBreaks = breaks.length;
-    const result = { task: task.id, model: modelName, modelId, error, escaped, unwritten, passed: checks.filter(c => c.ok).length, total: checks.length, checks, unjudged, judgeError: verdict?.error ?? null, flourishHits: style.hits, metrics: run.metrics, user: user && { done: user.done, userTurns: user.userTurns, said: user.said }, errors: errors.slice(0, 5), netErrors: netErrors.slice(0, 20), requests: requests.length, requestBytes: requests.map(r => r.body.length), breaks };
+    const result = { task: task.id, model: modelName, modelId, error, ...(partial && { partial }), escaped, unwritten, passed: checks.filter(c => c.ok).length, total: checks.length, checks, unjudged, judgeError: verdict?.error ?? null, flourishHits: style.hits, metrics: run.metrics, user: user && { done: user.done, userTurns: user.userTurns, said: user.said }, errors: errors.slice(0, 5), netErrors: netErrors.slice(0, 20), requests: requests.length, requestBytes: requests.map(r => r.body.length), breaks };
     await writeFile(path.join(dir, "result.json"), JSON.stringify({ ...result, persona: data.persona, messages, subagents, summary: main?.summary ?? null }, null, 1));
     if (requests.length) await writeFile(path.join(dir, "request.json"), requests.at(-1).body);
     await writeFile(path.join(dir, "transcript.md"), `# ${task.id} · ${modelName}\n\n${[...checks.map(c => `- [${c.ok ? "x" : " "}] ${c.label}${c.reason ? ` — ${c.reason}` : ""}`), ...unjudged.map(u => `- [?] judge: ${u.criterion} (unjudged: ${u.reason})`)].join("\n")}\n\n\`${JSON.stringify(run.metrics)}\`\n` + (user ? `\nsimulated user: ${user.done ? "DONE" : "no DONE"} after ${user.userTurns} user turns\n` : "") + (await transcript(messages, dir)));
     return result;
   } finally {
     clearInterval(seeing);
-    await context.close().catch(() => {});
+    await bounded(context.close(), "Closing the browser context").catch(() => {});
     fileServer?.closeAllConnections();
     fileServer?.close();
   }
@@ -448,7 +464,7 @@ function table(results, baseline) {
   const now = summarize(results);
   console.log(meanLine(results, baseline));
   for (const r of now.crashed) console.log(`CRASHED ${r.task} ${r.model}: ${r.crashed}`);
-  for (const r of now.unfinished) console.log(`UNFINISHED ${r.task} ${r.model}: ${r.error}`);
+  for (const r of now.unfinished) console.log(`UNFINISHED ${r.task} ${r.model}: ${r.error}${partialNote(r)}`);
   for (const r of results.filter(r => r.unjudged?.length)) console.log(`UNJUDGED ${r.task} ${r.model}: ${r.unjudged.length} criteria left out of the score (${r.judgeError})`);
 }
 
@@ -497,7 +513,7 @@ async function main() {
         task: job.task.id, model: job.model[0], modelId: job.model[1], crashed: String(e?.stack || e).split("\n").slice(0, 3).join(" | "), passed: 0, total: 0, checks: [],
       }));
       if (result.crashed) console.log(`CRASH ${job.task.id} ${job.model[0]} ${result.crashed}`);
-      else if (result.error) console.log(`UNFINISHED ${job.task.id} ${job.model[0]} ${result.error}`);
+      else if (result.error) console.log(`UNFINISHED ${job.task.id} ${job.model[0]} ${result.error}${partialNote(result)}`);
       else console.log(`${result.passed === result.total ? "PASS" : "FAIL"} ${job.task.id} ${job.model[0]} ${result.passed}/${result.total} ${result.checks.filter(c => !c.ok).map(c => c.label).join("; ")}${result.unjudged?.length ? ` (${result.unjudged.length} unjudged: ${result.judgeError})` : ""}`);
       results.push(result);
     }
