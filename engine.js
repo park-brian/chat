@@ -959,7 +959,6 @@ function silentReply(messages) {
 // the prompt changed nothing; the same rule injected after the eighth call worked in 3 of 3 runs.
 
 const STALL_STEPS = 6; // steps with no check turning green before the director says so
-const LONG_REQUEST = 100; // words: a request this long is work, not a question
 const NOTES_AT = 0.8; // share of the way to a summary at which the model is told to write its notes
 const LEDGER_KEPT = 300;
 
@@ -1172,7 +1171,7 @@ function doneNote(done, contract) {
   const next = currentItem(contract), ids = done.map(i => i.id), so = done.length > 1 ? "they are" : "it is";
   const head = `${itemsLabel(ids)}'s check${done.length > 1 ? "s" : ""} passed, so ${so} done (${progressLine(contract)}).`;
   return next ? `${head} Next: item ${next.id}, "${next.title}"; its check: ${describeCheck(next.check)}.`
-    : `${head} Every item is done: compare the work with the goal, then report what was done and what wasn't.`;
+    : `${head} Every item is done: compare the work with the goal, then tell the user what was done and what wasn't, in their terms: they don't see the plan's items or checks.`;
 }
 
 function resummaryNote(contract) {
@@ -1226,6 +1225,7 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
   const has = name => tools.includes(name);
   const reminded = new Set(), seen = new Set();
   let pending = [], idle = 0, asked = false, dirty = false, workspace = null;
+  const sources = new Set();
   let queue = Promise.resolve();
   const serial = fn => { const p = queue.then(fn); queue = p.catch(() => {}); return p; };
 
@@ -1251,7 +1251,8 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
     if (!ws?.commit || (!contract.goal && !contract.items.length)) return;
     try {
       ws.setContext?.({ threadId, agentId });
-      if (!ws.state.project) await ws.ensureProject({ agentId, threadId });
+      // Beside existing work only: a question shouldn't leave a project behind. The thread keeps the contract.
+      if (!ws.state.project) return;
       const text = renderPlan(contract);
       if (ws.state.files["PLAN.md"] !== text) await ws.exclusive(() => ws.commit("PLAN.md", text, { source: "harness" }));
     } catch (e) {
@@ -1341,11 +1342,11 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
 
   const stateFor = (messages, startAt, extra = {}) => {
     const calls = messages.slice(startAt).flatMap(m => m.content ?? []).filter(c => c?.toolUse && c.toolUse.name !== "think").length;
-    const words = String(typed || "").split(/\s+/).filter(Boolean).length;
     const usage = messages.findLast(m => m.role === "assistant" && m.usage)?.usage ?? {};
     return {
       messages, start: startAt, calls, contract, has, idle, asked: asked && contract.questions.some(q => q.answer == null), current: currentItem(contract),
-      sized: calls >= PLAN_AFTER || (words >= LONG_REQUEST && !/\?\s*$/.test(typed.trim())),
+      // By tool calls only: a long request can still be a small fix or a question.
+      sized: calls >= PLAN_AFTER,
       used: (usage.inputTokens || 0) + (usage.cacheReadInputTokens || 0) + (usage.cacheWriteInputTokens || 0),
       summaryAt: modelInfo(modelId).context * COMPACT_AT,
       events: { red: [], done: [], regressed: [], failed: [], same: [] },
@@ -1382,7 +1383,13 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       // A milestone: every check that passed before runs again, and one that fails reopens its item.
       if (s.events.done.length) for (const item of contract.items.filter(i => i.status === "done" && !s.events.done.includes(i)))
         record(item, await runCheck(item.check, env), "milestone", s.events);
-      idle = s.events.done.length || !contract.items.some(i => i.status !== "done" && runnable(i)) ? 0 : idle + 1;
+      // Reading a new source or recording a note is progress; an edit isn't, since an edit loop is what stalls.
+      const learned = (all.at(-2)?.content ?? []).filter(c => c?.toolUse).map(c => c.toolUse).some(c => {
+        const read = c.name === "read_url" ? c.input?.url : c.name === "web_search" ? c.input?.query
+          : c.name === "code" && /fetch\(|web\.(read|search)/.test(c.input?.source ?? "") ? c.input.source : null;
+        return (read && !sources.has(read) && sources.add(read)) || (c.name === "plan" && c.input?.note);
+      });
+      idle = s.events.done.length || learned || !contract.items.some(i => i.status !== "done" && runnable(i)) ? 0 : idle + 1;
       Object.assign(s, { idle, current: currentItem(contract) });
       await save();
       return fire("step", s);

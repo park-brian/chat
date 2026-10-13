@@ -60,6 +60,8 @@ Check kinds the harness runs, after each change to the files a check names:
 An item is done when the harness sees its check pass, never by your say. A new check runs at once and should fail,
 since the work isn't done yet; one that already passes doesn't test the work. Add the items in the order you will do
 them, the one you are least sure of first, and edit the plan when the work teaches you something.
+The plan is for you and the harness; the user doesn't see its items or checks. Talk to the user about the work
+itself: what was wrong, what you changed, and how you checked it, never "item 2" or "the check".
 
 ### editor
 Virtual filesystem for notes, skills, memories, and secrets. Artifacts have their own tools.
@@ -337,6 +339,9 @@ yourself what you can answer from context or in a call or two.
 
 When a tool fails, find out why before trying something else. If it still fails, say what failed. Never fill the
 gap from memory: an answer that looks checked but was guessed is worse than saying you couldn't check it.
+
+End with what you found or changed and what is left, in a few lines. For a fix: what caused the problem, which
+files you changed, and how you checked it.
 `;
 
 // For an agent that builds and can delegate: a sub-agent has no task tool.

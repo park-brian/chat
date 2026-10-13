@@ -1345,3 +1345,23 @@ targets (docs/specs/2026-10-12-director.md): state the goal, the assumptions and
 What this says about the harness: no stopping rule (both long runs kept revising finished work), parallel
 sub-agents abandoned mid-run, no way to stop runaway code, and an eval that discards unfinished runs. The director's
 "every item done: report" rule, loop protection in the code tool, and grading unfinished runs from disk are next.
+
+## The director, first run (de36eda, Haiku 5.5 ×3; Gemini 3.8 Flash ×1)
+
+Haiku against the latest baseline: intent 0.85 (0.84), answer-hard 0.89 (0.88), research 0.99 (0.98), swe 0.88
+(0.97), inner 0.88 (1.00), long 0.77 with all three finished (two of three hit 60 minutes before). Gemini: intent
+on the same five tasks 0.82 (0.82), answer-hard 0.88 (0.91), single runs.
+
+- **The contract leaked into the replies.** swe's losses are in the final message: "Item 1 passes now. Items 2 and
+  3 were not re-run this turn." The injections speak in items and checks, and Haiku answers in kind; the user
+  never sees the plan. Fix: the plan doc and the all-done note say to talk about the work in the user's terms,
+  and WORKING regains its closing rule (what caused it, which files, how it was checked), which the director
+  rewrite had dropped.
+- **It started on small work.** The 100-word request trigger set a goal on fix-bug (a two-test fix: four plan
+  calls, then a rewrite instead of edits) and on codebase-questions (a question; the harness wrote PLAN.md, which
+  failed "no artifact"). Fix: start on tool calls only (8 in a turn); write PLAN.md only when the chat already has
+  a project, keeping the contract on the thread otherwise; graders don't count PLAN.md or SPEC.md as artifacts.
+- **The stall rule fired on research.** Gemini's report items had file checks that pass only once report.md is
+  written, so "no check has passed in 6 steps" fired twice while it was reading sources. Fix: a new source read or
+  a note recorded counts as progress; edits don't, since an edit loop is what the rule is for.
+- **Long work now finishes.** All three long tasks ended inside their limits.

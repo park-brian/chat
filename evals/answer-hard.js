@@ -4,7 +4,7 @@
 import { mannered, prose, wordCount } from "./style.js";
 import { lookups, lookedUp, numbers } from "./research.js";
 
-const noArtifact = run => [!Object.keys(run.files ?? {}).some(p => !p.startsWith("scratch/")), "no artifact"];
+const noArtifact = run => [!Object.keys(run.files ?? {}).some(p => !p.startsWith("scratch/") && !["PLAN.md", "SPEC.md"].includes(p.split("/").pop())), "no artifact"];
 const atMost = (text, n) => [wordCount(text) <= n, `at most ${n} words (${wordCount(text)})`];
 
 // Text compared as words: case, punctuation, markdown and the escapes of JSON-encoded tool output fall away, so a

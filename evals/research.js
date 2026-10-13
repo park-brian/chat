@@ -22,7 +22,7 @@ const computed = run => {
 // digits stand as they are, so a pattern over the joined results finds it.
 const inResults = (run, re, what) => [re.test(run.results ?? ""), `${what} appears in tool output`];
 const hasNumber = (text, want, tol = 0) => numbers(text).some(n => Math.abs(n - want) <= tol);
-const noArtifact = run => [!Object.keys(run.files ?? {}).some(p => !p.startsWith("scratch/")), "no artifact"];
+const noArtifact = run => [!Object.keys(run.files ?? {}).some(p => !p.startsWith("scratch/") && !["PLAN.md", "SPEC.md"].includes(p.split("/").pop())), "no artifact"];
 
 // What every research answer should look like; the judge also adds the plain-writing criterion.
 const RUBRIC = [

@@ -6086,7 +6086,7 @@ if (window.__HARNESS__?.test) (async () => {
             const md = ws.state.files["PLAN.md"];
             assert(md.includes("- [x] 2. Todo") && md.includes("- [ ] 1. Notes") && md.includes("1 of 2 items done"), `PLAN.md follows the checks: ${md}`);
             const all = await step([["notes.md", "alpha"]]);
-            assert(all[0].includes("Every item is done: compare the work with the goal, then report what was done and what wasn't."), JSON.stringify(all));
+            assert(all[0].includes("Every item is done: compare the work with the goal, then tell the user what was done and what wasn't, in their terms: they don't see the plan's items or checks."), JSON.stringify(all));
           } finally {
             ws.dispose();
           }
@@ -6116,11 +6116,11 @@ if (window.__HARNESS__?.test) (async () => {
         async function testDirectorRules() {
           const GOAL = "This is long work, so the harness keeps a contract";
           const count = (notes, start) => notes.filter(n => n.startsWith(start)).length;
-          // The size threshold: eight calls in a turn, or a long request that isn't a question.
+          // The size threshold: eight calls in a turn. A long request alone is not enough: it can be a small fix.
           assert(count((await directedTurn({ script: [...calls(9), reply("Done.")] })).notes, GOAL) === 1, "eight calls and no goal: once");
           assert(count((await directedTurn({ script: [...calls(7), reply("Done.")] })).notes, GOAL) === 0, "seven: none");
           const long = Array.from({ length: 110 }, (_, i) => "word" + i).join(" ");
-          assert(count((await directedTurn({ script: [...calls(1), reply("Done.")], text: long + "." })).notes, GOAL) === 1, "a long request: at its first step");
+          assert(count((await directedTurn({ script: [...calls(1), reply("Done.")], text: long + "." })).notes, GOAL) === 0, "a long request alone: no");
           assert(count((await directedTurn({ script: [...calls(1), reply("Done.")], text: long + "?" })).notes, GOAL) === 0, "a long question: no");
           assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], contract: withItems(item(1, { kind: "source", text: "probe" })) })).notes, GOAL) === 0, "with a goal: no");
           // Goal set, no items.

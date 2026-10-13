@@ -171,7 +171,7 @@ const JS = /^(js|javascript|mjs|cjs)?$/i;
 export const replies = run => (run.dialogue ?? []).reduce((out, m) => (m.role === "user" ? out.push("") : out.length && (out[out.length - 1] += m.text), out), []);
 const tools = run => run.calls.filter(c => c.name !== "think");
 const noTools = run => [tools(run).length === 0, `no tool calls (${tools(run).map(c => c.name).join(", ") || "none"})`];
-const noArtifact = run => [!Object.keys(run.files).some(p => !p.startsWith("scratch/")), "no artifact"];
+const noArtifact = run => [!Object.keys(run.files).some(p => !p.startsWith("scratch/") && !["PLAN.md", "SPEC.md"].includes(p.split("/").pop())), "no artifact"];
 const atMost = (text, n) => [wordCount(text) <= n, `at most ${n} words (${wordCount(text)})`];
 
 // A JavaScript snippet from an answer, run in a fresh context with expr evaluated after it. Module syntax is dropped.
