@@ -1325,3 +1325,23 @@ theme (habits), whether the signature must stay (cleanup, 3 of 3), the date to r
 (photos). The trip plan takes 5-6 user turns because each constraint comes out as a correction after a draft; the
 cover letter adds achievements the user never gave. This is the hypothesis loop the director's Understand phase
 targets (docs/specs/2026-10-12-director.md): state the goal, the assumptions and what done means before building.
+
+## long tier baseline (2026-10-12, Haiku 5.5 ×1, before the director)
+
+- **long-lisp: the interpreter works; the run was lost.** lisp.js v1 (732 lines, with a 102-case test file) passes
+  all 167 hidden programs and the 9 optional macros, graded from the last saved request. Afterwards code run by a
+  review sub-agent looped forever on the page thread: the code tool's timeout can't interrupt a synchronous loop,
+  the tab froze and eval.js's final read hung. Lisp at this spec is at the ceiling for Haiku; it needs a vaguer
+  spec or harder groups to be a capability task.
+- **long-novella: 14/18 regraded, unfinished at 60 min.** 12 chapters (1,357-1,798 words) and the required ending.
+  Two contradictions (chapter 3 moves a cut from palm to hand; chapter 12 has a character arrive by ferry who never
+  left), one unresolved thread, similes that fail plain writing. It split chapters across 6 sub-agents, moved on
+  while 4 were still running, then trimmed, reviewed and revised until time ran out with all chapters on disk.
+  Sub-agents ran to 60 messages and 1.3-3.7M input tokens each; the run used 23M input tokens.
+- **long-research: 15/15 regraded.** 254 with RFC 5321 and the erratum cited, a 19-source PLAN.md; it read pages
+  in code and printed excerpts. Two grader faults fixed (pages fetched in code weren't visible to the numbers
+  check; a quote of the trap sentence counted as repeating it). The trap is too easy as written.
+
+What this says about the harness: no stopping rule (both long runs kept revising finished work), parallel
+sub-agents abandoned mid-run, no way to stop runaway code, and an eval that discards unfinished runs. The director's
+"every item done: report" rule, loop protection in the code tool, and grading unfinished runs from disk are next.
