@@ -1,6 +1,6 @@
 // Runs the chat harness against real models on fixed tasks, grades each run, and keeps every transcript.
 // npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout | swe | research | answer-hard | intent | long] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
-//                 [--system persona.md] [--baseline run-id] [--reasoning off|low|medium|high (default)|xhigh|max] [--headed] [--yes (needed above MAX_UNCONFIRMED jobs)]
+//                 [--system persona.md] [--baseline run-id] [--reasoning off|low|medium (default)|high|xhigh|max] [--headed] [--yes (needed above MAX_UNCONFIRMED jobs)]
 //                 [--flags name=value,... (the app's feature flags: FLAGS below)]
 // A task with a rubric is also graded by a judge model (evals/judge.js); its criteria join the checks.
 import { readFileSync } from "node:fs";
@@ -66,7 +66,7 @@ export function parseFlags(text, rules = null) {
 export const flagsText = flags => (flags && Object.keys(flags).length ? Object.entries(flags).map(([k, v]) => `${k}=${v}`).join(",") : "none");
 
 export function options(argv, tasks = TASKS) {
-  const o = { tasks: "inner", models: "haiku", repeat: 1, concurrency: 3, system: null, baseline: null, reasoning: "high", flags: "", headed: false, yes: false };
+  const o = { tasks: "inner", models: "haiku", repeat: 1, concurrency: 3, system: null, baseline: null, reasoning: "medium", flags: "", headed: false, yes: false };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i].startsWith("--") ? argv[i].slice(2) : null;
     if (flag === "headed" || flag === "yes") o[flag] = true;

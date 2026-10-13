@@ -25,6 +25,7 @@ every repeat), cost (input tokens in uncached equivalents), seconds, and task-sp
 | B1 | A rule in the system prompt is followed less than the same rule injected at the right moment | E3: plan file 0/3 with the prompt rule, 3/3 with an injection after 8 calls | tentative (n=3, one task) |
 | B2 | Models report in the vocabulary of the process they run; removing one trigger doesn't stop it | E6: leak 0-2/21 before the director, 15/21 with it; E6b: removing the strongest trigger left it at 11-12/21 | strong (the cause is the process, not one note) |
 | B9 | Asking the model to change wording rarely holds; checking the output and asking for a fix might | E4b (wording) 15 → 11; E6b (rule change) 11 → 11-12; E6c pending | tentative |
+| B11 | For Haiku 5.5, effort medium is better than high on agentic work, not just cheaper | E24 games 1.00 vs 0.94 at a third to half the time; swe 0.94 vs 0.92 at -40% time, no timeouts vs 3 | strong (two tiers, tier-level) |
 | B10 | An affordance (a tool that makes the right action easy) changes behavior more than an instruction | E10: a way to run test files cut test-running confusion 11-16 → 3/21, claim failures to 0, leak 11-12 → 5/21, swe +4 | strong (tier-level, mechanism in transcripts) |
 | B3 | Tool error messages steer behavior | E4c: "No project is open yet. Create the app with write_file" preceded a 2,317-line app for a prose request | one transcript |
 | B4 | Making the model compute with code fixes counting errors | E1: arxiv 0.64 → 0.97, lodash 0.85 → 1.00 | moderate (two tasks, ×3) |
@@ -390,6 +391,10 @@ experiments, each against the noise floor from E5.
   bug found by a result that looked like a regression, after E2's lodash key and E1's rubric).
 - **Next:** swe ×3 at high and ×3 at medium with the fixed graders: the shell's true swe score, and whether medium
   holds on bug fixes before it becomes Haiku's default.
+- **Result (fixed graders):** high 0.92 over 18 graded (3 unfinished: timeouts), pass^k 0/6, 480 s in total;
+  medium 0.94 over 21, pass^k 1/7, 291 s (-40%), none unfinished. The shell holds swe at the E10 level (0.95)
+  within noise: no gain on small fixes, no loss. medium equals or beats high on swe and beats it on games
+  (+6, half the time): **medium is now Haiku's default effort, in the app and in evals** (B11).
 
 ### E21 (part). GitHub projects against a real repository
 

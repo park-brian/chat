@@ -1737,7 +1737,7 @@
 
       function InputForm(props) {
         // The level chosen is kept across models; each model runs at the nearest one it accepts.
-        const [level, setLevel] = createSignal(localStorage.getItem(REASONING_KEY) || "high");
+        const [level, setLevel] = createSignal(localStorage.getItem(REASONING_KEY) || "medium");
         const [model, setModel] = createSignal(DEFAULT_MODEL);
         const levels = () => modelInfo(model()).levels ?? ["off"];
         const shownLevel = () => reasoningLevel(modelInfo(model()), level());
