@@ -1,7 +1,9 @@
 // Runs the chat harness against real models on fixed tasks, grades each run, and keeps every transcript.
 // npm run eval -- [--tasks a,b | inner | holdout | hard | game | answer | answer-holdout | swe | research | answer-hard | intent | long] [--models haiku (default) | haiku,sonnet,opus,luna,gemini | all] [--repeat n] [--concurrency n]
 //                 [--system persona.md] [--baseline run-id] [--reasoning off|low|medium|high (default)|xhigh|max] [--headed] [--yes (needed above MAX_UNCONFIRMED jobs)]
+//                 [--flags name=value,... (the app's feature flags: FLAGS below)]
 // A task with a rubric is also graded by a judge model (evals/judge.js); its criteria join the checks.
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,8 +41,31 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 export const SETS = ["inner", "holdout", "hard", "game", "answer", "answer-holdout", "swe", "research", "answer-hard", "intent", "long"];
 const LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
+// Feature flags, so an ablation needs no code change: the app reads them from localStorage "harness-flags" (engine.js
+// flag()). Each is a no-op at its default; rule.<id>=off silences one rule of engine.js's rule tables.
+export const FLAGS = { director: ["on", "off"], effort: LEVELS, "plan.where": ["inject", "prompt"], noProjectError: ["new", "old"], context: "tokens" };
+// The rule ids, read from engine.js's tables ({ id: "...", at: ... }), so a new rule needs no change here.
+export const ruleIds = (source = readFileSync(path.join(root, "engine.js"), "utf8")) => [...new Set([...source.matchAll(/\{ id: "([\w-]+)", at: "/g)].map(m => m[1]))];
+export function parseFlags(text, rules = null) {
+  const flags = {};
+  for (const pair of String(text).split(",").map(p => p.trim()).filter(Boolean)) {
+    const [, name, value] = pair.match(/^([\w.-]+)=([\w.-]+)$/) ?? fail(`--flags takes name=value pairs, got "${pair}"`);
+    if (Object.hasOwn(flags, name)) fail(`--flags sets ${name} twice`);
+    if (name.startsWith("rule.")) {
+      if (!(rules ??= ruleIds()).includes(name.slice(5))) fail(`Unknown rule in --flags: ${name.slice(5)} (rules: ${rules.join(", ")})`);
+      if (!["on", "off"].includes(value)) fail(`--flags ${name} must be on or off, got ${value}`);
+    } else if (!Object.hasOwn(FLAGS, name)) fail(`Unknown flag: ${name} (flags: ${Object.keys(FLAGS).join(", ")}, rule.<id>)`);
+    else if (FLAGS[name] === "tokens") {
+      if (!/^[1-9]\d*$/.test(value) || +value < 1000) fail(`--flags ${name} must be a token count of 1000 or more, got ${value}`);
+    } else if (!FLAGS[name].includes(value)) fail(`--flags ${name} must be one of ${FLAGS[name].join(", ")}, got ${value}`);
+    flags[name] = value;
+  }
+  return flags;
+}
+export const flagsText = flags => (flags && Object.keys(flags).length ? Object.entries(flags).map(([k, v]) => `${k}=${v}`).join(",") : "none");
+
 export function options(argv, tasks = TASKS) {
-  const o = { tasks: "inner", models: "haiku", repeat: 1, concurrency: 3, system: null, baseline: null, reasoning: "high", headed: false, yes: false };
+  const o = { tasks: "inner", models: "haiku", repeat: 1, concurrency: 3, system: null, baseline: null, reasoning: "high", flags: "", headed: false, yes: false };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i].startsWith("--") ? argv[i].slice(2) : null;
     if (flag === "headed" || flag === "yes") o[flag] = true;
@@ -57,7 +82,7 @@ export function options(argv, tasks = TASKS) {
   if (!LEVELS.includes(o.reasoning)) fail(`--reasoning must be one of ${LEVELS.join(", ")}, got ${o.reasoning}`);
   const chosen = SETS.includes(o.tasks) ? tasks.filter(t => t.set === o.tasks) : o.tasks === "all" ? tasks : o.tasks.split(",").map(id => tasks.find(t => t.id === id) ?? fail("Unknown task: " + id));
   const models = (o.models === "all" ? Object.keys(MODELS) : o.models.split(",")).map(m => [m, Object.hasOwn(MODELS, m) ? MODELS[m] : fail("Unknown model: " + m)]);
-  return { ...o, tasks: chosen, models, repeat: count("repeat"), concurrency: count("concurrency") };
+  return { ...o, tasks: chosen, models, repeat: count("repeat"), concurrency: count("concurrency"), flags: parseFlags(o.flags) };
 }
 
 // Where a workspace file is written: under files/, or null for a path that would leave it (absolute, "..", a drive)
@@ -285,7 +310,7 @@ async function transcript(messages, dir) {
   return out.join("\n\n");
 }
 
-async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelId], persona, reasoning, dir }) {
+async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelId], persona, reasoning, flags = {}, dir }) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
   // Closed however the run ends: a crash in grading or saving would otherwise leave them open.
   let seeing, fileServer;
@@ -304,6 +329,7 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       "google-config": JSON.stringify({ apiKey: process.env.GEMINI_API_KEY }),
       "brave-config": JSON.stringify({ apiKey: process.env.BRAVE_SEARCH_API_KEY }),
       "proxy-config": JSON.stringify({ endpoint: proxyUrl }),
+      "harness-flags": JSON.stringify(flags),
     });
     // Model requests, as the engine's worker sent them; the last one is kept whole, since it carries the most context.
     const requests = [];
@@ -437,7 +463,7 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
 
     const breaks = prefixBreaks(requests.map(r => r.body));
     run.metrics.prefixBreaks = breaks.length;
-    const result = { task: task.id, model: modelName, modelId, error, ...(partial && { partial }), escaped, unwritten, passed: checks.filter(c => c.ok).length, total: checks.length, checks, unjudged, judgeError: verdict?.error ?? null, flourishHits: style.hits, metrics: run.metrics, user: user && { done: user.done, userTurns: user.userTurns, said: user.said }, errors: errors.slice(0, 5), netErrors: netErrors.slice(0, 20), requests: requests.length, requestBytes: requests.map(r => r.body.length), breaks };
+    const result = { task: task.id, model: modelName, modelId, flags, error, ...(partial && { partial }), escaped, unwritten, passed: checks.filter(c => c.ok).length, total: checks.length, checks, unjudged, judgeError: verdict?.error ?? null, flourishHits: style.hits, metrics: run.metrics, user: user && { done: user.done, userTurns: user.userTurns, said: user.said }, errors: errors.slice(0, 5), netErrors: netErrors.slice(0, 20), requests: requests.length, requestBytes: requests.map(r => r.body.length), breaks };
     await writeFile(path.join(dir, "result.json"), JSON.stringify({ ...result, persona: data.persona, messages, subagents, summary: main?.summary ?? null }, null, 1));
     if (requests.length) await writeFile(path.join(dir, "request.json"), requests.at(-1).body);
     await writeFile(path.join(dir, "transcript.md"), `# ${task.id} · ${modelName}\n\n${[...checks.map(c => `- [${c.ok ? "x" : " "}] ${c.label}${c.reason ? ` — ${c.reason}` : ""}`), ...unjudged.map(u => `- [?] judge: ${u.criterion} (unjudged: ${u.reason})`)].join("\n")}\n\n\`${JSON.stringify(run.metrics)}\`\n` + (user ? `\nsimulated user: ${user.done ? "DONE" : "no DONE"} after ${user.userTurns} user turns\n` : "") + (await transcript(messages, dir)));
@@ -450,7 +476,7 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
   }
 }
 
-function table(results, baseline) {
+function table(results, baseline, flags) {
   const before = Object.groupBy((baseline ?? []).filter(graded), rowKey);
   const strict = new Map(passK(results).rows.map(r => [r.key, r.passAll]));
   const rows = Object.entries(Object.groupBy(results.filter(graded), rowKey)).map(([k, runs]) => {
@@ -463,6 +489,7 @@ function table(results, baseline) {
   console.table(rows);
   const now = summarize(results);
   console.log(meanLine(results, baseline));
+  console.log(`flags: ${flagsText(flags)}` + (baseline ? ` (baseline: ${flagsText(baseline.find(r => r.flags)?.flags)})` : ""));
   for (const r of now.crashed) console.log(`CRASHED ${r.task} ${r.model}: ${r.crashed}`);
   for (const r of now.unfinished) console.log(`UNFINISHED ${r.task} ${r.model}: ${r.error}${partialNote(r)}`);
   for (const r of results.filter(r => r.unjudged?.length)) console.log(`UNJUDGED ${r.task} ${r.model}: ${r.unjudged.length} criteria left out of the score (${r.judgeError})`);
@@ -471,7 +498,7 @@ function table(results, baseline) {
 async function main() {
   const o = options(process.argv.slice(2));
   const jobs = o.models.flatMap(model => o.tasks.flatMap(task => Array.from({ length: o.repeat }, (_, i) => ({ task, model, i }))));
-  console.log(`${jobs.length} jobs: ${o.tasks.length} tasks x ${o.models.length} models x ${o.repeat}, reasoning ${o.reasoning}`);
+  console.log(`${jobs.length} jobs: ${o.tasks.length} tasks x ${o.models.length} models x ${o.repeat}, reasoning ${o.reasoning}, flags ${flagsText(o.flags)}`);
   if (jobs.length > MAX_UNCONFIRMED && !o.yes) {
     console.error(`More than ${MAX_UNCONFIRMED} jobs call paid APIs; pass --yes to run them.`);
     process.exit(2);
@@ -501,7 +528,7 @@ async function main() {
   const browser = await chromium.launch({ headless: false, args: ["--auto-accept-this-tab-capture", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--disable-background-timer-throttling", ...(o.headed ? [] : ["--window-position=-32000,-32000"])] });
   const base = `http://localhost:${server.address().port}/`;
   const proxyUrl = `http://localhost:${proxy.address().port}`;
-  console.log(`eval ${runId}: ${jobs.length} runs`);
+  console.log(`eval ${runId}: ${jobs.length} runs, flags ${flagsText(o.flags)}`);
   const results = [];
   const queue = [...jobs];
   await Promise.all(Array.from({ length: o.concurrency }, async () => {
@@ -509,8 +536,8 @@ async function main() {
       const dir = path.join(root, ".artifacts", "evals", runId, job.model[0], job.task.id + (o.repeat > 1 ? `-${job.i + 1}` : ""));
       await mkdir(dir, { recursive: true });
       // One run's crash is recorded and the others go on.
-      const result = await runOne({ browser, base, proxyUrl, persona, reasoning: o.reasoning, dir, ...job }).catch(e => ({
-        task: job.task.id, model: job.model[0], modelId: job.model[1], crashed: String(e?.stack || e).split("\n").slice(0, 3).join(" | "), passed: 0, total: 0, checks: [],
+      const result = await runOne({ browser, base, proxyUrl, persona, reasoning: o.reasoning, flags: o.flags, dir, ...job }).catch(e => ({
+        task: job.task.id, model: job.model[0], modelId: job.model[1], flags: o.flags, crashed: String(e?.stack || e).split("\n").slice(0, 3).join(" | "), passed: 0, total: 0, checks: [],
       }));
       if (result.crashed) console.log(`CRASH ${job.task.id} ${job.model[0]} ${result.crashed}`);
       else if (result.error) console.log(`UNFINISHED ${job.task.id} ${job.model[0]} ${result.error}${partialNote(result)}`);
@@ -519,7 +546,7 @@ async function main() {
     }
   }));
   await writeFile(path.join(root, ".artifacts", "evals", runId, "results.json"), JSON.stringify(results, null, 1));
-  table(results, baseline);
+  table(results, baseline, o.flags);
   console.log(`transcripts: .artifacts/evals/${runId}/`);
   await browser.close();
   // A run that crashed or stopped before its turns finished is a harness failure, not a grade.

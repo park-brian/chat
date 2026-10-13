@@ -1,7 +1,7 @@
 // eval.js's pure helpers and the graders' CDN check, without a browser or a model.
 import assert from "node:assert/strict";
 import path from "node:path";
-import { bounded, dialogue, filePath, MAX_UNCONFIRMED, meanLine, options, partialNote, passK, summarize } from "../eval.js";
+import { bounded, dialogue, filePath, flagsText, MAX_UNCONFIRMED, meanLine, options, parseFlags, partialNote, passK, ruleIds, summarize } from "../eval.js";
 import TASKS, { numbers, pinsJsdelivr, replies } from "./tasks.js";
 import { criteriaOf, judge, judgedChecks, judgePrompt, JUDGE_MODEL, PLAIN } from "./judge.js";
 import { FLOURISHES, mannered, wordCount } from "./style.js";
@@ -78,6 +78,21 @@ assert.deepEqual(options(["--tasks", "answer-holdout"], sets).tasks.map(t => t.i
 assert.equal(options([], sets).reasoning, "high");
 assert.equal(options(["--reasoning", "off"], sets).reasoning, "off");
 assert.throws(() => options(["--reasoning", "loud"], sets));
+
+// Feature flags: validated name=value pairs, none by default; the rule ids are read from engine.js's tables.
+assert.deepEqual(options([], sets).flags, {});
+assert.deepEqual(options(["--flags", "director=off,rule.stalled=off,effort=medium"], sets).flags, { director: "off", "rule.stalled": "off", effort: "medium" });
+assert.deepEqual(parseFlags(" plan.where=prompt , context=50000,noProjectError=old,rule.unplanned=on "), { "plan.where": "prompt", context: "50000", noProjectError: "old", "rule.unplanned": "on" });
+assert.deepEqual(parseFlags(""), {});
+const ids = ruleIds();
+for (const id of ["polished", "goal", "red", "stalled", "open", "summary", "unplanned", "silent", "failing", "untested", "unadopted"]) assert.ok(ids.includes(id), `rule ${id} is found in engine.js: ${ids}`);
+assert.deepEqual(ruleIds('const R = [{ id: "a", at: "step" }, { id: "b-c", at: "stop" }, { id: "a", at: "stop" }]; x({ id: "nope" })'), ["a", "b-c"]);
+for (const bad of ["director", "director=maybe", "dirctor=off", "effort=loud", "rule.nope=off", "rule.stalled=no", "context=0", "context=999", "context=12k", "plan.where=system", "noProjectError=older", "director=off,director=on", "a=b=c", "toString=x"])
+  assert.throws(() => parseFlags(bad), undefined, bad);
+assert.throws(() => options(["--flags", "effort=loud"], sets));
+assert.equal(flagsText({}), "none");
+assert.equal(flagsText(undefined), "none");
+assert.equal(flagsText({ director: "off", effort: "low" }), "director=off,effort=low");
 for (const t of TASKS.filter(t => /^answer/.test(t.set))) {
   assert.ok(Array.isArray(t.rubric) && t.rubric.length && t.rubric.every(c => typeof c === "string"), t.id + " has a rubric");
   assert.ok(t.turns.length && typeof t.check === "function", t.id);

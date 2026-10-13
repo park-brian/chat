@@ -66,7 +66,8 @@ function systemPrompt(persona, { tools = [], memories = null, modelId = null } =
     today: new Date().toLocaleDateString("en-CA"),
     cutoff: cutoff ? ` What you know comes from data up to ${cutoff}.` : "",
   });
-  return [persona, memories, environment, WORKING, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
+  const working = WORKING + (planInPrompt(tools) ?? "");
+  return [persona, memories, environment, working, delegating, guide.join("\n"), artifacts, network].filter(Boolean).join("\n");
 }
 
 // /memories/ as the conversation found it. Taken once per thread: the prompt stays byte-stable for the cache,
@@ -150,7 +151,7 @@ const SUBAGENT_TYPES = ["fork", "variant", "part", "explore", "plan", "general",
 const SUBAGENT_MODELS = MODELS.filter(m => m.group !== "Test").map(m => m.label);
 const modelInfo = id => {
   const info = { maxTokens: 32_000, window: 200_000, cache: true, documents: true, beside: false, ...(MODELS.find(m => m.id === id) ?? { id, ...(/anthropic/.test(id) && CLAUDE_BUDGET) }) };
-  return { ...info, context: Math.min(info.context ?? CONTEXT, info.window) };
+  return { ...info, context: Math.min(Number(flag("context")) || (info.context ?? CONTEXT), info.window) };
 };
 // The level a model runs at: the one asked for, or the nearest it accepts.
 function reasoningLevel(model, level) {
@@ -938,8 +939,9 @@ function unplannedTask(messages, start, files, shown = null) {
   if (calls < PLAN_AFTER) return null;
   const folder = shown?.includes("/") ? shown.slice(0, shown.lastIndexOf("/") + 1) : "";
   if (files.some(p => PLAN_FILES.some(name => p === name || p === folder + name))) return null;
-  return "This task is long. Write PLAN.md now with write_file (SPEC.md if you are building an app): the goal in the user's words, the steps with the check for each, what is done, and what you learned with the URL or file it came from. Then continue.";
+  return PLAN_NOTE;
 }
+const PLAN_NOTE = "This task is long. Write PLAN.md now with write_file (SPEC.md if you are building an app): the goal in the user's words, the steps with the check for each, what is done, and what you learned with the URL or file it came from. Then continue.";
 
 // The note for a reply that ended in thought alone, with no text and no call, or null.
 function silentReply(messages) {
@@ -1216,10 +1218,33 @@ const DIRECTOR_RULES = [
   { id: "open", at: "stop", every: "turn", note: s => s.calls && openItemsNote(s.contract, s.asked) },
   { id: "summary", at: "summary", every: "event", note: s => resummaryNote(s.contract) },
 ];
+// director=off: the six reminders as the loop had them before the director (5f2e583), each once a turn. The plan
+// tool is withheld too (getConverseCommand), so no contract starts and no contract rule speaks.
+const ruleOf = id => DIRECTOR_RULES.find(r => r.id === id);
+const PRE_DIRECTOR_RULES = [
+  ruleOf("polished"),
+  { id: "unplanned", at: "step", every: "turn", note: s => s.has("write_file") && s.ws && unplannedTask(s.messages, s.start, s.files, s.shown) },
+  ...["silent", "failing", "untested", "unadopted"].map(ruleOf),
+];
+// The plan-keeping note, said after PLAN_AFTER calls: the director's goal note, or, with no plan tool, the plan file.
+const PLAN_RULES = ["goal", "unplanned"];
+// The rules a run reads, by the flags: director=off, rule.<id>=off, and plan.where=prompt (the plan note is in the
+// system prompt instead, so it isn't injected too).
+function activeRules() {
+  const rules = flag("director") === "off" ? PRE_DIRECTOR_RULES : DIRECTOR_RULES;
+  return rules.filter(r => flag("rule." + r.id) !== "off" && !(flag("plan.where") === "prompt" && PLAN_RULES.includes(r.id)));
+}
+// plan.where=prompt (E7): the note the plan rule would inject, in WORKING instead, said for when it applies.
+function planInPrompt(tools) {
+  if (flag("plan.where") !== "prompt") return null;
+  const rule = tools.includes("plan") ? "goal" : tools.includes("write_file") ? "unplanned" : null;
+  if (!rule || flag("rule." + rule) === "off") return null;
+  return `\nOnce a task has taken ${PLAN_AFTER} tool calls (think aside) and has no plan yet: ${rule === "goal" ? GOAL_NOTE : PLAN_NOTE}\n`;
+}
 
 // One per run (a turn): the thread's contract, the rules, and what they have said. messages: the run's messages as
 // they stand. tools: the names of the tools the run has.
-async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = DIRECTOR_RULES } = {}) {
+async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules() } = {}) {
   const thread = threadId != null ? await db.get("threads", threadId) : null;
   const contract = { ...emptyContract(), ...structuredClone(thread?.contract ?? {}) };
   const has = name => tools.includes(name);
@@ -1540,7 +1565,8 @@ async function projectHeads(db, threadId) {
 function getConverseCommand(config) {
   const model = modelInfo(config.modelId);
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
-  const tools = config.tools.map(({ toolSpec }) => ({ toolSpec }));
+  // director=off: no plan tool, as before the director.
+  const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec }));
   const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId });
   return {
     modelId: config.modelId,
@@ -1549,7 +1575,8 @@ function getConverseCommand(config) {
     system: [{ text: system }, ...cachePoint],
     toolConfig: { tools },
     inferenceConfig: { maxTokens: model.maxTokens },
-    additionalModelRequestFields: reasoningFields(model, config.reasoningMode),
+    // effort=<level> holds every call of the run at one level: the main loop's, sub-agents', summaries'.
+    additionalModelRequestFields: reasoningFields(model, flag("effort", config.reasoningMode)),
   };
 }
 
@@ -1948,10 +1975,15 @@ export function getGeminiClient(client) {
 // Credentials and the proxy are set in Settings and kept in localStorage. A worker has none: each tab sends its
 // settings with every command, and again when another tab changes them; the latest copy stands in. The proxy sent
 // is the stored one: the worker finds the local proxy itself.
-const SETTING_KEYS = ["aws-config", "google-config", "brave-config"];
+const FLAGS_KEY = "harness-flags"; // localStorage: { name: value }, the experiment's feature flags
+const SETTING_KEYS = ["aws-config", "google-config", "brave-config", FLAGS_KEY];
 const settings = { items: {}, proxy: null };
 const setting = key => globalThis.localStorage ? localStorage.getItem(key) : settings.items[key] ?? null;
 const storedJSON = key => { try { return JSON.parse(setting(key) || "null"); } catch { return null; } };
+// A feature flag, or its default. Set per eval run (eval.js --flags) so an ablation needs no code change; each flag
+// is a no-op at its default. director=off, rule.<id>=off, plan.where=prompt: activeRules and systemPrompt.
+// effort=<level>: getConverseCommand. context=<tokens>: modelInfo. noProjectError=old: workspaceFor.
+const flag = (name, fallback = null) => { const value = storedJSON(FLAGS_KEY)?.[name]; return value == null ? fallback : String(value); };
 const snapshotSettings = () => ({ items: Object.fromEntries(SETTING_KEYS.map(key => [key, setting(key)])), proxy: storedProxyConfig() });
 const applySettings = ({ items, proxy }) => Object.assign(settings, { items, proxy });
 
@@ -3892,7 +3924,8 @@ async function workspaceFor(context, { create = false } = {}) {
   if (!ws) throw new Error("No workspace is available here.");
   ws.setContext({ threadId: context.threadId, agentId: context.agentId });
   if (!ws.state.project) {
-    if (!create) throw new Error("No project is open: there are no files yet.");
+    // noProjectError=old is the text before da412ed, which preceded a 2,317-line app for a prose plan (E9).
+    if (!create) throw new Error(flag("noProjectError") === "old" ? "No project is open yet. Create the app with write_file." : "No project is open: there are no files yet.");
     await ws.ensureProject({ agentId: context.agentId, threadId: context.threadId });
   }
   return ws;
@@ -4306,7 +4339,7 @@ if (inSharedWorker) {
 // #endregion
 
 export {
-  CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
+  CAPTURE_CHOICE_KEY, CDN, CORS_BLOCKED, DB_VERSION, DEFAULT_MODEL, DIRECTOR_RULES, FLAGS_KEY, PRE_DIRECTOR_RULES, activeRules, flag, LOCAL_PROXY, MEMORY_BUDGET, MODELS, PROTOCOL,
   PROXY_CONFIG_KEY, TOOLS, VIEWPORTS, WORKSPACE_TOOL_NAMES, appendReasoning, applyEdits, blobCache, contractState, contradictedClaim,
   countLines, countRepeats, createDirector, createWorkspace, describeCheck, editFile, editor, renderPlan, runCheck, ensureDefaultAgent, escapeHtml, failingReport, forkOf, getBlob, getContentBlock,
   getConverseClient, getConverseCommand, getProxyConfig, getToolResults, guardLoops, initDB, inspectArgs, isHtml, isLocalHost,

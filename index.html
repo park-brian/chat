@@ -3341,7 +3341,7 @@
       if (new URLSearchParams(window.location.search).get("test") === "1" || window.__HARNESS__?.test) {
         // The engine's internals the tests reach for, beside what the app imports.
         const {
-          DIRECTOR_RULES, MEMORY_BUDGET, TOOLS, appendReasoning, applyEdits, blobCache, buildMessageTree, contradictedClaim,
+          DIRECTOR_RULES, FLAGS_KEY, PRE_DIRECTOR_RULES, activeRules, flag, modelInfo, snapshotSettings, MEMORY_BUDGET, TOOLS, appendReasoning, applyEdits, blobCache, buildMessageTree, contradictedClaim,
           createDirector, editFile, editor, runCheck,
           failingReport, forkOf, getBlob, getContentBlock, getConverseClient, getConverseCommand, getGeminiClient,
           getMostRecentPath, getToolResults, listHistory, mcp, memoriesBlock, missingFiles, normalizePath, outline,
@@ -6154,6 +6154,93 @@ if (window.__HARNESS__?.test) (async () => {
           for (const id of ["polished", "goal", "silent", "failing", "untested", "unadopted"]) assert(DIRECTOR_RULES.some(r => r.id === id), `the old ${id} reminder is a rule`);
         }
 
+        // Why: an ablation is a flag set for one eval run (eval.js --flags), not a worktree; each is a no-op at its default
+        async function testFeatureFlags() {
+          const withFlags = async (flags, fn) => {
+            localStorage.setItem(FLAGS_KEY, JSON.stringify(flags));
+            try { return await fn(); } finally { localStorage.removeItem(FLAGS_KEY); }
+          };
+          const GOAL = "This is long work, so the harness keeps a contract";
+          const count = (notes, start) => notes.filter(n => n.startsWith(start)).length;
+          const stuck = withItems(item(1, { kind: "source", text: "never seen" }));
+          assert(flag("director", "on") === "on" && flag("effort") === null, "no flags: the defaults");
+          assert(eq(activeRules().map(r => r.id), DIRECTOR_RULES.map(r => r.id)), "no flags: every director rule");
+
+          // director=off: the six reminders from before the director, no contract notes, and no plan tool offered.
+          await withFlags({ director: "off" }, async () => {
+            assert(eq(activeRules().map(r => r.id), ["polished", "unplanned", "silent", "failing", "untested", "unadopted"]), `the old reminders: ${activeRules().map(r => r.id)}`);
+            const long = await directedTurn({ script: [...calls(9), reply("Done.")] });
+            assert(count(long.notes, GOAL) === 0, `no goal note: ${JSON.stringify(long.notes)}`);
+            assert(long.sent.every(r => !r.toolConfig.tools.some(t => t.toolSpec.name === "plan") && !r.system[0].text.includes("### plan")), "the plan tool is not offered");
+            const open = await directedTurn({ script: [...calls(7), reply("Done.")], contract: stuck });
+            assert(open.notes.length === 0, `a contract on the thread speaks no note: ${JSON.stringify(open.notes)}`);
+            const eight = Array.from({ length: 8 }, (_, i) => ({ role: "assistant", content: [{ toolUse: { toolUseId: "c" + i, name: "probe", input: {} } }] }));
+            const unplanned = PRE_DIRECTOR_RULES.find(r => r.id === "unplanned").note;
+            const state = { has: n => n === "write_file", ws: {}, messages: eight, start: 0, files: [], shown: null };
+            assert(unplanned(state)?.startsWith("This task is long. Write PLAN.md now") && !unplanned({ ...state, has: () => false }) && !unplanned({ ...state, ws: null }), "the old plan reminder, under its old condition");
+          });
+          // rule.<id>=off silences that rule alone.
+          await withFlags({ "rule.stalled": "off" }, async () => {
+            const notes = (await directedTurn({ script: [...calls(7), reply("Stopping.")], contract: stuck })).notes;
+            assert(count(notes, "No check has passed") === 0 && count(notes, "Item 1 is open") === 1, `stalled is silent, open still speaks: ${JSON.stringify(notes)}`);
+          });
+          await withFlags({ "rule.goal": "off" }, async () => assert(count((await directedTurn({ script: [...calls(9), reply("Done.")] })).notes, GOAL) === 0, "rule.goal=off"));
+          await withFlags({ director: "off", "rule.unplanned": "off" }, async () => assert(!activeRules().some(r => r.id === "unplanned") && activeRules().length === 5, "an old reminder by its id"));
+
+          // effort=<level>: every request at that level, whatever the run asked for.
+          const haiku = reasoningMode => getConverseCommand({ modelId: "global.anthropic.claude-haiku-5-5", reasoningMode, systemPrompt: "P", tools: [], messages: [] }).additionalModelRequestFields;
+          assert(haiku("high").output_config.effort === "high", "no flag: the run's level");
+          await withFlags({ effort: "low" }, async () => {
+            assert(haiku("high").output_config.effort === "low" && haiku("off").output_config.effort === "low", `effort=low: ${JSON.stringify(haiku("high"))}`);
+            // The worker has no localStorage: the flags ride the settings each tab sends it.
+            assert(JSON.parse(snapshotSettings().items[FLAGS_KEY]).effort === "low", "the flags are among the settings sent to the worker");
+          });
+          await withFlags({ effort: "off" }, async () => assert(haiku("high").thinking.type === "disabled", "effort=off"));
+
+          // plan.where=prompt: the plan note in WORKING, and not injected.
+          const AT = "Once a task has taken 8 tool calls (think aside) and has no plan yet: ";
+          assert(!systemPrompt("P", { tools: ["plan"] }).includes(AT), "no flag: not in the prompt");
+          await withFlags({ "plan.where": "prompt" }, async () => {
+            const withPlan = systemPrompt("P", { tools: ["plan", "write_file"] }), withFile = systemPrompt("P", { tools: ["write_file"] });
+            assert(withPlan.includes(AT + GOAL), "with the plan tool: the goal note");
+            assert(withFile.includes(AT + "This task is long. Write PLAN.md now"), "without it: the plan-file note");
+            assert(!systemPrompt("P", { tools: ["code"] }).includes(AT), "an agent that can't write has none");
+            const working = withPlan.indexOf("## Working"), at = withPlan.indexOf(AT), next = withPlan.indexOf("\n## ", working + 1);
+            assert(working >= 0 && at > working && (next < 0 || next > at), "inside WORKING");
+            const run = await directedTurn({ script: [...calls(9), reply("Done.")] });
+            assert(count(run.notes, GOAL) === 0 && run.sent[0].system[0].text.includes(AT + GOAL), `in the system prompt, not injected: ${JSON.stringify(run.notes)}`);
+            assert(!activeRules().some(r => r.id === "goal"), "the goal rule is off");
+          });
+          await withFlags({ director: "off", "plan.where": "prompt" }, async () => assert(!activeRules().some(r => r.id === "unplanned") && getConverseCommand({ modelId: "echo", systemPrompt: "P", tools: TOOLS.filter(t => ["plan", "write_file"].includes(t.toolSpec.name)), messages: [] }).system[0].text.includes(AT + "This task is long."), "director off: the old note moves"));
+
+          // context=<tokens>: the budget, and with it the summary threshold.
+          assert(modelInfo("echo").context === 200_000, "echo: its window");
+          const heavy = n => Array.from({ length: n }, (_, i) => ({ blocks: [...mockToolUseBlock("probe", {}, "h" + i), { metadata: { usage: { inputTokens: 100_000 } } }], stopReason: "tool_use" }));
+          await withFlags({ context: "50000" }, async () => {
+            assert(modelInfo("echo").context === 50_000 && modelInfo("global.anthropic.claude-haiku-5-5").context === 50_000, "the flag sets the budget");
+            const near = await directedTurn({ script: [...heavy(3), reply("Done.")] });
+            assert(count(near.notes, "The context is at 100k tokens, near the 30k at which") === 1, `the summary threshold follows: ${JSON.stringify(near.notes)}`);
+          });
+          const summarizes = async () => {
+            const history = Array.from({ length: 10 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: [{ text: "turn " + i }], ...(i === 9 && { usage: { inputTokens: 50_000 } }) }));
+            const threadId = await db.add("threads", { agentId: 1, name: "budget", createdAt: Date.now() });
+            const messages = [];
+            for (const m of [...history, { role: "user", content: [{ text: "go on" }] }]) messages.push({ ...m, id: await db.add("messages", { ...m, threadId, agentId: 1 }) });
+            const [store, setStore] = createStore({ modelId: "echo", systemPrompt: "P", tools: [], messages });
+            const asked = [];
+            const client = { send: async input => (asked.push(JSON.stringify(input.messages).includes("Older messages are about to be dropped")), createMockClient([reply(asked.at(-1) ? "Summary." : "Done.")]).send(input)) };
+            await runAgentWithBranching(store, setStore, client, messages.at(-1).id, { threadId, agentId: 1 }, db);
+            return asked.some(Boolean);
+          };
+          assert(!(await summarizes()), "50k of 200k: no summary");
+          assert(await withFlags({ context: "60000" }, summarizes), "50k of a 60k budget: a summary");
+
+          // noProjectError=old: the error text before da412ed (E9).
+          const none = async () => (await viewFile({ path: "a.md" }, { workspace: createWorkspace(db, { headless: true }), agentId: 1, threadId: null })).error;
+          assert((await none()) === "No project is open: there are no files yet.", `no flag: the new text: ${await none()}`);
+          assert((await withFlags({ noProjectError: "old" }, none)) === "No project is open yet. Create the app with write_file.", "noProjectError=old");
+        }
+
         // Why: "17 passed" with no report saying so was the commonest failure on swe
         async function testClaimCheck() {
           const ran = tests => [{ role: "assistant", content: [{ toolUse: { toolUseId: "e", name: "edit_file", input: {} } }] }, { role: "user", content: [{ toolResult: { toolUseId: "e", content: [{ json: { result: { report: { path: "index.html", ok: !tests.failed, tests } } } }] } }] }];
@@ -6491,6 +6578,7 @@ if (window.__HARNESS__?.test) (async () => {
           testCheckKinds,
           testContractRerun,
           testDirectorRules,
+          testFeatureFlags,
           testClaimCheck,
           testReinjectAfterSummary,
           testEmptyMessages,
