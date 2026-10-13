@@ -195,14 +195,17 @@ async function run(config = options(process.argv.slice(2))) {
               throw new Error("Screenshot source is not the test page");
             if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(request.name))
               throw new Error("Invalid screenshot name");
-            const file = path.join(
-              path.dirname(absoluteTarget),
-              ".artifacts",
-              "screenshots",
-              runId,
-              viewport,
-              request.name + ".png",
-            );
+            // dir: "ui" keeps a story's latest look at the UI in .artifacts/ui/<viewport>/, one file per name.
+            const file = request.dir === "ui"
+              ? path.join(path.dirname(absoluteTarget), ".artifacts", "ui", viewport, request.name + ".png")
+              : path.join(
+                  path.dirname(absoluteTarget),
+                  ".artifacts",
+                  "screenshots",
+                  runId,
+                  viewport,
+                  request.name + ".png",
+                );
             await mkdir(path.dirname(file), { recursive: true });
             const capture = {
               path: file,

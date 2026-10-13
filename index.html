@@ -125,8 +125,6 @@
       .history-thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
       .min-w-0 { min-width: 0; }
       /* Chat content */
-      .tool-card > summary { list-style: none; cursor: pointer; }
-      .tool-card > summary::-webkit-details-marker { display: none; }
       .reasoning-control { display: inline-flex; align-items: center; gap: 0.375rem; margin: 0; font-size: 0.75rem; color: var(--bs-secondary-color); }
       .reasoning-control .form-range { width: 4.5rem; height: 1rem; }
       .reasoning-control:has(:disabled) { opacity: 0.5; }
@@ -137,10 +135,57 @@
       .reasoning-text { max-height: 12rem; overflow: auto; margin: 0.125rem 0 0.25rem; padding-left: 0.75rem; border-left: 2px solid var(--bs-border-color); }
       .reasoning-pulse { animation: reasoning-pulse 1.2s ease-in-out infinite; }
       @keyframes reasoning-pulse { 50% { opacity: 0.3; } }
-      .tool-card.tool-quiet { border: 0; }
-      .tool-card.tool-quiet > summary { padding-block: 0.125rem !important; color: var(--bs-secondary-color); }
-      .tool-thumb { height: 1.75rem; width: 2.75rem; object-fit: cover; object-position: top; border: 1px solid var(--bs-border-color); border-radius: 0.25rem; }
-      .tool-shot { display: block; max-width: 100%; max-height: 20rem; border: 1px solid var(--bs-border-color); border-radius: 0.375rem; margin-top: 0.25rem; }
+      /* Tool cards: one frame for every call (ToolCard) */
+      .tool-card { width: 100%; min-width: 0; margin-bottom: 0.25rem; background: #fff; border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius); }
+      .tool-card[data-status="error"] { border-color: rgba(var(--bs-danger-rgb), 0.35); }
+      .tool-head { display: flex; align-items: center; gap: 0.4rem; min-width: 0; padding: 0.25rem 0.5rem; cursor: pointer; user-select: none; border-radius: inherit; }
+      .tool-head:hover { background: var(--bs-tertiary-bg); }
+      .tool-head:focus-visible { outline: 2px solid rgba(var(--bs-primary-rgb), 0.5); outline-offset: -2px; }
+      .tool-status { flex-shrink: 0; font-size: 0.8rem; }
+      .tool-status.spinner-border { width: 0.8rem; height: 0.8rem; border-width: 0.15em; }
+      .tool-icon { flex-shrink: 0; color: var(--bs-secondary-color); }
+      .tool-name { flex-shrink: 0; font-weight: 600; white-space: nowrap; }
+      .tool-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tool-title.font-monospace { font-size: 0.75rem; }
+      .tool-summary { flex: 0 1 auto; min-width: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--bs-secondary-color); }
+      .tool-badge { flex-shrink: 0; font-weight: 500; }
+      .tool-aside { flex-shrink: 0; display: inline-flex; }
+      .tool-meta { flex-shrink: 0; white-space: nowrap; color: var(--bs-secondary-color); font-variant-numeric: tabular-nums; font-size: 0.75rem; }
+      .tool-chevron { flex-shrink: 0; color: var(--bs-secondary-color); font-size: 0.7rem; transition: transform 0.15s; }
+      .tool-card[data-open="true"] > .tool-head .tool-chevron { transform: rotate(90deg); }
+      .tool-error, .tool-foot { padding: 0 0.5rem 0.375rem 0.5rem; }
+      .tool-error { max-height: 8rem; overflow: auto; overflow-wrap: anywhere; }
+      .tool-body { padding: 0.5rem; border-top: 1px solid var(--bs-border-color-translucent); min-width: 0; }
+      .tool-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--bs-secondary-color); }
+      .tool-pre { margin: 0; }
+      .tool-diff .diff-add { color: #116329; background: #dafbe1; } .tool-diff .diff-del { color: #82071e; background: #ffebe9; } .tool-diff .diff-hunk { color: #6639ba; }
+      .terminal { margin: 0; padding: 0.5rem 0.625rem; background: #1f2328; color: #e6edf3; border-radius: var(--bs-border-radius-sm); font: 0.75rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; }
+      .terminal .term-prompt { color: #7ee787; user-select: none; }
+      .terminal .term-err { color: #ffa198; }
+      .terminal .term-cursor { animation: reasoning-pulse 1s steps(2) infinite; }
+      .tool-list { display: flex; flex-direction: column; border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius-sm); overflow: hidden; }
+      .tool-row { display: flex; align-items: center; gap: 0.5rem; width: 100%; min-width: 0; padding: 0.3rem 0.5rem; text-align: left; color: inherit; text-decoration: none; background: none; border: 0; border-top: 1px solid var(--bs-border-color-translucent); font: inherit; }
+      .tool-row:first-child { border-top: 0; }
+      :is(a, button).tool-row:hover { background: var(--bs-tertiary-bg); }
+      .tool-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+      .tool-row-primary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      a.tool-row .tool-row-primary { color: var(--bs-link-color); }
+      .tool-row-secondary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--bs-secondary-color); font-size: 0.75rem; }
+      .tool-row-detail { color: var(--bs-secondary-color); font-size: 0.75rem; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+      .tool-row .badge { flex-shrink: 0; font-weight: 500; }
+      .tool-more { justify-content: center; color: var(--bs-link-color); }
+      .tool-excerpt { max-height: 12rem; overflow: auto; padding: 0.375rem 0.5rem; background: var(--bs-light); border-radius: var(--bs-border-radius-sm); overflow-wrap: anywhere; }
+      .tool-answer .markdown { padding: 0 !important; }
+      .tool-sub { margin-left: 0.25rem; padding-left: 0.625rem; border-left: 2px solid var(--bs-border-color); min-width: 0; }
+      .tool-shots { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+      .tool-figure { margin: 0; max-width: 100%; }
+      .tool-figure figcaption { font-size: 0.7rem; margin-top: 0.125rem; }
+      .tool-thumb { height: 1.5rem; width: 2.5rem; object-fit: cover; object-position: top; border: 1px solid var(--bs-border-color); border-radius: 0.25rem; }
+      .tool-shot { display: block; max-width: 100%; max-height: 20rem; border: 1px solid var(--bs-border-color); border-radius: 0.375rem; }
+      .harness-note { max-width: 100%; }
+      .harness-note > summary { list-style: none; cursor: pointer; font-size: 0.7rem; padding-block: 0.0625rem; opacity: 0.8; }
+      .harness-note > summary::-webkit-details-marker { display: none; }
+      @media (max-width: 575.98px) { .tool-summary { display: none; } }
       .md-code, .markdown pre { margin: 0.25rem 0; padding: 0.5rem; background: var(--bs-light); border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius-sm); font-size: 0.75rem; max-height: 20rem; overflow: auto; white-space: pre; }
       .markdown { overflow-wrap: anywhere; }
       .markdown :is(p, ul, ol, blockquote, table, details) { margin-bottom: 0.5rem; }
@@ -248,7 +293,7 @@
       // =============================================================================
 
       import { render } from "solid-js/web";
-      import { For, Switch, Match, Show, ErrorBoundary, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
+      import { For, Switch, Match, Show, ErrorBoundary, createEffect, createMemo, createRoot, createSignal, onCleanup, untrack } from "solid-js";
       import { createStore, reconcile, unwrap } from "solid-js/store";
       import html from "solid-js/html";
       import DOMPurify from "dompurify";
@@ -313,6 +358,27 @@
 
       // Sub-agents as the UI last heard of them, from the engine's events.
       const [subagentViews, setSubagentViews] = createSignal(new Map());
+      let subagentLists = 0; // the engine's full lists heard, each in place of what was known
+      // What running calls have shown so far, by toolUseId, from the engine's tool.progress events: { stdout, stderr,
+      // status }. Each stream keeps its last LIVE_MAX characters; the call's result replaces them, and the oldest go
+      // past LIVE_CALLS.
+      const LIVE_MAX = 20_000, LIVE_CALLS = 100;
+      const [toolProgress, setToolProgress] = createSignal(new Map());
+      function addProgress({ toolUseId, stdout, stderr, status }) {
+        if (!toolUseId) return;
+        setToolProgress(map => {
+          const next = new Map(map), was = next.get(toolUseId) ?? { stdout: "", stderr: "", status: null };
+          next.delete(toolUseId);
+          next.set(toolUseId, {
+            stdout: stdout ? (was.stdout + stdout).slice(-LIVE_MAX) : was.stdout,
+            stderr: stderr ? (was.stderr + stderr).slice(-LIVE_MAX) : was.stderr,
+            status: status !== undefined ? status : was.status,
+          });
+          while (next.size > LIVE_CALLS) next.delete(next.keys().next().value);
+          return next;
+        });
+      }
+
       // The Code tab's edits not yet saved, by the function that saves each: a reload saves them first.
       const unsaved = new Set();
       const reload = async () => { await Promise.allSettled([...unsaved].map(save => save())); location.reload(); };
@@ -372,15 +438,9 @@
         const [attachments, setAttachments] = createSignal([]);
         const [notice, setNotice] = createSignal(null); // { threadId, text }: why the last message didn't go, or its run failed
         const [sends, setSends] = createSignal(0);
-        // Every call's result by its id, so a card finds its own without searching the chat.
-        const results = createMemo(() => {
-          const map = new Map();
-          for (let i = 0; i < agent.messages.length; i++) {
-            const content = agent.messages[i].content;
-            for (let j = 0; j < content.length; j++) if (content[j].toolResult) map.set(content[j].toolResult.toolUseId, content[j].toolResult);
-          }
-          return map;
-        });
+        // Every call's result block by its id, so a card finds its own without searching the chat; and each background
+        // sub-agent's result, delivered later, by its task call's id.
+        const lookup = createMemo(() => resultsOf(agent.messages));
         const suggestions = [
           ["bi-window", "A pomodoro timer", "Make a pomodoro timer page with start, pause, and reset."],
           ["bi-vector-pen", "An SVG logo", "Draw an SVG logo for a coffee shop called Nightjar."],
@@ -583,7 +643,9 @@
                             message=${message}
                             content=${content}
                             workspace=${workspace}
-                            results=${results}
+                            results=${() => lookup().results}
+                            delivered=${() => lookup().delivered}
+                            loading=${() => agent.loading}
                             live=${() => agent.loading && message === agent.messages.at(-1) && content === message.content.at(-1)}
                             editing=${editing}
                             onSave=${saveEdit}
@@ -762,7 +824,9 @@
             working.set(data.id, controller);
             try {
               if (!Object.hasOwn(host, data.method)) throw new Error(`Unknown host call: ${data.method}`);
-              port.postMessage({ type: "answer", id: data.id, value: await host[data.method](data.args, { signal: controller.signal }) });
+              // What the call reports as it works (a command's output) goes back before its answer.
+              const progress = value => !controller.signal.aborted && port.postMessage({ type: "progress", id: data.id, value });
+              port.postMessage({ type: "answer", id: data.id, value: await host[data.method](data.args, { signal: controller.signal, progress }) });
             } catch (e) {
               port.postMessage({ type: "answer", id: data.id, error: plainError(e) });
             } finally {
@@ -848,7 +912,7 @@
           return ws;
         }
         return {
-          async run({ projectId, threadId, agentId, path, branch, ...args }, { signal } = {}) {
+          async run({ projectId, threadId, agentId, path, branch, ...args }, { signal, progress = null } = {}) {
             let ws = branch ? await park(projectId, branch) : display.state.project?.id === projectId ? display : null;
             if (!ws && threadId === shown()) await display.open(projectId, { run: false }).then(() => (ws = display));
             signal?.throwIfAborted();
@@ -856,14 +920,14 @@
             await ws.exclusive(() => {}, { signal });
             ws.setContext({ threadId, agentId });
             if (ws === display && path && !isScratch(path)) await ws.show(path);
-            return ws.run({ ...args, announce: true, signal });
+            return ws.run({ ...args, announce: true, signal, progress });
           },
           async code({ input, threadId, agentId, projectId }, { signal } = {}) {
             const ws = !projectId ? null : display.state.project?.id === projectId ? display : await park(projectId);
             return code(input, { db, threadId, agentId, workspace: ws, signal });
           },
           readUrl: ({ input }, { signal } = {}) => readUrl(input, { signal }),
-          shell: (args, { signal } = {}) => shells.call(args, { signal }),
+          shell: (args, { signal, progress = null } = {}) => shells.call(args, { signal, progress }),
           // A project's release takes its branches with it, and its shells.
           release(projectId, branch = null) {
             if (!branch) shells.release(projectId);
@@ -916,8 +980,11 @@
 
         onCleanup(engine.on(event => {
           if (event.type === "runs") return setRunning(event.threadIds);
+          // A running call's output and steps, by its id, for its card (a sub-agent's calls too).
+          if (event.type === "tool.progress") return addProgress(event);
           // Each entry as it changes, its messages from where they changed, null for one that went; full, every entry there is.
           if (event.type === "subagents") return setSubagentViews(views => {
+            if (event.full) subagentLists++;
             const next = new Map(event.full ? [] : views);
             for (const [id, entry] of event.entries) {
               if (!entry) { next.delete(id); continue; }
@@ -1639,98 +1706,727 @@
       // edits as the card shows them, from a patch whole or still streaming.
       const editsOf = i => typeof i?.patch === "string" ? parsePatch(i.patch, { partial: true }) : [];
 
-      const WORKSPACE_TOOL_TITLES = {
-        view_file: i => i.path?.endsWith("/") ? `Listed ${i.path}` : `Read ${i.path || "the artifact"}${i.grep ? ` for /${i.grep}/` : i.start || i.end ? ` lines ${i.start ?? 1}-${i.end ?? "end"}` : ""}`,
-        edit_file: (i, done, edits) => `${done ? "Edited" : "Editing"} ${i.path || "the artifact"}${edits.length > 1 ? ` (${edits.length} edits)` : ""}`,
-        write_file: (i, done) => `${done ? "Wrote" : "Writing"} ${i.path || "the artifact"}`,
-        run_app: (i, done) => i.script ? (done ? "Tried the artifact with a script" : "Trying the artifact with a script") : done ? "Checked the artifact" : "Checking the artifact",
-        history: () => "Looked at history",
-        diff: i => `Diffed v${i.from} → ${i.to ? "v" + i.to : "current"}`,
-        restore: i => `Restored v${i.version}`,
-      };
+      // Every call is one card, ToolCard: the same frame for every tool, a sub-agent's included. The frame is its status
+      // (a spinner while it runs, ok, an exit code or an error), the tool's icon and name, its key argument, a few words
+      // on how it went, the time it took, and a body that opens. The view says what goes in each: TOOL_VIEWS[name], else
+      // DEFAULT_VIEW. A view's parts take the card's context (see ToolCard) and answer text or nodes:
+      //   title(c): the key argument (bash's command, read_url's URL); mono: it is code
+      //   summary(c): a few words on how it went, or what it is doing now
+      //   status(c): { tone: "ok" | "error" | "busy" | "idle", text? } in place of the frame's own
+      //   body(c): what the card shows open; output that streams in goes here too
+      //   open(c): opens by itself, while its input or output streams; the reader's own choice wins
+      //   aside(c): beside the time (a version's link); footer(c): under the header, open or not
+      // An error shows under the header whether the card is open or not.
+      const firstLine = s => String(s ?? "").split("\n").find(l => l.trim())?.trim() ?? "";
+      const clipText = (s, n) => (s = String(s ?? ""), s.length > n ? s.slice(0, n - 1) + "…" : s);
+      const stripAnsi = s => String(s ?? "").replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+      const httpUrl = u => /^https?:\/\//i.test(String(u ?? "")) ? String(u) : null;
+      const formatMs = ms => ms == null ? "" : ms < 1000 ? `${ms} ms` : ms < 60_000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.floor(ms / 60_000)}m ${String(Math.round((ms % 60_000) / 1000)).padStart(2, "0")}s`;
+      const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+      const asObject = v => v && typeof v === "object" && !Array.isArray(v) ? v : {};
 
-      const QUIET_TOOLS = new Set(["view_file", "history", "diff"]);
-
-      // A call streams into its card: its input, its edits and its result parse once per change, not once per use.
-      function WorkspaceToolCard(props) {
-        const input = () => props.input ?? {};
-        const edits = createMemo(() => editsOf(input()));
-        const result = createMemo(() => props.result?.content?.[0]?.json?.result);
-        const report = () => result()?.report;
-        const error = () => result()?.error ?? (props.result?.status === "error" && props.result.content?.[0]?.text);
-        const image = () => props.result?.content?.find(c => c.image)?.image;
-        const shotUrl = createMemo(previous => {
-          if (previous) URL.revokeObjectURL(previous);
-          const img = image();
-          return img ? URL.createObjectURL(new Blob([img.source.bytes], { type: `image/${img.format}` })) : null;
+      // A call's answer: its JSON result, else its text.
+      function resultValue(toolResult) {
+        if (!toolResult) return undefined;
+        const json = toolResult.content?.find(c => c.json);
+        if (json) return json.json.result;
+        const text = toolResult.content?.filter(c => c.text != null).map(c => c.text).join("\n");
+        return text || undefined;
+      }
+      // The images a result carries, each with the label before it (a full page's "page 2 of 4").
+      function imagesOf(toolResult) {
+        const out = [];
+        let label = null;
+        for (const c of toolResult?.content ?? []) {
+          if (c.text != null) label = c.text;
+          else if (c.image?.source?.bytes) { out.push({ image: c.image, label }); label = null; }
+        }
+        return out;
+      }
+      // Object URLs for images, let go of when they change or the card goes: a little later, so an image still loading
+      // its URL doesn't fail.
+      const revokeLater = urls => setTimeout(() => urls.forEach(u => URL.revokeObjectURL(u.url)), 10_000);
+      function objectUrls(images) {
+        const urls = createMemo(previous => {
+          if (previous) revokeLater(previous);
+          return (images() ?? []).map(({ image, label }) => ({ url: URL.createObjectURL(new Blob([image.source.bytes], { type: `image/${image.format}` })), label }));
         });
-        onCleanup(() => shotUrl() && URL.revokeObjectURL(shotUrl()));
-        const title = () => (WORKSPACE_TOOL_TITLES[props.toolUse.name] || (() => props.toolUse.name))({ ...input(), path: input().path || report()?.path }, !!props.result, edits());
-        const text = () => typeof result() === "string" ? result() : null;
-        // A file or script streams into the open card; once it has run, the card folds to its report.
-        const writing = () => !props.result && (input().content ?? input().script);
-        const openVersion = () => {
-          const ws = props.workspace;
-          ws.setState({ tab: "preview", panel: true });
-          ws.preview(result().version).catch(e => ws.notify(e.message));
+        onCleanup(() => revokeLater(urls()));
+        return urls;
+      }
+      // A conversation's results by call: results, the blocks by toolUseId; delivered, a background sub-agent's result
+      // by its task call's id, from the note that delivered it or the wait that returned it.
+      function resultsOf(messages) {
+        const results = new Map(), delivered = new Map();
+        for (const m of messages ?? []) for (const c of m?.content ?? []) {
+          if (c?.toolResult) {
+            results.set(c.toolResult.toolUseId, c);
+            const waited = resultValue(c.toolResult)?.results;
+            if (Array.isArray(waited)) for (const w of waited) if (w?.id != null && w.result !== undefined) delivered.set(String(w.id), w.result);
+          } else if (c?.instruction?.status === "delivered" && c.instruction.data?.subagent) {
+            delivered.set(String(c.instruction.data.subagent.id), c.instruction.data.subagent.result);
+          }
+        }
+        return { results, delivered };
+      }
+
+      // One list for every tool that answers one: a row each, a primary line, a muted secondary one (and a detail),
+      // a badge on the right; a row that points somewhere opens it. rows: [{ primary, secondary?, detail?, badge?,
+      // tone?: "ok" | "error" | "muted", href?, onClick? }]. The first max show, the rest behind "Show N more".
+      function ListBody(props) {
+        const [all, setAll] = createSignal(false);
+        const rows = () => props.rows ?? [];
+        const max = () => props.max ?? 8;
+        const shown = () => all() ? rows() : rows().slice(0, max());
+        const badge = tone => `badge rounded-pill ${tone === "ok" ? "text-bg-success" : tone === "error" ? "text-bg-danger" : "text-bg-light border"}`;
+        const row = r => {
+          const inner = html`
+            <span class="tool-row-main">
+              <span class="tool-row-primary">${r.primary}</span>
+              ${r.secondary ? html`<span class="tool-row-secondary">${r.secondary}</span>` : ""}
+              ${r.detail ? html`<span class="tool-row-detail">${r.detail}</span>` : ""}
+            </span>
+            ${r.badge ? html`<span class=${badge(r.tone)}>${r.badge}</span>` : ""}
+          `;
+          if (httpUrl(r.href)) return html`<a class="tool-row" href=${httpUrl(r.href)} target="_blank" rel="noopener noreferrer">${inner}</a>`;
+          if (r.onClick) return html`<button type="button" class="tool-row" onClick=${r.onClick}>${inner}</button>`;
+          return html`<div class="tool-row">${inner}</div>`;
         };
-        // Offer real screenshots where the agent only got an approximate one or none.
-        const offerSight = () => props.workspace?.state.capture === "none" && (report()?.screenshot?.approximate || report()?.screenshot?.error);
-        const letSee = e => {
-          e.preventDefault();
+        return html`
+          <div class="tool-list" data-list>
+            <${For} each=${shown}>${row}<//>
+            <${Show} when=${() => !rows().length}><div class="tool-row text-muted">${() => props.empty ?? "Nothing."}</div><//>
+            <${Show} when=${() => !all() && rows().length > max()}>
+              <button type="button" class="tool-row tool-more" onClick=${() => setAll(true)}>Show ${() => rows().length - max()} more</button>
+            <//>
+          </div>
+        `;
+      }
+
+      // Images with their labels under them.
+      function Shots(props) {
+        const urls = objectUrls(() => props.images);
+        return html`
+          <div class="tool-shots">
+            <${For} each=${urls}>${(u, i) => html`
+              <figure class="tool-figure">
+                <img class="tool-shot" src=${u.url} alt=${u.label || "Screenshot"} />
+                <figcaption class="text-muted">${() => u.label || props.caption || ""}</figcaption>
+              </figure>
+            `}<//>
+          </div>
+        `;
+      }
+
+      const Pre = (text, cls = "") => html`<pre class=${`md-code tool-pre ${cls}`}>${text}</pre>`;
+      const Muted = text => html`<div class="text-muted text-pre">${text}</div>`;
+
+      // A run report, as run_app, write_file, edit_file and restore return it, with the images that came with it.
+      function ReportBody(props) {
+        const r = () => props.report ?? {};
+        const shot = () => r().screenshot ?? {};
+        const offerSight = () => props.workspace?.state.capture === "none" && (shot().approximate || shot().error);
+        const letSee = () => {
           const ws = props.workspace;
           ws.setState({ tab: "preview", panel: true });
           ws.enableCapture().catch(err => ws.notify(err.message));
         };
-
         return html`
-          <details class=${QUIET_TOOLS.has(props.toolUse.name) ? "tool-card tool-quiet small mb-1" : "tool-card small border rounded mb-1"} data-tool=${props.toolUse.name} open=${() => !props.result && !QUIET_TOOLS.has(props.toolUse.name) && !!(writing() || edits().length)}>
-            <summary class="d-flex align-items-center gap-2 px-2 py-1">
-              <${Show} when=${() => props.result} fallback=${html`<span class="spinner-border spinner-border-sm text-secondary"></span>`}>
-                <i class=${() => `bi ${error() ? "bi-exclamation-triangle text-danger" : report() && !report().ok ? "bi-x-circle text-danger" : "bi-check2 text-success"}`}></i>
+          <div class="d-flex flex-column gap-1" data-report>
+            <div class="d-flex flex-wrap align-items-center gap-2">
+              <span class=${() => `badge ${r().ok ? "text-bg-success" : "text-bg-danger"}`}>${() => r().ok ? "ok" : "failing"}</span>
+              <${Show} when=${() => r().tests}>
+                <span>${() => `${r().tests.passed} passed`}</span>
+                <${Show} when=${() => r().tests.failed}><span class="text-danger">${() => `${r().tests.failed} failed`}</span><//>
               <//>
-              <span class="text-truncate">${title}</span>
-              <${Show} when=${() => result()?.change}><span class="text-muted text-nowrap">${() => result().change}</span><//>
-              <${Show} when=${report}>
-                <span class=${() => `badge ${report().ok ? "text-bg-success" : "text-bg-danger"}`}>${() => summarizeReport(report())}</span>
+              <${Show} when=${() => r().path}><span class="text-muted">${() => r().path}${() => r().version ? ` v${r().version}` : ""}</span><//>
+            </div>
+            <${Show} when=${() => r().errors?.length}><div class="text-danger text-pre">${() => r().errors.join("\n")}</div><//>
+            <${Show} when=${() => r().tests?.failures?.length}><div class="text-danger text-pre">${() => r().tests.failures.map(f => "FAIL: " + f).join("\n")}</div><//>
+            <${Show} when=${() => r().notes?.length}>${() => Muted(r().notes.join("\n"))}<//>
+            <${Show} when=${() => r().scriptError}><div class="text-danger">Script: ${() => r().scriptError}</div><//>
+            <${Show} when=${() => r().result !== undefined}>${() => Pre(JSON.stringify(r().result, null, 2))}<//>
+            <${Show} when=${() => r().console?.length}>${() => Pre(r().console.join("\n"))}<//>
+            <${Show} when=${() => props.images?.length}>
+              <${Shots} images=${() => props.images} caption=${() => `${shot().tier ?? ""} screenshot${shot().approximate ? " (approximate)" : ""}`} />
+            <//>
+            <${Show} when=${() => shot().full}>${() => Muted(`Whole page: ${shot().full}${shot().cut ? `; ${shot().cut}` : ""}`)}<//>
+            <${Show} when=${() => shot().unchanged}>${() => Muted(`Screenshot ${shot().unchanged}.`)}<//>
+            <${Show} when=${() => shot().error}><div class="text-warning">No screenshot: ${() => shot().error}</div><//>
+            <${Show} when=${offerSight}>
+              <button type="button" class="btn btn-sm btn-link p-0 align-self-start" data-let-see onClick=${letSee}><i class="bi bi-eye"></i> Share the tab for real screenshots</button>
+            <//>
+          </div>
+        `;
+      }
+
+      // The bash card's body is the terminal: the command, then what it printed, as it printed it, streaming in while
+      // it runs; stderr in its own colour; the exit code when it isn't 0.
+      function Terminal(props) {
+        const c = props.c;
+        const r = () => c.done() ? asObject(c.result()) : null;
+        const out = () => stripAnsi(r() ? r().stdout : c.live()?.stdout);
+        const err = () => stripAnsi(r() ? r().stderr : c.live()?.stderr);
+        const command = () => c.input().command ?? "";
+        const cut = () => [...`${r()?.stdout ?? ""}\n${r()?.stderr ?? ""}`.matchAll(/all of (stdout|stderr) is in (\S+?):/g)].map(m => `${m[1]}: ${m[2]}`);
+        const saved = () => (r()?.files ?? []).map(f => ({
+          primary: f.path, secondary: f.deleted ? "deleted" : `v${f.version}`,
+          onClick: !f.deleted && props.workspace ? act(props.workspace, () => props.workspace.setState({ selected: f.path, tab: "code", panel: true })) : null,
+        }));
+        return html`
+          <div class="d-flex flex-column gap-1">
+            <pre class="terminal" data-terminal ref=${follow(() => out() + err())}><span class="term-prompt">$ </span>${command}${() => out() || err() || c.running() ? "\n" : ""}${out}<span class="term-err">${err}</span><${Show} when=${() => c.running()}><span class="term-cursor">▍</span><//></pre>
+            <${Show} when=${() => r() && r().exitCode != null && r().exitCode !== 0}><div class="text-danger" data-exit>exit code ${() => r().exitCode}</div><//>
+            <${Show} when=${() => cut().length}>${() => Muted(`Output cut to its head and tail; all of it is saved, ${cut().join(", ")}`)}<//>
+            <${Show} when=${() => r()?.cwd}>${() => Muted(`cwd: ${r().cwd}`)}<//>
+            <${Show} when=${() => saved().length}><${ListBody} rows=${saved} /><//>
+            <${Show} when=${() => r()?.notes?.length}>${() => Muted(r().notes.join("\n"))}<//>
+            <${Show} when=${() => r()?.report}><${ReportBody} report=${() => r().report} images=${() => c.images()} workspace=${props.workspace} /><//>
+            <${Show} when=${() => !r()?.report && c.images().length}><${Shots} images=${() => c.images()} /><//>
+          </div>
+        `;
+      }
+
+      // A version's link, with its screenshot's thumbnail, for the cards whose call made or ran one.
+      function VersionLink(props) {
+        const c = props.c;
+        const thumb = objectUrls(() => c.images().slice(0, 1));
+        const version = () => asObject(c.result()).version ?? asObject(c.result()).report?.version;
+        const open = () => {
+          const ws = c.workspace;
+          ws.setState({ tab: "preview", panel: true });
+          ws.preview(version()).catch(e => ws.notify(e.message));
+        };
+        return html`
+          <${Show} when=${() => version() && c.workspace}>
+            <button type="button" class="btn btn-sm btn-link p-0 d-flex align-items-center gap-1 text-nowrap" title="Open this version" onClick=${e => { e.stopPropagation(); open(); }}>
+              <${Show} when=${() => thumb()[0]}><img class="tool-thumb" src=${() => thumb()[0].url} alt="" /><//>
+              v${version}
+            </button>
+          <//>
+        `;
+      }
+
+      // A report's status: its badge says how the run went.
+      const reportStatus = c => {
+        const report = asObject(c.result()).report;
+        return c.done() && report ? { tone: report.ok ? "ok" : "error", text: report.ok ? "ok" : "failing" } : null;
+      };
+      // The rest of the report's summary, beside it: "4 passed, 1 error".
+      const reportSummary = c => summarizeReport(asObject(c.result()).report).split(", ").slice(1).join(", ");
+      const reportBody = c => html`
+        <${Show} when=${() => asObject(c.result()).report} fallback=${html`<${Show} when=${() => c.images().length}><${Shots} images=${() => c.images()} /><//>`}>
+          <${ReportBody} report=${() => c.result().report} images=${() => c.images()} workspace=${c.workspace} />
+        <//>
+      `;
+      const editLines = edits => edits.map(e => [e.old_str, e.new_str].map((s, i) => (s ?? "").split("\n").map(l => (i ? "+ " : "- ") + l).join("\n")).join("\n")).join("\n⋯\n");
+      // A diff, its lines coloured by what they do.
+      const DiffText = text => html`<pre class="md-code tool-pre tool-diff">${String(text ?? "").split("\n").map(l => html`<span class=${/^\+(?!\+\+)/.test(l) ? "diff-add" : /^-(?!--)/.test(l) ? "diff-del" : /^@@/.test(l) ? "diff-hunk" : ""}>${l + "\n"}</span>`)}</pre>`;
+      const openInCode = (ws, path) => ws && act(ws, () => ws.setState({ selected: path, tab: "code", panel: true }));
+
+      // web_search's text, as rows: "1. Title", "   url (age)", then snippets.
+      function searchRows(text) {
+        return String(text ?? "").split(/\n\s*\n/).map(block => {
+          const [head = "", link = "", ...snippets] = block.split("\n");
+          const title = head.match(/^\s*\d+\.\s+(.*)$/)?.[1];
+          if (!title) return null;
+          const [, url = link.trim(), age] = link.trim().match(/^(\S+)(?:\s+\((.+)\))?$/) ?? [];
+          return { primary: title, secondary: [url.replace(/^https?:\/\/(www\.)?/, ""), age].filter(Boolean).join(" · "), detail: snippets.map(s => s.trim()).filter(Boolean)[0], href: url };
+        }).filter(Boolean);
+      }
+      // history's text, as rows: "v12*  index.html  agent  2m ago  40 lines  ok, 3 passed".
+      function historyRows(text, ws) {
+        return String(text ?? "").split("\n").filter(l => /^v\d+/.test(l)).map(line => {
+          const [tag, path, source, when, lines, ...report] = line.split(/\s{2,}/);
+          const id = +tag.match(/\d+/)[0], status = report.join("  ");
+          return {
+            primary: `${tag.replace("*", "")} ${path ?? ""}${tag.endsWith("*") ? " (current)" : tag.endsWith("~") ? " (a sub-agent's)" : ""}`,
+            secondary: [source, when, lines].filter(Boolean).join(" · "),
+            badge: status, tone: /^ok/.test(status) ? "ok" : /^failing/.test(status) ? "error" : "muted",
+            onClick: ws && act(ws, () => { ws.setState({ tab: "preview", panel: true }); return ws.preview(id); }),
+          };
+        });
+      }
+      // plan's state, its items as rows: "2. [open] Title".
+      function planParts(text) {
+        const rows = [], rest = [];
+        for (const line of String(text ?? "").split("\n")) {
+          const item = line.match(/^(\d+)\. \[([^\]]+)\] (.*)$/);
+          if (item) rows.push({ primary: `${item[1]}. ${item[3]}`, badge: item[2], tone: item[2] === "done" ? "ok" : /fail/.test(item[2]) ? "error" : "muted" });
+          else if (line.trim()) rest.push(line);
+        }
+        return { rows, rest: rest.join("\n") };
+      }
+      // A sub-agent's latest action, as its own card would title it: "bash: npm test".
+      function latestActivity(entry) {
+        const messages = [...(entry?.messages ?? []), ...(entry?.currentMessage ? [entry.currentMessage] : [])];
+        for (const m of messages.toReversed()) for (const c of (m.content ?? []).toReversed()) {
+          if (c?.toolUse) {
+            let input = {};
+            try { input = asObject(parseJSON(c.toolUse.input)); } catch {}
+            const title = (TOOL_VIEWS[c.toolUse.name] ?? DEFAULT_VIEW).title?.({ name: c.toolUse.name, input: () => input, result: () => undefined, done: () => false, running: () => true });
+            return clipText(`${c.toolUse.name}${title ? `: ${firstLine(title)}` : ""}`, 80);
+          }
+          if (m.role === "assistant" && c?.text?.trim()) return clipText(firstLine(c.text.split("\n").at(-1) || c.text), 80);
+        }
+        return "";
+      }
+
+      const TOOL_VIEWS = {
+        bash: {
+          icon: "bi-terminal", mono: true,
+          title: c => firstLine(c.input().command) || (c.input().restart ? "restart the shell" : ""),
+          status: c => {
+            const r = asObject(c.result());
+            if (!c.done() || r.error || r.exitCode == null) return r.restarted ? { tone: "ok", text: "restarted" } : null;
+            return r.exitCode === 0 ? { tone: "ok" } : { tone: "error", text: r.exitCode === 124 ? "timed out" : r.exitCode === 130 ? "stopped" : `exit ${r.exitCode}` };
+          },
+          summary: c => c.running() ? clipText(firstLine(stripAnsi(`${c.live()?.stdout ?? ""}${c.live()?.stderr ?? ""}`).split("\n").filter(l => l.trim()).at(-1)), 60)
+            : asObject(c.result()).files?.length ? `saved ${plural(c.result().files.length, "file")}` : "",
+          ms: c => c.timing()?.ms ?? asObject(c.result()).ms,
+          open: c => c.running(),
+          body: c => html`<${Terminal} c=${c} workspace=${c.workspace} />`,
+        },
+        run_app: {
+          icon: "bi-play-circle",
+          title: c => `${c.input().path || asObject(c.result()).report?.path || "the artifact"}${c.input().version ? ` v${c.input().version}` : ""}${c.input().script ? ", with a script" : ""}${c.input().full ? ", whole page" : ""}`,
+          status: reportStatus,
+          summary: c => c.running() ? c.live()?.status ?? "" : asObject(c.result()).report ? reportSummary(c) : "",
+          aside: c => html`<${VersionLink} c=${c} />`,
+          open: c => c.running() && !!c.input().script,
+          body: c => html`
+            <${Show} when=${() => c.input().script}>${() => Pre(c.input().script)}<//>
+            <${Show} when=${() => c.running() && c.live()?.status}>${() => Muted(c.live().status)}<//>
+            ${reportBody(c)}
+          `,
+        },
+        write_file: {
+          icon: "bi-file-earmark-plus",
+          title: c => c.input().path || asObject(c.result()).report?.path || "the artifact",
+          status: reportStatus,
+          summary: c => asObject(c.result()).change ?? (c.running() && c.input().content ? `${plural(countLines(c.input().content), "line")}…` : ""),
+          aside: c => html`<${VersionLink} c=${c} />`,
+          open: c => c.running() && !!c.input().content,
+          body: c => html`
+            <${Show} when=${() => !c.done() && c.input().content}><pre class="md-code tool-pre" ref=${follow(() => c.input().content)}>${() => c.input().content}</pre><//>
+            ${reportBody(c)}
+            <${Show} when=${() => c.done() && !asObject(c.result()).report && typeof c.result() === "string"}>${() => Pre(c.result())}<//>
+          `,
+        },
+        edit_file: {
+          icon: "bi-pencil-square",
+          title: c => `${c.input().path || asObject(c.result()).report?.path || "the artifact"}${editsOf(c.input()).length > 1 ? ` (${editsOf(c.input()).length} edits)` : ""}`,
+          status: reportStatus,
+          summary: c => asObject(c.result()).change ?? "",
+          aside: c => html`<${VersionLink} c=${c} />`,
+          open: c => c.running() && editsOf(c.input()).length > 0,
+          body: c => html`
+            <${Show} when=${() => editsOf(c.input()).length}>${() => DiffText(editLines(editsOf(c.input())))}<//>
+            ${reportBody(c)}
+          `,
+        },
+        restore: {
+          icon: "bi-arrow-counterclockwise",
+          title: c => `v${c.input().version ?? "?"}${asObject(c.result()).path ? ` of ${c.result().path}` : ""}`,
+          status: reportStatus,
+          summary: c => asObject(c.result()).change ?? "",
+          aside: c => html`<${VersionLink} c=${c} />`,
+          body: c => html`
+            ${reportBody(c)}
+            <${Show} when=${() => c.done() && !asObject(c.result()).report}>${() => Muted(asObject(c.result()).change ?? "")}<//>
+          `,
+        },
+        view_file: {
+          icon: "bi-file-earmark-text",
+          title: c => { const i = c.input(); return `${i.path || "the artifact"}${i.grep ? ` /${i.grep}/` : i.start || i.end ? ` lines ${i.start ?? 1}-${i.end ?? "end"}` : ""}`; },
+          summary: c => typeof c.result() === "string" ? (c.input().path?.endsWith("/") && !c.input().grep ? plural(c.result().split("\n").filter(l => l && l !== "(no files)").length, "file") : firstLine(c.result()).match(/\d+ (lines|matching)[^,]*/)?.[0] ?? "") : "",
+          body: c => html`
+            <${Show} when=${() => c.input().path?.endsWith("/") && !c.input().grep && typeof c.result() === "string"} fallback=${html`
+              <${Show} when=${() => c.images().length} fallback=${() => Pre(typeof c.result() === "string" ? c.result() : JSON.stringify(c.result() ?? null, null, 2))}>
+                <${Shots} images=${() => c.images()} />
               <//>
-              <${Show} when=${() => result()?.version && props.workspace}>
-                <button type="button" class="btn btn-sm btn-link p-0 ms-auto d-flex align-items-center gap-1" title="Open this version" onClick=${e => { e.preventDefault(); openVersion(); }}>
-                  <${Show} when=${shotUrl}><img class="tool-thumb" src=${shotUrl} alt="" /><//>
-                  v${() => result().version}
-                </button>
+            `}>
+              <${ListBody} empty="No files." rows=${() => c.result().split("\n").filter(l => l && l !== "(no files)").map(path => ({ primary: path, onClick: openInCode(c.workspace, path) }))} />
+            <//>
+          `,
+        },
+        history: {
+          icon: "bi-clock-history",
+          title: c => c.input().path || "all files",
+          summary: c => typeof c.result() === "string" ? plural(historyRows(c.result()).length, "version") : "",
+          body: c => html`
+            <${Show} when=${() => typeof c.result() === "string" && historyRows(c.result()).length} fallback=${() => Pre(typeof c.result() === "string" ? c.result() : JSON.stringify(c.result() ?? null, null, 2))}>
+              <${ListBody} rows=${() => historyRows(c.result(), c.workspace)} />
+            <//>
+          `,
+        },
+        diff: {
+          icon: "bi-file-diff",
+          title: c => `v${c.input().from ?? "?"} → ${c.input().to ? "v" + c.input().to : "current"}`,
+          body: c => typeof c.result() === "string" ? DiffText(c.result()) : Pre(JSON.stringify(c.result() ?? null, null, 2)),
+        },
+        web_search: {
+          icon: "bi-search",
+          title: c => c.input().query ?? "",
+          summary: c => typeof c.result() === "string" ? (searchRows(c.result()).length ? plural(searchRows(c.result()).length, "result") : "no results") : "",
+          body: c => html`
+            <${Show} when=${() => typeof c.result() === "string" && searchRows(c.result()).length} fallback=${() => Muted(typeof c.result() === "string" ? c.result() : "")}>
+              <${ListBody} rows=${() => searchRows(c.result())} />
+            <//>
+          `,
+        },
+        read_url: {
+          icon: "bi-globe2",
+          title: c => c.input().url ?? "",
+          summary: c => { const t = typeof c.result() === "string" ? c.result() : asObject(c.result()).page; return t ? `${t.length.toLocaleString()} characters` : ""; },
+          body: c => {
+            const text = () => typeof c.result() === "string" ? c.result() : asObject(c.result()).page ?? "";
+            const lines = () => text().split("\n");
+            const title = () => lines()[0]?.startsWith("# ") ? lines()[0].slice(2) : "";
+            const rest = () => lines().slice(title() ? 1 : 0);
+            return html`
+              <div class="d-flex flex-column gap-1">
+                <${Show} when=${title}><div class="fw-semibold">${title}</div><//>
+                <${Show} when=${() => rest()[0]}><div class="text-muted text-truncate">${() => rest()[0]}</div><//>
+                <${Show} when=${() => rest().slice(1).join("\n").trim()}>
+                  <div class="tool-excerpt text-pre">${() => rest().slice(1).join("\n").trim().split("\n").slice(0, 12).join("\n")}</div>
+                <//>
+                <${Show} when=${() => text()}>${() => Muted(`${text().length.toLocaleString()} characters${/… showing \d+-\d+ of (\d+)/.test(text()) ? `, of ${(+text().match(/of (\d+) characters/)?.[1]).toLocaleString()} in all` : ""}`)}<//>
+                <${Show} when=${() => c.images().length}><${Shots} images=${() => c.images()} /><//>
+              </div>
+            `;
+          },
+        },
+        plan: {
+          icon: "bi-list-check",
+          title: c => {
+            const i = c.input();
+            if (i.add) return `add: ${[i.add].flat()[0]?.title ?? ""}`;
+            if (i.edit != null) return `edit item ${i.edit}${i.title ? `: ${i.title}` : ""}`;
+            if (i.goal) return `goal: ${i.goal}`;
+            if (i.note) return `note: ${i.note}`;
+            if (i.ask) return `ask: ${i.ask}`;
+            if (i.assumptions) return "assumptions";
+            if (i.done) return `done: ${i.done}`;
+            return "state";
+          },
+          summary: c => typeof c.result() === "string" ? c.result().match(/^Items: (.*?)\.?$/m)?.[1] ?? "" : "",
+          body: c => html`
+            <div class="d-flex flex-column gap-1">
+              <${Show} when=${() => typeof c.result() === "string" && planParts(c.result()).rest}>${() => Muted(planParts(c.result()).rest)}<//>
+              <${Show} when=${() => typeof c.result() === "string" && planParts(c.result()).rows.length}><${ListBody} rows=${() => planParts(c.result()).rows} max=${12} /><//>
+            </div>
+          `,
+        },
+        task: {
+          icon: "bi-robot",
+          title: c => `${c.input().type ?? "task"}: ${firstLine(c.input().prompt)}`,
+          status: c => {
+            const sub = subagentViews().get(c.id), r = asObject(c.taskResult());
+            if (sub?.status === "running" || (r.started && !c.delivered() && c.loading() && sub?.status !== "error")) return { tone: "busy" };
+            if (r.started && !c.delivered()) return { tone: "idle", text: "in the background" };
+            if (r.error) return { tone: "error", text: "error" };
+            return null;
+          },
+          summary: c => {
+            const sub = subagentViews().get(c.id), r = asObject(c.taskResult());
+            if (sub?.status === "running") return latestActivity(sub) || "starting…";
+            if (r.started && !c.delivered()) return "running in background";
+            return r.turns != null ? plural(r.turns, "turn") : "";
+          },
+          footer: c => html`<${TakeActions} c=${c} />`,
+          body: c => html`<${TaskBody} c=${c} />`,
+        },
+        wait: {
+          icon: "bi-hourglass-split",
+          title: c => { const i = c.input(); return [i.id, ...(i.ids ?? [])].filter(Boolean).join(", ") || "all running sub-agents"; },
+          summary: c => { const r = asObject(c.result()); return r.results ? `${plural(r.results.length, "result")}${r.running?.length ? `, ${r.running.length} still running` : ""}` : ""; },
+          body: c => html`
+            <div class="d-flex flex-column gap-1">
+              <${ListBody} empty="No results yet." rows=${() => (asObject(c.result()).results ?? []).map(({ id, result }) => ({
+                primary: `${id}${result?.type ? ` (${result.type})` : ""}`, secondary: clipText(firstLine(result?.error ?? result?.summary ?? (typeof result === "string" ? result : "")), 160),
+                badge: result?.error ? "error" : "done", tone: result?.error ? "error" : "ok",
+              }))} />
+              <${Show} when=${() => asObject(c.result()).note}>${() => Muted(c.result().note)}<//>
+            </div>
+          `,
+        },
+        code: {
+          icon: "bi-code-slash", mono: true,
+          title: c => c.input().filename || firstLine(c.input().source) || c.input().language || "code",
+          summary: c => asObject(c.result()).logs?.length ? plural(c.result().logs.length, "log line") : "",
+          open: c => c.running() && !!c.input().source,
+          body: c => html`
+            <${Show} when=${() => c.input().source}><pre class="md-code tool-pre" ref=${follow(() => !c.done() && c.input().source)}>${() => c.input().source}</pre><//>
+            <${Show} when=${() => asObject(c.result()).logs?.length}>${() => Pre(c.result().logs.join("\n"))}<//>
+            <${Show} when=${() => asObject(c.result()).result !== undefined}>${() => Pre(typeof c.result().result === "string" ? c.result().result : JSON.stringify(c.result().result, null, 2))}<//>
+            <${Show} when=${() => c.done() && !asObject(c.result()).logs?.length && asObject(c.result()).result === undefined && !asObject(c.result()).error}>${() => Muted("No output.")}<//>
+          `,
+        },
+        editor: {
+          icon: "bi-journal-text",
+          title: c => `${c.input().command ?? ""} ${c.input().path ?? ""}${c.input().new_path ? ` → ${c.input().new_path}` : ""}`.trim(),
+          open: c => c.running() && !!(c.input().file_text ?? c.input().new_str),
+          body: c => html`<${EditorBody} c=${c} />`,
+        },
+        mcp: {
+          icon: "bi-plug",
+          title: c => [c.input().command, c.input().server, c.input().tool ?? c.input().uri ?? c.input().name].filter(Boolean).join(" "),
+          body: c => {
+            const r = () => asObject(c.result());
+            const formatText = text => { try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; } };
+            const blocks = list => list.map(x => x.text ? formatText(x.text) : JSON.stringify(x, null, 2)).join("\n");
+            const rows = () => r().servers?.map(s => ({ primary: s.name, secondary: s.url, badge: s.enabled ? "on" : "off", tone: s.enabled ? "ok" : "muted" }))
+              ?? r().tools?.map(t => ({ primary: t.name, secondary: t.description }))
+              ?? r().resources?.map(x => ({ primary: x.name || x.uri, secondary: x.name ? x.uri : x.description }))
+              ?? r().prompts?.map(p => ({ primary: p.name, secondary: p.description }));
+            return html`
+              <${Show} when=${rows} fallback=${() => r().contents ? Pre(blocks(r().contents)) : r().content ? Pre(blocks(r().content)) : r().messages ? Pre(r().messages.map(m => `[${m.role}] ${m.content?.text || JSON.stringify(m.content)}`).join("\n")) : JSONBody(c)}>
+                <${ListBody} rows=${rows} />
               <//>
-            </summary>
-            <div class="px-2 pb-2">
-              <${Show} when=${writing}><pre class="md-code" ref=${follow(writing)}>${writing}</pre><//>
-              <${Show} when=${() => edits().length}>
-                <pre class="md-code">${() => edits().map(e => [e.old_str, e.new_str].map((s, i) => (s ?? "").split("\n").map(l => (i ? "+ " : "- ") + l).join("\n")).join("\n")).join("\n⋯\n")}</pre>
-              <//>
-              <${Show} when=${error}><div class="text-danger text-pre">${error}</div><//>
-              <${Show} when=${text}><pre class="md-code">${text}</pre><//>
-              <${Show} when=${() => report()?.errors?.length}>
-                <div class="text-danger text-pre">${() => report().errors.join("\n")}</div>
-              <//>
-              <${Show} when=${() => report()?.tests?.failures?.length}>
-                <div class="text-pre">${() => report().tests.failures.map(f => "FAIL: " + f).join("\n")}</div>
-              <//>
-              <${Show} when=${() => report()?.result !== undefined}>
-                <pre class="md-code">${() => JSON.stringify(report().result, null, 2)}</pre>
-              <//>
-              <${Show} when=${() => report()?.scriptError}><div class="text-danger">Script: ${() => report().scriptError}</div><//>
-              <${Show} when=${() => report()?.console?.length}>
-                <pre class="md-code">${() => report().console.join("\n")}</pre>
-              <//>
-              <${Show} when=${shotUrl}>
-                <img class="tool-shot" src=${shotUrl} alt="App screenshot" />
-                <div class="text-muted">${() => report()?.screenshot?.tier} screenshot${() => report()?.screenshot?.approximate ? " (approximate)" : ""}${() => report()?.screenshot?.pages ? `, page 1 of ${report().screenshot.pages}` : ""}</div>
-              <//>
-              <${Show} when=${() => report()?.screenshot?.unchanged}><div class="text-muted">Screenshot ${() => report().screenshot.unchanged}.</div><//>
-              <${Show} when=${() => report()?.screenshot?.error}><div class="text-warning">No screenshot: ${() => report().screenshot.error}</div><//>
-              <${Show} when=${offerSight}>
-                <button type="button" class="btn btn-sm btn-link p-0" data-let-see onClick=${letSee}><i class="bi bi-eye"></i> Share the tab for real screenshots</button>
+              <${Show} when=${() => r().saved}>${() => Muted(`Saved to ${r().saved}`)}<//>
+            `;
+          },
+        },
+      };
+
+      // Any result, readably: text as it is, anything else as JSON; never nothing.
+      function JSONBody(c) {
+        const shown = () => {
+          const r = c.result();
+          if (typeof r === "string") return r;
+          if (r !== undefined) return JSON.stringify(r, null, 2);
+          if (c.block()) return JSON.stringify(c.block(), (k, v) => v instanceof Uint8Array ? `(${v.length} bytes)` : v, 2);
+          return null;
+        };
+        return html`
+          <div class="d-flex flex-column gap-1" data-json>
+            <${Show} when=${() => Object.keys(c.input()).length}>
+              <div class="tool-label">Input</div>${() => Pre(JSON.stringify(c.input(), null, 2))}
+            <//>
+            <${Show} when=${shown} fallback=${() => Muted(c.running() ? "Running…" : "No result.")}>
+              <div class="tool-label">Result</div>${() => Pre(shown())}
+            <//>
+            <${Show} when=${() => c.images().length}><${Shots} images=${() => c.images()} /><//>
+          </div>
+        `;
+      }
+      // Any other tool: its name and first string argument, and its result as JSON.
+      const DEFAULT_VIEW = {
+        icon: "bi-tools",
+        title: c => firstLine(Object.values(c.input()).find(v => typeof v === "string") ?? ""),
+        body: JSONBody,
+      };
+
+      function EditorBody(props) {
+        const c = props.c;
+        const r = () => asObject(c.result());
+        const writing = () => !c.done() && (c.input().file_text ?? c.input().new_str);
+        const download = () => {
+          const url = URL.createObjectURL(new Blob([r().content], { type: "text/plain" }));
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = (r().path || "file.txt").split("/").pop() || "file.txt";
+          a.click();
+          URL.revokeObjectURL(url);
+        };
+        return html`
+          <div class="d-flex flex-column gap-1">
+            <${Show} when=${writing}><pre class="md-code tool-pre" ref=${follow(writing)}>${writing}</pre><//>
+            <${Show} when=${() => r().content !== undefined}>
+              ${() => Pre(r().content)}
+              <button type="button" class="btn btn-sm btn-link p-0 align-self-start text-muted" onClick=${download} title="Download"><i class="bi bi-download"></i> Download</button>
+            <//>
+            <${Show} when=${() => r().entries}><${ListBody} empty="(empty)" rows=${() => r().entries.map(e => ({ primary: e }))} /><//>
+            <${Show} when=${() => r().status === "deleted"}>${() => Muted("Deleted")}<//>
+            <${Show} when=${() => c.done() && r().content === undefined && !r().entries && r().status !== "deleted" && !r().error}>${() => JSONBody(c)}<//>
+          </div>
+        `;
+      }
+
+      // A variant is a take on a matter of taste, and taste is the user's: each can be seen and chosen from its card.
+      function TakeActions(props) {
+        const c = props.c, ws = c.workspace;
+        const r = () => asObject(c.taskResult());
+        const takeFiles = () => r().type === "variant" ? Object.keys(r().versions ?? {}) : [];
+        const takePage = () => takeFiles().find(isRenderable) ?? takeFiles()[0];
+        // In use: each head is the take's version, or a restore of it.
+        const inUse = () => takeFiles().every(p => {
+          const s = ws?.state, head = s?.project?.heads?.[p], want = r().versions[p];
+          return head === want || s?.versions.find(v => v.id === head)?.restoredFrom === want;
+        });
+        const useTake = async () => {
+          for (const p of takeFiles()) await ws.restore(r().versions[p]);
+          await ws.select(takePage());
+        };
+        return html`
+          <${Show} when=${() => ws && takeFiles().length}>
+            <div class="d-flex gap-3 align-items-center" data-take>
+              <button type="button" class="btn btn-sm btn-link p-0" onClick=${act(ws, () => { ws.setState("tab", "preview"); return ws.preview(r().versions[takePage()]); })}>Preview this take</button>
+              <${Show} when=${inUse} fallback=${html`<button type="button" class="btn btn-sm btn-link p-0" onClick=${act(ws, useTake)}>Use this take</button>`}>
+                <span class="badge text-bg-dark">in use</span>
               <//>
             </div>
+          <//>
+        `;
+      }
+
+      // A sub-agent's card, open: what it found, then its own conversation, its calls as cards like the lead's.
+      function TaskBody(props) {
+        const c = props.c;
+        const r = () => asObject(c.taskResult());
+        const sub = () => subagentViews().get(c.id);
+        const threadId = () => r().subagentThreadId ?? sub()?.threadId ?? null;
+        const [stored, setStored] = createSignal(null);
+        // Once its entry has gone (a minute after it ends), its thread has the conversation.
+        createEffect(() => {
+          const id = threadId();
+          if (sub() || !id) return;
+          db.getAllFromIndex("messages", "threadId", id).then(msgs => setStored(msgs.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))));
+        });
+        const messages = () => sub() ? [...sub().messages, ...(sub().currentMessage?.content?.length ? [sub().currentMessage] : [])] : stored() ?? [];
+        return html`
+          <div class="d-flex flex-column gap-1">
+            <${Show} when=${() => r().summary}><div class="tool-answer"><${Markdown} text=${() => r().summary} /></div><//>
+            <${Show} when=${() => r().started && !c.delivered()}>${() => Muted(sub()?.status === "running" ? "Running in the background; its result arrives in a later message." : "Started in the background; its result arrives in a later message.")}<//>
+            <${Show} when=${() => r().folder}>${() => Muted(`Saved to ${r().folder}`)}<//>
+            <${Show} when=${() => r().adopt || r().note}>${() => Muted(r().adopt || r().note)}<//>
+            <${Show} when=${() => messages().length} fallback=${html`<${Show} when=${threadId}>${() => Muted("Loading its conversation…")}<//>`}>
+              <div class="tool-label">Its conversation</div>
+              <${SubConversation} messages=${messages} loading=${() => sub()?.status === "running"} workspace=${c.workspace} />
+            <//>
+            <${Show} when=${() => !messages().length && !threadId() && !r().summary && !r().started && c.done()}>${() => JSONBody(c)}<//>
+          </div>
+        `;
+      }
+
+      // A sub-agent's messages, one level in, with the same blocks and cards as the lead's.
+      function SubConversation(props) {
+        const lookup = createMemo(() => resultsOf(props.messages));
+        const isUser = m => m.role === "user" && !m.content?.some(c => c.toolResult);
+        return html`
+          <div class="tool-sub" data-subconversation>
+            <${For} each=${() => props.messages ?? []}>${m => html`
+              <${Show} when=${() => m.content?.some(showsBlock)}>
+                <div class="d-flex flex-column mb-1 min-w-0" classList=${() => ({ "align-items-end": isUser(m) })}>
+                  <${For} each=${() => m.content.filter(showsBlock)}>${content => html`
+                    <${MessageContent} message=${m} content=${content} results=${() => lookup().results} delivered=${() => lookup().delivered}
+                      loading=${() => props.loading} workspace=${props.workspace} live=${() => props.loading && m === props.messages.at(-1) && content === m.content.at(-1)} />
+                  `}<//>
+                </div>
+              <//>
+            `}<//>
+          </div>
+        `;
+      }
+
+      // The card. block: the call's result block ({ toolResult, timing }), once there is one; delivered: a background
+      // sub-agent's result; loading: the run it is in still runs, so a call without a result is running.
+      function ToolCard(props) {
+        const name = props.toolUse.name;
+        const view = TOOL_VIEWS[name] ?? DEFAULT_VIEW;
+        const id = props.toolUse.toolUseId;
+        const block = () => props.block?.toolResult;
+        const input = createMemo(() => {
+          if (props.input !== undefined) return asObject(props.input);
+          try { return asObject(parseJSON(props.toolUse.input)); } catch { return {}; }
+        });
+        const result = createMemo(() => resultValue(block()));
+        const c = {
+          name, id, workspace: props.workspace,
+          input, result, block,
+          timing: () => props.block?.timing,
+          done: () => !!block(),
+          loading: () => !!props.loading,
+          running: () => !block() && !!props.loading,
+          live: createMemo(() => block() ? null : toolProgress().get(id) ?? null),
+          images: createMemo(() => imagesOf(block())),
+          delivered: () => props.delivered,
+          // A background sub-agent's result is the one delivered later; its call only said it started.
+          taskResult: () => props.delivered ?? result(),
+        };
+        const error = createMemo(() => {
+          const r = name === "task" ? c.taskResult() : result();
+          if (typeof r?.error === "string") return r.error;
+          if (block()?.status === "error") return typeof r === "string" ? r : JSON.stringify(r);
+          return null;
+        });
+        const status = createMemo(() => view.status?.(c) ?? (error() ? { tone: "error", text: "error" } : !c.done() ? (c.loading() ? { tone: "busy" } : { tone: "idle", text: "no result" }) : { tone: "ok" }));
+        const ms = () => (view.ms ? view.ms(c) : c.timing()?.ms) ?? null;
+        const title = () => view.title?.(c) ?? "";
+        const summary = () => view.summary?.(c) ?? "";
+
+        const [chosen, setChosen] = createSignal(null); // the reader's own open or closed
+        const open = () => chosen() ?? !!view.open?.(c);
+        const [mounted, setMounted] = createSignal(false);
+        createEffect(() => open() && setMounted(true));
+        const toggle = () => setChosen(!open());
+        const onKey = e => (e.key === "Enter" || e.key === " ") && e.target === e.currentTarget && (e.preventDefault(), toggle());
+
+        const icon = () => {
+          const s = status();
+          if (s.tone === "busy") return html`<span class="spinner-border spinner-border-sm text-secondary tool-status" role="status" aria-label="Running"></span>`;
+          const cls = s.tone === "error" ? "bi-x-circle-fill text-danger" : s.tone === "idle" ? "bi-dash-circle text-secondary" : "bi-check-circle-fill text-success";
+          return html`<i class=${`bi ${cls} tool-status`} aria-label=${s.tone}></i>`;
+        };
+        const badge = () => {
+          const s = status();
+          if (!s.text || s.tone === "busy") return "";
+          return html`<span class=${`badge tool-badge ${s.tone === "error" ? "text-bg-danger" : s.tone === "ok" ? "text-bg-success" : "text-bg-light border"}`}>${s.text}</span>`;
+        };
+
+        return html`
+          <div class="tool-card small" data-tool=${name} data-status=${() => status().tone} data-open=${() => String(open())}>
+            <div class="tool-head" role="button" tabindex="0" aria-expanded=${() => String(open())} onClick=${toggle} onKeyDown=${onKey}>
+              ${icon}
+              <i class=${`bi ${view.icon} tool-icon`} aria-hidden="true"></i>
+              <span class="tool-name">${name}</span>
+              <span class="tool-title" classList=${{ "font-monospace": !!view.mono }} title=${title}>${title}</span>
+              <${Show} when=${summary}><span class="tool-summary" title=${summary}>${summary}</span><//>
+              ${badge}
+              <${Show} when=${() => view.aside}><span class="tool-aside" onClick=${e => e.stopPropagation()}>${() => view.aside(c)}</span><//>
+              <${Show} when=${() => ms() != null}><span class="tool-meta">${() => formatMs(ms())}</span><//>
+              <i class="bi bi-chevron-right tool-chevron" aria-hidden="true"></i>
+            </div>
+            <${Show} when=${error}><div class="tool-error text-danger text-pre" data-error>${error}</div><//>
+            <${Show} when=${() => view.footer}><div class="tool-foot">${() => view.footer(c)}</div><//>
+            <${Show} when=${mounted}>
+              <div class="tool-body" hidden=${() => !open()}>${() => view.body(c)}</div>
+            <//>
+          </div>
+        `;
+      }
+
+      // A note from the harness, not the user: an old harness text block, a director's instruction, or a message's
+      // metadata (when it was sent, the screen, attachments, changes). Small, and closed until asked.
+      function HarnessNote(props) {
+        const c = () => props.content;
+        const label = () => {
+          if (c().instruction) return `${c().instruction.rule}${c().instruction.status === "capped" ? " (capped, not sent)" : ""}`;
+          if (c().metadata) {
+            const m = c().metadata;
+            return [m.timestamp && `sent ${m.timestamp.replace("T", " ").slice(0, 16)}`, m.client && `${m.client.device ?? ""} ${m.client.viewport ?? ""}`.trim(),
+              m.attachments?.length && plural(m.attachments.length, "attachment"), m.changes && "changes", m.state && "plan state"].filter(Boolean).join(" · ") || "metadata";
+          }
+          return "note";
+        };
+        const text = () => {
+          if (c().instruction) return c().instruction.text;
+          if (!c().metadata) return c().text;
+          const m = c().metadata;
+          return [
+            m.timestamp && `Sent: ${m.timestamp}`,
+            m.client && `Client: ${["device", "viewport", "tz", "locale"].map(k => m.client[k]).filter(Boolean).join(", ")}`,
+            m.attachments?.length && `Attachments: ${m.attachments.map(f => f.name ?? f.path).join(", ")}`,
+            m.changes && `Changes:\n${m.changes}`,
+            m.state && `Plan:\n${m.state}`,
+            m.files && `Files: ${m.files.join(", ") || "none"}`,
+          ].filter(Boolean).join("\n");
+        };
+        return html`
+          <details class="harness-note small text-muted" data-rule=${() => c().instruction?.rule} data-note=${() => c().metadata ? "metadata" : c().instruction ? "instruction" : "harness"}>
+            <summary><i class="bi bi-info-circle"></i> harness · ${label}</summary>
+            <pre class="md-code">${text}</pre>
           </details>
         `;
       }
@@ -1812,7 +2508,7 @@
 
       // Whether a block puts anything on screen. A result shows in its call's card; a blank block, or thought that
       // left nothing to read, takes no room.
-      const showsBlock = c => !!(c?.harness || c?.instruction || c?.text?.trim() || c?.toolUse || c?.reasoningContent?.reasoningText?.text || c?.reasoningContent?.redactedContent != null);
+      const showsBlock = c => !!(c?.harness || c?.instruction || c?.metadata || c?.text?.trim() || c?.toolUse || c?.reasoningContent?.reasoningText?.text || c?.reasoningContent?.redactedContent != null);
 
       // A reply as Markdown, a block at a time: the blocks above the one still streaming keep their DOM, and only the
       // last renders again.
@@ -1825,35 +2521,23 @@
         `;
       }
 
-      const CUSTOM_CARDS = ["think", "editor", "code", "mcp", "task", ...WORKSPACE_TOOL_NAMES];
-
       function MessageContent(props) {
         const c = () => props.content;
         const m = () => props.message;
         const isText = () => c().text !== undefined;
-        const toolResult = createMemo(() => c().toolUse && props.results.get(c().toolUse.toolUseId));
-        const result = () => toolResult()?.content?.[0]?.json?.result;
+        const block = createMemo(() => c().toolUse && props.results?.get(c().toolUse.toolUseId));
         const input = createMemo(() => parseJSON(c().toolUse?.input));
 
         // A block that fails to render says so in place; the error must not reach the store update that streamed it.
         return html`
           <${ErrorBoundary} fallback=${error => html`<div class="small text-danger">This block could not be shown: ${String(error?.message ?? error)}</div>`}>
           <${Switch}>
-            <${Match} when=${() => c().harness}>
-              <details class="small text-muted harness-note">
-                <summary class="cursor-pointer"><i class="bi bi-info-circle"></i> Note to the agent</summary>
-                <pre class="md-code">${() => c().text}</pre>
-              </details>
-            <//>
-            <${Match} when=${() => c().instruction}>
-              <details class="small text-muted harness-note" data-rule=${() => c().instruction.rule}>
-                <summary class="cursor-pointer"><i class="bi bi-info-circle"></i> Note to the agent: ${() => c().instruction.rule}${() => c().instruction.status === "capped" ? " (capped, not sent)" : ""}</summary>
-                <pre class="md-code">${() => c().instruction.text}</pre>
-              </details>
+            <${Match} when=${() => c().harness || c().instruction || c().metadata}>
+              <${HarnessNote} content=${c} />
             <//>
             <${Match} when=${() => isText() && m().role === "user"}>
               <${Show}
-                when=${() => props.editing?.id === m().id}
+                when=${() => props.editing && props.editing.id === m().id}
                 fallback=${html`<div class="small rounded p-2 text-dark bg-secondary-subtle d-inline-block text-pre">${() => c().text}</div>`}>
                 <${EditableMessage} text=${() => props.editing?.text ?? c().text} onSave=${text => props.onSave?.(m().id, text)} onCancel=${props.onCancel} />
               <//>
@@ -1864,33 +2548,9 @@
             <${Match} when=${() => c().reasoningContent || c().toolUse?.name === "think"}>
               <${Reasoning} content=${c} input=${input} live=${() => props.live} />
             <//>
-            <${Match} when=${() => WORKSPACE_TOOL_NAMES.includes(c().toolUse?.name)}>
-              <${WorkspaceToolCard} toolUse=${c().toolUse} input=${input} workspace=${props.workspace} result=${toolResult} />
-            <//>
-            <${Match} when=${() => c().toolUse?.name === "editor"}>
-              <${EditorResult} input=${() => input() || {}} result=${result} />
-            <//>
-            <${Match} when=${() => c().toolUse?.name === "code"}>
-              <${CodeResult} input=${input} result=${result} />
-            <//>
-            <${Match} when=${() => c().toolUse?.name === "mcp"}>
-              <${McpResult} result=${result} />
-            <//>
-            <${Match} when=${() => c().toolUse?.name === "task"}>
-              <${TaskResult}
-                result=${result}
-                toolUseId=${() => c().toolUse.toolUseId}
-                workspace=${props.workspace} />
-            <//>
-            <${Match} when=${() => c().toolUse && !CUSTOM_CARDS.includes(c().toolUse?.name)}>
-              <details class="small rounded border p-2">
-                <summary class="cursor-pointer text-dark">${() => c().toolUse.name}</summary>
-                <div class="my-2 text-muted text-pre">
-                  ${() => JSON.stringify(input() ?? {}, null, 2)}
-                  <hr />
-                  ${() => JSON.stringify(toolResult() || {}, null, 2)}
-                </div>
-              </details>
+            <${Match} when=${() => c().toolUse}>
+              <${ToolCard} toolUse=${c().toolUse} input=${input} block=${block} delivered=${() => props.delivered?.get(c().toolUse.toolUseId)}
+                loading=${() => props.loading} workspace=${props.workspace} />
             <//>
           <//>
           <//>
@@ -1957,266 +2617,6 @@
               <button type="button" class="btn btn-sm btn-primary" onClick=${e => props.onSave(textareaRef.value)}>Save & Submit</button>
               <button type="button" class="btn btn-sm btn-secondary" onClick=${props.onCancel}>Cancel</button>
             </div>
-          </div>
-        `;
-      }
-
-      function EditorResult(props) {
-        const r = () => props.result;
-        const input = () => props.input ?? {};
-        // Until the result comes back, show what is being written.
-        const writing = () => !r() && (input().file_text ?? input().new_str);
-        const download = () => {
-          const content = r()?.content;
-          const path = r()?.path || "file.txt";
-          if (content === undefined) return;
-          const blob = new Blob([content], { type: "text/plain" });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = path.split("/").pop() || "file.txt";
-          a.click();
-          URL.revokeObjectURL(url);
-        };
-        return html`
-          <div class="editor-result small border rounded overflow-hidden mb-1">
-            <div class="px-2 py-1 bg-secondary-subtle text-muted border-bottom d-flex justify-content-between align-items-center">
-              <span>${() => r()?.path || input().path || (r()?.error ? "Error" : "…")}</span>
-              <${Show} when=${() => r()?.content !== undefined}>
-                <button type="button" class="btn btn-sm btn-link p-0 text-muted" onClick=${download} title="Download">
-                  <i class="bi bi-download"></i>
-                </button>
-              <//>
-            </div>
-            <${Show} when=${() => r()?.content !== undefined}>
-              <pre class="m-0 p-2 text-pre" style="max-height: 300px; overflow: auto;">${() => r().content}</pre>
-            <//>
-            <${Show} when=${writing}>
-              <pre class="m-0 p-2 text-pre" style="max-height: 300px; overflow: auto;" ref=${follow(writing)}>${writing}</pre>
-            <//>
-            <${Show} when=${() => r()?.entries}>
-              <div class="p-2 text-pre">${() => r().entries.length ? r().entries.join("\n") : "(empty)"}</div>
-            <//>
-            <${Show} when=${() => r()?.error}>
-              <div class="p-2 text-danger">${() => r().error}</div>
-            <//>
-            <${Show} when=${() => r()?.status === "deleted"}>
-              <div class="p-2 text-muted">Deleted</div>
-            <//>
-          </div>
-        `;
-      }
-
-      function CodeResult(props) {
-        const input = () => props.input;
-        const result = () => props.result;
-        const lang = () => input()?.language || (input()?.filename?.endsWith(".html") ? "html" : "js");
-
-        return html`
-          <div class="code-result small border rounded overflow-hidden mb-1">
-            <div class="px-2 py-1 bg-secondary-subtle text-muted border-bottom">
-              <span>${() => input()?.filename || lang()}</span>
-            </div>
-            <${Show} when=${() => input()?.source}>
-              <pre class="m-0 p-2 text-pre bg-light" style="max-height: 300px; overflow: auto;" ref=${follow(() => !result() && input()?.source)}>${() => input().source}</pre>
-            <//>
-            <${Show} when=${() => result()?.logs?.length}>
-              <pre class="m-0 p-2 text-pre border-top" style="max-height: 200px; overflow: auto;">${() => result().logs.join("\n")}</pre>
-            <//>
-            <${Show} when=${() => result()?.error}>
-              <div class="p-2 text-danger">${() => result().error}</div>
-            <//>
-          </div>
-        `;
-      }
-
-      function McpResult(props) {
-        const r = () => props.result;
-        const formatText = text => {
-          try { return JSON.stringify(JSON.parse(text), null, 2); }
-          catch { return text; }
-        };
-        return html`
-          <div class="mcp-result small border rounded overflow-hidden mb-1">
-            <div class="px-2 py-1 bg-secondary-subtle text-muted border-bottom">
-              <span>${() => r()?.server || "mcp"}</span>
-            </div>
-            <${Show} when=${() => r()?.error}>
-              <div class="p-2 text-danger">${() => r().error}</div>
-            <//>
-            <${Show} when=${() => r()?.servers}>
-              <div class="p-2 text-pre">${() => r().servers.map(s => `${s.enabled ? "●" : "○"} ${s.name} - ${s.url}`).join("\n")}</div>
-            <//>
-            <${Show} when=${() => r()?.tools}>
-              <div class="p-2 text-pre">${() => r().tools.map(t => `${t.name}${t.description ? ` - ${t.description}` : ""}`).join("\n")}</div>
-            <//>
-            <${Show} when=${() => r()?.resources}>
-              <div class="p-2 text-pre">${() => r().resources.map(res => `${res.name || res.uri}`).join("\n")}</div>
-            <//>
-            <${Show} when=${() => r()?.prompts}>
-              <div class="p-2 text-pre">${() => r().prompts.map(p => `${p.name}${p.description ? ` - ${p.description}` : ""}`).join("\n")}</div>
-            <//>
-            <${Show} when=${() => r()?.contents}>
-              <div class="p-2 text-pre">${() => r().contents.map(c => c.text ? formatText(c.text) : JSON.stringify(c, null, 2)).join("\n")}</div>
-            <//>
-            <${Show} when=${() => r()?.content}>
-              <div class="p-2 text-pre">${() => r().content.map(c => c.text ? formatText(c.text) : JSON.stringify(c, null, 2)).join("\n")}</div>
-            <//>
-            <${Show} when=${() => r()?.messages}>
-              <div class="p-2 text-pre">${() => r().messages.map(m => `[${m.role}] ${m.content?.text || JSON.stringify(m.content)}`).join("\n")}</div>
-            <//>
-          </div>
-        `;
-      }
-
-      // Renders a single message from a subagent conversation
-      function SubagentMessageBubble(props) {
-        const m = () => props.message;
-        const isToolResult = () => m()?.content?.some(c => c.toolResult);
-        const displayRole = () => isToolResult() ? "tool" : m()?.role;
-
-        const renderContent = (content) => {
-          if (!content) return "";
-          return content.map(c => {
-            if (c.text) return c.text;
-            if (c.toolUse) return `[${c.toolUse.name}] ${JSON.stringify(c.toolUse.input || {}, null, 2).slice(0, 200)}...`;
-            if (c.toolResult) {
-              const result = c.toolResult.content?.[0]?.json?.result;
-              const preview = typeof result === "string" ? result.slice(0, 200) : JSON.stringify(result || {}, null, 2).slice(0, 200);
-              return `Result: ${preview}${preview.length >= 200 ? "..." : ""}`;
-            }
-            if (c.reasoningContent) return `[Thinking...] ${(c.reasoningContent.reasoningText?.text || "").slice(0, 100)}...`;
-            return "";
-          }).filter(Boolean).join("\n");
-        };
-
-        return html`
-          <div class="mb-2" classList=${() => ({ "ps-3 border-start border-2": displayRole() === "tool" })}>
-            <div class="d-flex align-items-center gap-1 text-muted small mb-1">
-              <span class="fw-semibold">${displayRole}</span>
-            </div>
-            <div class="text-pre small" style="max-height: 150px; overflow: auto;">
-              ${() => renderContent(m()?.content)}
-            </div>
-          </div>
-        `;
-      }
-
-      function TaskResult(props) {
-        const r = () => props.result;
-
-        // Get running state for this tool call from the signal
-        const runningState = () => subagentViews().get(props.toolUseId);
-        const isRunning = () => runningState()?.status === "running";
-
-        // A variant's files at their versions; the page among them is what Preview shows.
-        const takeFiles = () => r()?.type === "variant" ? Object.keys(r().versions ?? {}) : [];
-        const takePage = () => takeFiles().find(isRenderable) ?? takeFiles()[0];
-        // In use: each head is the take's version, or a restore of it.
-        const inUse = () => takeFiles().every(p => {
-          const s = props.workspace?.state, head = s?.project?.heads?.[p], want = r().versions[p];
-          return head === want || s?.versions.find(v => v.id === head)?.restoredFrom === want;
-        });
-        const useTake = async () => {
-          for (const p of takeFiles()) await props.workspace.restore(r().versions[p]);
-          await props.workspace.select(takePage());
-        };
-
-        // State for expanded view of completed conversation
-        const [expanded, setExpanded] = createSignal(false);
-        const [fullMessages, setFullMessages] = createSignal([]);
-
-        // Load full conversation when expanded
-        createEffect(async () => {
-          if (expanded() && r()?.subagentThreadId) {
-            const msgs = await db.getAllFromIndex("messages", "threadId", r().subagentThreadId);
-            setFullMessages(msgs.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)));
-          }
-        });
-
-        return html`
-          <div class="task-result small border rounded overflow-hidden mb-1">
-            <div class="px-2 py-1 bg-secondary-subtle d-flex justify-content-between align-items-center">
-              <span class="text-muted">
-                <i class="bi bi-robot me-1"></i>
-                ${() => r()?.type || runningState()?.type || "task"} agent
-              </span>
-              <span class="text-muted">
-                ${() => isRunning() ? html`<i class="bi bi-arrow-repeat spin me-1"></i> Running...` : ""}
-                ${() => r()?.turns ? `${r().turns} turns` : ""}
-              </span>
-            </div>
-
-            <!-- Real-time streaming display while running -->
-            <${Show} when=${isRunning}>
-              <div class="bg-body-tertiary p-2 border-top" style="max-height: 400px; overflow: auto;">
-                <${For} each=${() => runningState()?.messages || []}>
-                  ${msg => html`<${SubagentMessageBubble} message=${msg} />`}
-                <//>
-                <!-- Current streaming message -->
-                <${Show} when=${() => runningState()?.currentMessage?.content?.length > 0}>
-                  <div class="opacity-75 mb-2">
-                    <div class="d-flex align-items-center gap-1 text-muted small mb-1">
-                      <span class="fw-semibold">assistant</span>
-                      <span class="spinner-grow spinner-grow-sm"></span>
-                    </div>
-                    <div class="text-pre small" style="max-height: 150px; overflow: auto;">
-                      ${() => {
-                        const content = runningState()?.currentMessage?.content || [];
-                        return content.map(c => c.text || "").filter(Boolean).join("\n");
-                      }}
-                    </div>
-                  </div>
-                <//>
-              </div>
-            <//>
-
-            <!-- Completed state: show error, summary, or expand option -->
-            <${Show} when=${() => !isRunning()}>
-              <${Show} when=${() => r()?.error}>
-                <div class="p-2 text-danger">${() => r().error}</div>
-              <//>
-              <${Show} when=${() => r()?.summary}>
-                <div class="p-2 text-pre">${() => r().summary}</div>
-              <//>
-              <${Show} when=${() => r()?.folder}>
-                <div class="px-2 pb-2 text-muted small">
-                  Saved to: ${() => r().folder}
-                </div>
-              <//>
-              <!-- A variant is a take on a matter of taste, and taste is the user's: each can be seen and chosen here. -->
-              <${Show} when=${() => props.workspace && takeFiles().length}>
-                <div class="px-2 pb-2 d-flex gap-3 align-items-center">
-                  <button type="button" class="btn btn-sm btn-link p-0" onClick=${act(props.workspace, () => { props.workspace.setState("tab", "preview"); return props.workspace.preview(r().versions[takePage()]); })}>Preview this take</button>
-                  <${Show} when=${inUse} fallback=${html`<button type="button" class="btn btn-sm btn-link p-0" onClick=${act(props.workspace, useTake)}>Use this take</button>`}>
-                    <span class="badge text-bg-dark">in use</span>
-                  <//>
-                </div>
-              <//>
-              <${Show} when=${() => r()?.subagentThreadId}>
-                <div class="px-2 pb-2">
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-link p-0 text-muted"
-                    onClick=${_ => setExpanded(e => !e)}>
-                    <i class=${() => `bi ${expanded() ? 'bi-chevron-up' : 'bi-chevron-down'} me-1`}></i>
-                    ${() => expanded() ? "Hide conversation" : "View full conversation"}
-                  </button>
-                </div>
-              <//>
-
-              <!-- Expanded conversation view -->
-              <${Show} when=${expanded}>
-                <div class="bg-body-tertiary border-top p-2" style="max-height: 500px; overflow: auto;">
-                  <${For} each=${fullMessages}>
-                    ${msg => html`<${SubagentMessageBubble} message=${msg} />`}
-                  <//>
-                  <${Show} when=${() => fullMessages().length === 0}>
-                    <div class="text-muted small">Loading conversation...</div>
-                  <//>
-                </div>
-              <//>
-            <//>
           </div>
         `;
       }
@@ -3454,7 +3854,8 @@
         }
 
         // The whole page, in pages (see fullMethods). Answers { images, thumb, shot }; each image carries its label.
-        async function takeFullPage(frame, methods = fullMethods({ sharing: capture.track?.readyState === "live" && !!capture.frames })) {
+        // step(status): says which page it is on.
+        async function takeFullPage(frame, methods = fullMethods({ sharing: capture.track?.readyState === "live" && !!capture.frames }), step = () => {}) {
           const doc = frame.contentDocument, failures = [];
           if (!doc?.documentElement) return { images: null, thumb: null, shot: { error: "the app has no document" } };
           for (const method of methods) {
@@ -3462,7 +3863,8 @@
               if (method === "stitch") await reveal();
               const sheet = method === "stitch" ? await stitch(doc, grabFor(frame)) : await snapshot(doc);
               const pages = pagesOf(sheet, doc.documentElement.clientHeight), sent = pages.slice(0, MAX_PAGES);
-              const encoded = await Promise.all(sent.map(p => encodeImage(p.canvas, { sw: p.canvas.width, sh: p.canvas.height }, p.canvas.width)));
+              let made = 0;
+              const encoded = await Promise.all(sent.map(p => encodeImage(p.canvas, { sw: p.canvas.width, sh: p.canvas.height }, p.canvas.width).then(e => (step(`capturing page ${Math.min(++made + 1, sent.length)} of ${sent.length}`), e))));
               const shot = { tier: method, full: `${sheet.width}x${sheet.height} px in ${pages.length} page${pages.length > 1 ? "s" : ""}, each up to two screens`, pages: pages.length };
               // Only stitch shows the browser's own pixels; the snapshot renders a frozen copy of the page.
               if (method !== "stitch") shot.approximate = true;
@@ -3499,8 +3901,10 @@
         // thumb, runLog }; a project closed meanwhile throws { closed: true }. A parked run (a scratch page) is one
         // frame, off the page and tests on, so the preview stays the shown artifact's.
         // files: the rest of the folder, { path: text }, served beside it. signal: the run stops where it is.
-        async function run({ version, doc, files = {}, script = null, screenshot = false, full = false, parked = false, signal = null }) {
+        // progress({ status }): the run's steps, for the card of the call that asked for it.
+        async function run({ version, doc, files = {}, script = null, screenshot = false, full = false, parked = false, signal = null, progress = null }) {
           signal?.throwIfAborted();
+          const step = status => progress?.({ status });
           if (!parked) liveErrors = [];
           const started = performance.now();
           const size = sizeFor();
@@ -3534,7 +3938,7 @@
             previewRun.settled = true;
             unpublish(runs, base);
             const tested = [doc, ...Object.entries(files).filter(([p]) => /\.m?js$/.test(p)).map(([, text]) => text)].some(text => text.includes("TESTS_DONE"));
-            if (isHtml(version.path) && tested) await waitForTests(testRun);
+            if (isHtml(version.path) && tested) { step("running tests…"); await waitForTests(testRun); }
           } finally {
             signal?.removeEventListener("abort", stop);
           }
@@ -3546,6 +3950,7 @@
           let result, scriptError;
           const consoleBefore = previewRun.console.length;
           if (script) {
+            step("running the script…");
             try { result = await runScript(previewRun, script); }
             catch (e) { scriptError = String(e?.message || e); }
           }
@@ -3555,8 +3960,9 @@
           const layout = isHtml(version.path) && !parked ? layoutChecks(previewRun.frame.contentDocument) : [];
           const phone = isHtml(version.path) && !parked ? await atPhoneWidth(testRun, size, layout) : null;
           // A full page is pages, not one view: image is then a list, each labelled.
+          if (wanted) step(full ? "capturing the whole page…" : "taking a screenshot…");
           let { image = null, thumb = null, fingerprint = null, shot = null } = !wanted ? {}
-            : full ? await takeFullPage(parked ? scratchFrame : previewFrame, parked ? fullMethods({ sharing: false }) : undefined).then(f => ({ ...f, image: f.images }))
+            : full ? await takeFullPage(parked ? scratchFrame : previewFrame, parked ? fullMethods({ sharing: false }) : undefined, step).then(f => ({ ...f, image: f.images }))
             : parked ? { ...(await rasterize(scratchFrame)), shot: { tier: "dom", approximate: true } } : await takeScreenshot(previewFrame);
           if (image && phoneRun && !phoneRun.aborted) {
             try {
@@ -3925,41 +4331,319 @@
           assert(text.includes("Hello world"), "Response should echo input");
         }
 
-        async function testTaskResultRendering() {
-          await new Promise(r => setTimeout(r, 100));
+        // Why: the bash card opened empty, and other tools' results showed as raw JSON or nothing: the cards knew only
+        // a few shapes. Every tool has a view in one frame now (ToolCard), and any other tool a readable default.
+        const cardImage = async (label, color = "#4c6ef5", w = 320, h = 200) => {
+          const canvas = new OffscreenCanvas(w, h), g = canvas.getContext("2d");
+          g.fillStyle = color; g.fillRect(0, 0, w, h);
+          g.fillStyle = "#fff"; g.font = "bold 28px sans-serif"; g.fillText(label, 20, h / 2);
+          return { image: { format: "png", source: { bytes: new Uint8Array(await (await canvas.convertToBlob({ type: "image/png" })).arrayBuffer()) } } };
+        };
+        // One call per tool: [name, input, result content, what the card shows open].
+        async function toolFixtures() {
+          const json = result => [{ json: { result } }];
+          return [
+            ["bash", { command: "npm test" }, json({ stdout: "> test\n> node --test\n\nok 1 - adds\nnot ok 2 - halves\n[... 120 of 20000 characters cut; all of stdout is in /tmp/bash-out/1.stdout: read it with grep, head, tail or sed -n ...]\n", stderr: "\x1b[31mnpm ERR! Test failed.\x1b[0m\n", exitCode: 1, ms: 1840 }), "not ok 2 - halves"],
+            ["bash", { command: "ls src && grep -rn TODO src" }, json({ stdout: "app.js\nstyle.css\nsrc/app.js:12:  // TODO: undo\n", stderr: "", exitCode: 0, ms: 35, files: [{ path: "notes.txt", version: 7 }] }), "src/app.js:12"],
+            ["run_app", { full: true }, [{ json: { result: { report: { ok: true, path: "index.html", version: 3, tests: { passed: 4, failed: 0 }, screenshot: { tier: "dom", approximate: true, pages: 2, full: "1280x2400 px in 2 pages, each up to two screens" } } } } },
+              { text: "page 1 of 2" }, await cardImage("page 1"), { text: "page 2 of 2" }, await cardImage("page 2", "#2b8a3e")], "page 2 of 2"],
+            ["run_app", { script: "document.querySelector('button').click(); return document.title" }, json({ report: { ok: false, path: "index.html", version: 3, errors: ["TypeError: x is undefined (index.html:12)"], tests: { passed: 1, failed: 1, failures: ["timer resets"] }, result: "Pomodoro", console: ["clicked"] } }), "FAIL: timer resets"],
+            ["write_file", { path: "index.html", content: "<!doctype html>\n<title>Timer</title>" }, json({ version: 4, change: "new file, 2 lines", report: { ok: true, path: "index.html", version: 4 } }), "ok"],
+            ["edit_file", { path: "index.html", patch: "<<<<<<< SEARCH\n<title>Timer</title>\n=======\n<title>Pomodoro</title>\n>>>>>>> REPLACE" }, json({ version: 5, change: "1 line changed", report: { ok: false, path: "index.html", version: 5, errors: ["ReferenceError: start is not defined"] } }), "+ <title>Pomodoro</title>"],
+            ["view_file", { path: "/" }, json("index.html\nsrc/app.js\nsrc/style.css\nPLAN.md"), "src/app.js"],
+            ["view_file", { path: "src/app.js", start: 1, end: 3 }, json("src/app.js v2: 40 lines, showing 1-3\n1  const a = 1;\n2  const b = 2;\n3  export { a, b };"), "export { a, b }"],
+            ["history", {}, json("v5*  index.html  agent  just now  42 lines  failing, 1 error\nv4  index.html  agent  2m ago  41 lines  ok\nv2  src/app.js  shell  5m ago  40 lines  not run\n(* = current)"), "v4 index.html"],
+            ["diff", { from: 4 }, json("--- v4\n+++ current\n@@ -1,2 +1,2 @@\n-<title>Timer</title>\n+<title>Pomodoro</title>"), "+<title>Pomodoro</title>"],
+            ["restore", { version: 4 }, json({ version: 6, path: "index.html", change: "1 line changed, restored v4", report: { ok: true, path: "index.html", version: 6 } }), "ok"],
+            ["web_search", { query: "pomodoro technique intervals" }, json("1. The Pomodoro Technique\n   https://en.wikipedia.org/wiki/Pomodoro_Technique (3 days ago)\n   A time management method: 25 minutes of work, then a short break.\n\n2. How long is a pomodoro?\n   https://example.com/pomodoro\n   Most people use 25 minutes."), "The Pomodoro Technique"],
+            ["read_url", { url: "https://example.com/pomodoro" }, json("# How long is a pomodoro?\nhttps://example.com/pomodoro (text/html)\n\nMost people use 25 minutes of focus.\n\nThen a five minute break."), "Most people use 25 minutes"],
+            ["plan", { add: { title: "Timer counts down", check: { kind: "test", run: "tests" } } }, json("Added item 2. Its check fails now, as it should before the work.\nGoal: A pomodoro timer\nItems: 1 of 2 done.\n1. [done] Page loads\n2. [open] Timer counts down\nCurrent: item 2; check: the page's tests."), "Timer counts down"],
+            ["task", { type: "explore", prompt: "Find the test files\nand list them" }, json({ type: "explore", summary: "Found **3** test files.", folder: "/explore/findings/", turns: 2 }), "Found 3 test files"],
+            ["wait", { id: "tool-async" }, json({ results: [{ id: "tool-async", result: { type: "general", summary: "Wrote the README." } }] }), "Wrote the README"],
+            ["code", { source: "console.log(6 * 7)" }, json({ logs: ["42"] }), "42"],
+            ["editor", { command: "view", path: "notes.md" }, json({ path: "notes.md", content: "# Notes\n- buy beans" }), "buy beans"],
+            ["editor", { command: "view", path: "/" }, json({ entries: ["notes.md", "skills/"] }), "skills/"],
+            ["mcp", { command: "list_tools", server: "files" }, json({ server: "files", tools: [{ name: "read", description: "Read a file" }] }), "Read a file"],
+            ["frobnicate", { target: "widget" }, json({ turned: 3, knobs: ["a", "b"] }), "knobs"],
+          ];
+        }
+        const fixtureBlock = (id, content, ms = 1234) => ({ toolResult: { toolUseId: id, content }, timing: { ms } });
+        function mountCard(props, width = 640) {
+          const box = document.createElement("div");
+          box.style.cssText = `position:absolute;left:-9999px;top:0;width:${width}px;`;
+          document.body.append(box);
+          const value = v => typeof v === "function" ? v : () => v;
+          const dispose = render(() => html`<${ToolCard} toolUse=${props.toolUse} block=${value(props.block)} delivered=${value(props.delivered)} loading=${value(props.loading)} workspace=${props.workspace} />`, box);
+          return { box, card: box.querySelector(".tool-card"), dispose: () => { dispose(); box.remove(); } };
+        }
+        // A sub-agent's entry as the engine would send it. The engine's full list, sent as a tab connects, would drop
+        // one set here, so it is set again until let go.
+        function holdSubagent(id, entry) {
+          const set = () => setSubagentViews(v => v.get(id) === entry ? v : new Map(v).set(id, entry));
+          const stop = createRoot(dispose => { createEffect(() => { subagentViews(); set(); }); return dispose; });
+          return () => { stop(); setSubagentViews(v => { const n = new Map(v); n.delete(id); return n; }); };
+        }
+        const openCard = card => { if (card.dataset.open !== "true") card.querySelector(".tool-head").click(); };
 
-          // Create a test result object
-          const testResult = {
-            type: "explore",
-            summary: "Found test data",
-            folder: "/explore/test/",
-            turns: 2,
-            subagentThreadId: 12345
-          };
+        async function testToolCards() {
+          // Each tool's card: its name and time in the header, closed until opened, and open, a body with its result.
+          for (const [i, [name, input, content, expect]] of (await toolFixtures()).entries()) {
+            const id = `fixture-${i}`;
+            const { card, dispose } = mountCard({ toolUse: { toolUseId: id, name, input }, block: fixtureBlock(id, content), loading: false });
+            try {
+              assert(card?.dataset.tool === name, `${name}: a card`);
+              assert(card.querySelector(".tool-name").textContent === name && card.querySelector(".tool-meta")?.textContent, `${name}: its name and its time in the header: ${card.querySelector(".tool-head").textContent}`);
+              assert(!card.querySelector(".tool-body") || card.querySelector(".tool-body").hidden, `${name}: closed until opened`);
+              openCard(card);
+              const body = card.querySelector(".tool-body");
+              assert(body && !body.hidden && body.textContent.trim(), `${name}: the open body shows something`);
+              assert(card.textContent.includes(expect), `${name}: shows "${expect}": ${card.textContent.slice(0, 400)}`);
+            } finally {
+              dispose();
+            }
+          }
+          const fixtures = Object.fromEntries((await toolFixtures()).map(f => [f[0] + (f[1].path ? ":" + f[1].path : f[1].command && f[0] !== "bash" ? ":" + f[1].command : ""), f]).reverse()); // the first of a name wins
+          const mounted = (key, extra = {}) => { const [name, input, content] = fixtures[key]; return mountCard({ toolUse: { toolUseId: key, name, input }, block: fixtureBlock(key, content), loading: false, ...extra }); };
 
-          // Render TaskResult component
-          const container = document.createElement("div");
-          document.body.appendChild(container);
+          // bash: the command is the title; the body is the terminal, stderr apart and its colours stripped, the exit code
+          // when it isn't 0, and where the cut output went.
+          let m = mounted("bash");
+          try {
+            assert(m.card.querySelector(".tool-title").textContent === "npm test" && m.card.querySelector(".tool-badge")?.textContent === "exit 1" && m.card.dataset.status === "error", `bash: command and exit code: ${m.card.querySelector(".tool-head").textContent}`);
+            assert(m.card.querySelector(".tool-meta").textContent === "1.2 s", `the time from the result's timing: ${m.card.querySelector(".tool-meta").textContent}`);
+            openCard(m.card);
+            const term = m.card.querySelector("[data-terminal]");
+            assert(term.textContent.startsWith("$ npm test\n> test") && term.querySelector(".term-err").textContent === "npm ERR! Test failed.\n", `the terminal: ${JSON.stringify(term.textContent)}`);
+            assert(m.card.querySelector("[data-exit]")?.textContent.includes("1") && m.card.textContent.includes("/tmp/bash-out/1.stdout"), "exit code and the saved output's file");
+          } finally { m.dispose(); }
 
-          render(() => html`<${TaskResult}
-            result=${() => testResult}
-            toolUseId=${() => "render-test-001"} />`, container);
+          // run_app with full: each page with its label; the version's link with its thumbnail in the header.
+          m = mounted("run_app", { workspace: { state: {}, setState() {}, preview: async () => {}, notify() {} } });
+          try {
+            assert(m.card.querySelector(".tool-badge.text-bg-success")?.textContent === "ok" && m.card.querySelector(".tool-summary")?.textContent === "4 passed" && m.card.querySelector(".tool-thumb"), `run_app: report badge and thumbnail: ${m.card.querySelector(".tool-head").innerHTML.slice(0, 300)}`);
+            openCard(m.card);
+            const captions = [...m.card.querySelectorAll("figcaption")].map(f => f.textContent);
+            assert(eq(captions, ["page 1 of 2", "page 2 of 2"]) && m.card.querySelectorAll("img.tool-shot").length === 2, `its pages, labelled: ${captions}`);
+          } finally { m.dispose(); }
 
-          await new Promise(r => setTimeout(r, 50));
+          // web_search: a list, each row its result's link.
+          m = mounted("web_search");
+          try {
+            openCard(m.card);
+            const rows = [...m.card.querySelectorAll(".tool-list a.tool-row")];
+            assert(rows.length === 2 && rows[0].href === "https://en.wikipedia.org/wiki/Pomodoro_Technique" && rows[0].target === "_blank" && rows[0].textContent.includes("3 days ago"), `results as rows: ${rows.map(r => r.textContent)}`);
+            assert(m.card.querySelector(".tool-summary").textContent === "2 results", "the count in the header");
+          } finally { m.dispose(); }
 
-          const taskResult = container.querySelector(".task-result");
-          assert(taskResult, "TaskResult should render");
-          assert(taskResult.textContent.includes("explore"), "Should show agent type");
-          assert(taskResult.textContent.includes("Found test data"), "Should show summary");
-          assert(taskResult.textContent.includes("2 turns"), "Should show turns");
+          // A listing is rows that open the file in Code.
+          let opened = null;
+          m = mounted("view_file:/", { workspace: { state: {}, setState: s => (opened = s), notify() {} } });
+          try {
+            openCard(m.card);
+            [...m.card.querySelectorAll("button.tool-row")].find(b => b.textContent.includes("src/app.js")).click();
+            await waitFor(() => opened);
+            assert(opened.selected === "src/app.js" && opened.tab === "code", `a file's row opens it: ${JSON.stringify(opened)}`);
+          } finally { m.dispose(); }
 
-          // Check for expand button - wait a bit more for reactive content
-          await new Promise(r => setTimeout(r, 100));
-          const expandBtn = taskResult.querySelector("button");
-          assert(expandBtn, "Should have expand button");
-          assert(expandBtn.textContent.includes("View"), "Expand button should say View");
+          // Errors show with the card closed.
+          m = mountCard({ toolUse: { toolUseId: "fixture-error", name: "web_search", input: { query: "x" } }, block: fixtureBlock("fixture-error", [{ json: { result: { error: "Brave Search answered 401: bad key" } } }]), loading: false });
+          try {
+            assert(m.card.dataset.status === "error" && m.card.querySelector("[data-error]")?.textContent.includes("401") && m.card.dataset.open === "false", "an error shows on the closed card");
+          } finally { m.dispose(); }
 
-          container.remove();
+          // The default view never opens empty: the raw block when there is no result value, a note while it runs.
+          m = mountCard({ toolUse: { toolUseId: "raw", name: "mystery", input: {} }, block: { toolResult: { toolUseId: "raw", content: [] } }, loading: false });
+          try {
+            openCard(m.card);
+            assert(m.card.querySelector(".tool-body").textContent.includes("toolUseId"), `nothing but the block: the block: ${m.card.textContent}`);
+          } finally { m.dispose(); }
+          m = mountCard({ toolUse: { toolUseId: "pending", name: "mystery", input: "" }, loading: true });
+          try {
+            assert(m.card.querySelector(".spinner-border") && m.card.dataset.status === "busy", "a call without its result spins while the run goes on");
+            openCard(m.card);
+            assert(m.card.querySelector(".tool-body").textContent.includes("Running"), "and says so open");
+          } finally { m.dispose(); }
+          m = mountCard({ toolUse: { toolUseId: "orphan", name: "bash", input: { command: "ls" } }, loading: false });
+          try {
+            assert(m.card.dataset.status === "idle" && m.card.querySelector(".tool-badge").textContent === "no result", "one whose run ended without its result says so");
+          } finally { m.dispose(); }
+
+          // A partial input streams into the header: the command shows as it is typed.
+          const [streamed, setStreamed] = createSignal('{"command": "npm run bu');
+          const box = document.createElement("div");
+          document.body.append(box);
+          const dispose = render(() => html`<${MessageContent} message=${{ role: "assistant" }} content=${() => ({ toolUse: { toolUseId: "typing", name: "bash", input: streamed() } })} results=${new Map()} loading=${true} />`, box);
+          try {
+            assert(box.querySelector(".tool-title")?.textContent === "npm run bu", `the command so far: ${box.querySelector(".tool-title")?.textContent}`);
+            setStreamed('{"command": "npm run build"}');
+            assert(box.querySelector(".tool-title").textContent === "npm run build" && box.querySelector("[data-terminal]")?.textContent.startsWith("$ npm run build"), "and as it grows, in the open terminal too");
+          } finally { dispose(); box.remove(); }
+        }
+
+        // Why: a command's output came only at its end; a long npm test showed nothing for a minute. Its progress events
+        // stream into the open card, and the result replaces them.
+        async function testBashStreams() {
+          const id = "live-bash";
+          const [block, setBlock] = createSignal(null);
+          const m = mountCard({ toolUse: { toolUseId: id, name: "bash", input: { command: "npm test" } }, block, loading: true });
+          try {
+            assert(m.card.dataset.open === "true" && m.card.dataset.status === "busy", "a running command's card is open");
+            addProgress({ toolUseId: id, stdout: "ok 1 - adds\n" });
+            addProgress({ toolUseId: id, stdout: "ok 2 - halves\n", stderr: "warn: slow\n" });
+            const term = m.card.querySelector("[data-terminal]");
+            assert(term.textContent.includes("ok 1 - adds\nok 2 - halves\n") && term.querySelector(".term-err").textContent === "warn: slow\n" && term.querySelector(".term-cursor"), `chunks append as they come: ${JSON.stringify(term.textContent)}`);
+            assert(m.card.querySelector(".tool-summary")?.textContent === "warn: slow", `the header has the latest line: ${m.card.querySelector(".tool-summary")?.textContent}`);
+            addProgress({ toolUseId: id, stdout: "x".repeat(LIVE_MAX) });
+            assert(toolProgress().get(id).stdout.length === LIVE_MAX, "the live buffer is capped");
+            setBlock(fixtureBlock(id, [{ json: { result: { stdout: "# pass 2\n# fail 0\n", stderr: "", exitCode: 0, ms: 900 } } }], 950));
+            assert(term.textContent === "$ npm test\n# pass 2\n# fail 0\n" && !term.querySelector(".term-cursor"), `the result replaces the live output: ${JSON.stringify(term.textContent)}`);
+            assert(m.card.dataset.status === "ok" && m.card.dataset.open === "false" && m.card.querySelector(".tool-meta").textContent === "950 ms", "and the card folds to how it went");
+          } finally { m.dispose(); }
+          // A run_app's steps show in its header while it runs.
+          const run = mountCard({ toolUse: { toolUseId: "live-run", name: "run_app", input: { full: true } }, loading: true });
+          try {
+            addProgress({ toolUseId: "live-run", status: "capturing page 2 of 4" });
+            assert(run.card.querySelector(".tool-summary")?.textContent === "capturing page 2 of 4", "run_app says which step it is on");
+          } finally { run.dispose(); }
+        }
+
+        // Why: a sub-agent's card showed its messages as clipped JSON. It is the same card, and open it is the
+        // sub-agent's own conversation, its calls as cards like the lead's; its header has what it is doing now.
+        async function testSubagentCards() {
+          const id = "sub-card", json = result => [{ json: { result } }];
+          const messages = [
+            { role: "user", content: [{ text: "Run the tests and report." }] },
+            { role: "assistant", content: [{ text: "Running them." }, { toolUse: { toolUseId: "sub-bash", name: "bash", input: { command: "npm test" } } }] },
+            { role: "user", content: [{ toolResult: { toolUseId: "sub-bash", content: json({ stdout: "# pass 3\n", stderr: "", exitCode: 0, ms: 40 }) }, timing: { ms: 60 } }] },
+            { role: "assistant", content: [{ toolUse: { toolUseId: "sub-view", name: "view_file", input: '{"path": "src/ap' } }] },
+          ];
+          const release = holdSubagent(id, { threadId: null, type: "general", status: "running", messages, currentMessage: null });
+          const m = mountCard({ toolUse: { toolUseId: id, name: "task", input: { type: "general", prompt: "Run the tests\nthen report" } }, loading: true });
+          try {
+            assert(m.card.querySelector(".tool-title").textContent === "general: Run the tests" && m.card.dataset.status === "busy", `type and brief: ${m.card.querySelector(".tool-head").textContent}`);
+            assert(m.card.querySelector(".tool-summary").textContent === "view_file: src/ap", `its latest action: ${m.card.querySelector(".tool-summary").textContent}`);
+            openCard(m.card);
+            const nested = m.card.querySelector("[data-subconversation] .tool-card[data-tool=bash]");
+            assert(nested && nested.querySelector(".tool-title").textContent === "npm test" && nested.dataset.status === "ok" && nested.querySelector(".tool-meta").textContent === "60 ms", "its bash call is a card like the lead's");
+            assert(m.card.querySelector("[data-subconversation] .tool-card[data-tool=view_file]").dataset.status === "busy", "its running call spins");
+            openCard(nested);
+            assert(nested.querySelector("[data-terminal]").textContent.includes("# pass 3"), "and opens to its terminal");
+          } finally {
+            m.dispose();
+            release();
+          }
+          // A background one says so, and shows its result once a later message delivers it (matched by id).
+          const started = { toolUseId: "bg-1", name: "task", input: { type: "general", prompt: "Write the README" } };
+          const call = { role: "assistant", content: [{ toolUse: started }] };
+          const answer = { role: "user", content: [{ toolResult: { toolUseId: "bg-1", content: json({ started: "bg-1", type: "general", note: "Running." }) } }] };
+          const later = { role: "user", content: [{ instruction: { rule: "subagent", text: "Sub-agent bg-1 finished.", status: "delivered", data: { subagent: { id: "bg-1", result: { type: "general", summary: "Wrote the README.", turns: 3 } } } } }] };
+          const [msgs, setMsgs] = createSignal([call, answer]);
+          const lookup = createMemo(() => resultsOf(msgs()));
+          const bm = mountCard({ toolUse: started, block: () => lookup().results.get("bg-1"), delivered: () => lookup().delivered.get("bg-1"), loading: false });
+          try {
+            assert(bm.card.querySelector(".tool-summary").textContent === "running in background" && bm.card.dataset.status === "idle", `started: ${bm.card.querySelector(".tool-head").textContent}`);
+            setMsgs([call, answer, later]);
+            assert(bm.card.querySelector(".tool-summary").textContent === "3 turns" && bm.card.dataset.status === "ok", `delivered: ${bm.card.querySelector(".tool-head").textContent}`);
+            openCard(bm.card);
+            assert(bm.card.querySelector(".tool-body").textContent.includes("Wrote the README."), "its result in the body");
+          } finally { bm.dispose(); }
+          assert(resultsOf([{ content: [{ toolResult: { toolUseId: "w", content: json({ results: [{ id: "bg-2", result: { summary: "ok" } }] }) } }] }]).delivered.get("bg-2")?.summary === "ok", "a wait's results count as delivered too");
+        }
+
+        // Why: lists looked different in every card. One ListBody: a row each, capped, the rest behind "Show N more".
+        async function testListBody() {
+          const box = document.createElement("div");
+          document.body.append(box);
+          const dispose = render(() => html`<${ListBody} rows=${Array.from({ length: 12 }, (_, i) => ({ primary: `row ${i}`, secondary: "muted", badge: i % 2 ? "ok" : "failing", tone: i % 2 ? "ok" : "error" }))} />`, box);
+          try {
+            assert(box.querySelectorAll(".tool-row-primary").length === 8 && box.querySelector(".tool-more").textContent === "Show 4 more", "eight rows, and the rest behind a button");
+            box.querySelector(".tool-more").click();
+            assert(box.querySelectorAll(".tool-row-primary").length === 12 && !box.querySelector(".tool-more"), "all of them once asked");
+            assert(box.querySelector(".badge.text-bg-danger") && box.querySelector(".badge.text-bg-success"), "badges by tone");
+          } finally { dispose(); box.remove(); }
+        }
+
+        // Why: the harness's notes and a message's metadata are the harness's, not the user's: small notes, closed.
+        async function testHarnessNotes() {
+          const blocks = [
+            { metadata: { timestamp: "2026-10-13T14:05:00-04:00", client: { device: "desktop", viewport: "1440x900", tz: "America/New_York", locale: "en-US" }, changes: "a.html: v1 → v2 (user)" } },
+            { instruction: { rule: "subagent", text: "Sub-agent t1 finished.", status: "delivered" } },
+            { text: "files changed", harness: true },
+          ];
+          const box = document.createElement("div");
+          document.body.append(box);
+          const dispose = render(() => html`<${For} each=${blocks}>${content => html`<${MessageContent} message=${{ role: "user" }} content=${content} results=${new Map()} />`}<//>`, box);
+          try {
+            const notes = [...box.querySelectorAll("details.harness-note")];
+            assert(notes.length === 3 && notes.every(n => !n.open) && !box.querySelector(".bg-secondary-subtle"), "three closed notes, none of them the user's words");
+            assert(notes[0].dataset.note === "metadata" && notes[0].querySelector("summary").textContent.includes("sent 2026-10-13 14:05") && notes[0].textContent.includes("a.html: v1 → v2"), `metadata: ${notes[0].textContent}`);
+            assert(notes[1].dataset.rule === "subagent" && notes[2].dataset.note === "harness", "an instruction and an old harness block");
+          } finally { dispose(); box.remove(); }
+          assert(showsBlock({ metadata: { timestamp: "x" } }), "metadata takes its small place");
+        }
+
+        // Every card in one conversation, open, for a look at desktop and phone widths: npm test checks each opens to
+        // something and nothing runs wide; node test.js index.html --story tool-cards --screenshot --viewports
+        // desktop,mobile saves them to .artifacts/ui/<viewport>/.
+        async function storyToolCards() {
+          const fixtures = await toolFixtures();
+          // The page's own engine connects as the suite starts; its list of sub-agents would replace this one's.
+          await waitFor(() => subagentLists > 0, 10000);
+          const messages = [{ role: "user", content: [{ text: "Make me a pomodoro timer, and test it." }, { metadata: { timestamp: "2026-10-13T14:05:00-04:00", client: { device: "desktop", viewport: "1440x900" } } }] }];
+          for (const [i, [name, input, content]] of fixtures.entries()) {
+            const id = `gallery-${i}`;
+            messages.push({ role: "assistant", content: [...(i === 0 ? [{ text: "I'll run the tests first." }] : []), { toolUse: { toolUseId: id, name, input } }] });
+            messages.push({ role: "user", content: [fixtureBlock(id, content, [1840, 35, 6200, 900, 410, 380][i] ?? 120 + i * 37)] });
+          }
+          // A sub-agent at work, and a call still running with its output streaming in.
+          const sub = [
+            { role: "user", content: [{ text: "Check the layout at phone width." }] },
+            { role: "assistant", content: [{ toolUse: { toolUseId: "gallery-sub-bash", name: "bash", input: { command: "node --test test/" } } }] },
+            { role: "user", content: [{ toolResult: { toolUseId: "gallery-sub-bash", content: [{ json: { result: { stdout: "# pass 6\n# fail 0\n", stderr: "", exitCode: 0, ms: 700 } } }] }, timing: { ms: 740 } }] },
+            { role: "assistant", content: [{ text: "Tests pass; looking at the page now." }, { toolUse: { toolUseId: "gallery-sub-run", name: "run_app", input: { viewport: "mobile" } } }] },
+          ];
+          const release = holdSubagent("gallery-sub", { threadId: null, type: "review", status: "running", messages: sub, currentMessage: null });
+          messages.push({ role: "assistant", content: [{ toolUse: { toolUseId: "gallery-sub", name: "task", input: { type: "review", prompt: "Review the timer at phone width" } } }, { toolUse: { toolUseId: "gallery-live", name: "bash", input: { command: "npm run build -- --watch" } } }] });
+          messages.push({ role: "user", content: [{ instruction: { rule: "plan", text: "Item 2's check fails: fix it before you finish.", status: "delivered" } }] });
+          addProgress({ toolUseId: "gallery-live", stdout: "building…\n✓ 12 modules transformed\n", stderr: "warning: large chunk\n" });
+          addProgress({ toolUseId: "gallery-sub-run", status: "capturing page 1 of 2" });
+
+          const capture = window.__captureScreenshot;
+          const box = document.createElement("div");
+          box.dataset.screenshotTarget = "tool-cards";
+          box.style.cssText = capture ? `position:absolute;left:0;top:0;z-index:9999;background:#f8f9fa;padding:12px;width:${Math.min(innerWidth, 820)}px;` : "position:absolute;left:-9999px;top:0;width:820px;";
+          document.body.append(box);
+          const lookup = resultsOf(messages);
+          const dispose = render(() => html`
+            <${For} each=${messages}>${message => html`
+              <div class="message-block d-flex flex-column mb-2" classList=${{ "align-items-end": message.role === "user" && !message.content.some(c => c.toolResult) }}>
+                <${For} each=${message.content.filter(showsBlock)}>${content => html`
+                  <${MessageContent} message=${message} content=${content} results=${lookup.results} delivered=${lookup.delivered} loading=${true} />
+                `}<//>
+              </div>
+            `}<//>
+          `, box);
+          try {
+            const cards = [...box.querySelectorAll(".tool-card")];
+            for (const card of cards) openCard(card);
+            for (const card of box.querySelectorAll(".tool-card")) openCard(card); // the sub-agent's, now there
+            await new Promise(r => setTimeout(r, 50));
+            const all = [...box.querySelectorAll(".tool-card")];
+            assert(all.length >= fixtures.length + 4 && all.every(c => c.querySelector(".tool-body")?.textContent.trim()), `every card opens to something: ${all.filter(c => !c.querySelector(".tool-body")?.textContent.trim()).map(c => c.dataset.tool)}`);
+            assert(box.querySelector("[data-tool=task] [data-subconversation] [data-tool=bash]") && box.querySelector("[data-tool=bash][data-status=busy] .term-err"), "the sub-agent's own cards, and the live one streaming");
+            assert(box.scrollWidth <= box.clientWidth + 1, `nothing runs past the conversation's width: ${box.scrollWidth} > ${box.clientWidth}`);
+            if (capture) {
+              await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+              await capture({ name: "tool-cards", targetId: "tool-cards", dir: "ui" });
+              for (const card of all) if (card.dataset.open === "true") card.querySelector(".tool-head").click();
+              await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+              await capture({ name: "tool-cards-closed", targetId: "tool-cards", dir: "ui" });
+            }
+          } finally {
+            dispose();
+            box.remove();
+            release();
+          }
         }
 
         // =============================================================================
@@ -4654,10 +5338,33 @@
           try {
             const marker = `shell story ${Date.now()}`;
             const { messages } = await ui.send({ text: "Running it.", toolUse: [{ name: "bash", input: { command: `echo '${marker}' > shell-story.txt && cat shell-story.txt` } }] }, { timeout: 30000 });
-            const shown = Array.from(messages).map(m => m.textContent).join(" ");
-            assert(shown.includes(marker), `the command's output is in the chat: ${shown.slice(-300)}`);
+            const card = ui.container.querySelector(".tool-card[data-tool=bash]");
+            card.querySelector(".tool-head").click();
+            const terminal = card.querySelector("[data-terminal]")?.textContent ?? "";
+            assert(terminal.endsWith(`
+${marker}
+`) && card.dataset.status === "ok", `the command's output is in its card's terminal: ${terminal.slice(-300)}`);
             const made = (await db.getAll("versions")).findLast(v => v.path === "shell-story.txt");
             assert(made?.source === "shell" && (await getBlob(db, made.hash)) === marker + "\n", `the file it wrote is a version of the chat's project: ${JSON.stringify(made)}`);
+          } finally {
+            ui.cleanup();
+          }
+        }
+
+        // Why: a long command showed nothing until it ended. What it prints comes through the shell's Worker, the tab,
+        // the engine and its tool.progress events into its open card while it runs.
+        async function storyShellStreams() {
+          const ui = createTestUI();
+          try {
+            const command = `node -e "let i = 0; const t = setInterval(() => { console.log('tick ' + i++); if (i === 8) clearInterval(t); }, 250)"`;
+            const sent = ui.send({ text: "Watch it.", toolUse: [{ name: "bash", input: { command } }] }, { timeout: 30000 });
+            await waitFor(() => ui.container.querySelector(".tool-card[data-tool=bash][data-status=busy] [data-terminal]")?.textContent.includes("tick 1"), 25000);
+            const live = ui.container.querySelector(".tool-card[data-tool=bash]");
+            assert(!live.querySelector("[data-terminal]").textContent.includes("tick 7"), "it shows the first lines before the last are printed");
+            await sent;
+            const terminal = ui.container.querySelector(".tool-card[data-tool=bash]");
+            terminal.dataset.open === "true" || terminal.querySelector(".tool-head").click();
+            assert(terminal.dataset.status === "ok" && terminal.querySelector("[data-terminal]").textContent.includes("tick 7"), "then the whole of it, as the result has it");
           } finally {
             ui.cleanup();
           }
@@ -6372,7 +7079,8 @@ if (window.__HARNESS__?.test) (async () => {
             // The user sees each take and chooses, from the variant's own card.
             const card = document.createElement("div");
             document.body.append(card);
-            const dispose = render(() => html`<${TaskResult} result=${() => ({ type: "variant", summary: "Dense", versions: { "index.html": made.version } })} toolUseId=${() => "take-1"} workspace=${main} />`, card);
+            const take = { toolResult: { toolUseId: "take-1", content: [{ json: { result: { type: "variant", summary: "Dense", versions: { "index.html": made.version } } } }] } };
+            const dispose = render(() => html`<${ToolCard} toolUse=${{ toolUseId: "take-1", name: "task", input: { type: "variant", prompt: "dense" } }} block=${() => take} workspace=${main} />`, card);
             const button = label => [...card.querySelectorAll("button")].find(b => b.textContent.trim() === label);
             button("Preview this take").click();
             await waitFor(() => main.state.preview?.versionId === made.version);
@@ -8267,6 +8975,9 @@ if (window.__HARNESS__?.test) (async () => {
         }
         // #endregion
 
+        // ?story=tool-cards (node test.js index.html --story tool-cards) runs that story alone.
+        const onlyStory = new URLSearchParams(location.search).get("story");
+        const storyName = test => test.name.replace(/^story/, "").replace(/[A-Z]/g, c => "-" + c.toLowerCase()).replace(/^-/, "");
         runTests([
           // Unit tests
           testBranchingAndParseJSON,
@@ -8316,7 +9027,11 @@ if (window.__HARNESS__?.test) (async () => {
           testMultiToolTurn,
           testTaskIntegration,
           testTaskWithoutToolUseId,
-          testTaskResultRendering,
+          testToolCards,
+          testBashStreams,
+          testSubagentCards,
+          testListBody,
+          testHarnessNotes,
 
           // Workspace and runner
           testWorkspaceVersions,
@@ -8422,6 +9137,8 @@ if (window.__HARNESS__?.test) (async () => {
           storyFileWorkflow,
           storyCodeExecution,
           storyShellCommand,
+          storyShellStreams,
+          storyToolCards,
           storySubAgent,
           storyBranching,
           storyRetryRewindsFiles,
@@ -8438,7 +9155,7 @@ if (window.__HARNESS__?.test) (async () => {
           storyReplyStaysOnItsBranch,
           storyFirstMessageEditScoped,
           storyEngineRefused,
-          ]]).then(({ passed, failed }) => {
+          ]].filter(test => !onlyStory || storyName(test) === onlyStory)).then(({ passed, failed }) => {
           window.TESTS_DONE = { passed, failed };
           if (failed > 0) console.error(`\n${failed} test(s) failed!`);
         });
