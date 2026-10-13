@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CSS animations</title>
+<style>
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #fdf4ff; }
+  .row { display: flex; gap: 24px; padding: 24px; align-items: center; min-height: 300px; border-bottom: 1px solid #e9d5ff; }
+  .spin { width: 120px; height: 120px; border: 14px solid #e9d5ff; border-top-color: #9333ea; border-radius: 50%; animation: spin 1.2s linear infinite; }
+  .pulse { width: 140px; height: 140px; background: #db2777; border-radius: 20px; animation: pulse 2s ease-in-out infinite alternate; }
+  .slide { width: 100px; height: 60px; background: #0ea5e9; animation: slide 3s linear infinite; }
+  .badge::after { content: "pseudo"; display: inline-block; margin-left: 8px; padding: 4px 8px; background: #16a34a; color: #fff; animation: fade 1.5s linear infinite alternate; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { from { transform: scale(.6); background: #db2777; } to { transform: scale(1.1); background: #f59e0b; } }
+  @keyframes slide { from { transform: translateX(0); } to { transform: translateX(600px); } }
+  @keyframes fade { from { opacity: 1; } to { opacity: .1; } }
+</style>
+</head>
+<body>
+<div class="row" data-check><div class="spin"></div><div class="pulse"></div><span class="badge">Animated ::after</span></div>
+<div class="row"><div class="slide" data-check></div></div>
+<div class="row" data-check><div class="pulse" style="animation-delay:-1s"></div><div class="spin" style="animation-duration:3s"></div></div>
+<div class="row"><div class="slide" style="animation-delay:-1.5s"></div></div>
+<div class="row"><div class="spin"></div><p>Rows below the fold animate too.</p></div>
+<div class="row"><div class="pulse"></div></div>
+</body>
+</html>

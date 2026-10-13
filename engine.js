@@ -436,7 +436,7 @@ Examples:
     fn: runApp,
     toolSpec: {
       name: "run_app",
-      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included. There is no Node.js, npm or shell here: on a test file or folder (test/index.test.js, test/), it runs the tests as node --test would (node:test, node:assert and the common runners work) and returns pass and fail counts.",
+      description: "Re-render the shown artifact (or an older version) with its tests and return the run report. Optionally run an async script in the page after it settles; its return value is included. The screenshot shows the viewport, one screen; full: true returns the whole page, top to bottom, as pages (each up to two screens tall, labelled page N of M). A page taller than the screen is fine: look at it with full: true rather than changing its layout to fit one screen. There is no Node.js, npm or shell here: on a test file or folder (test/index.test.js, test/), it runs the tests as node --test would (node:test, node:assert and the common runners work) and returns pass and fail counts.",
       inputSchema: {
         json: {
           type: "object",
@@ -445,7 +445,8 @@ Examples:
             version: { type: "integer", description: "Version id to run instead of the current file, such as one a variant returned" },
             viewport: { type: "string", enum: ["fit", "desktop", "tablet", "mobile"], description: "Preview size. Wider than a phone, the screenshot has a phone's width beside it" },
             script: { type: "string", description: "Async function body run in the app page, e.g. document.querySelector('button').click(); return document.title" },
-            screenshot: { type: "boolean", description: "Attach a screenshot (default true; approximate when the user has not shared the tab)" },
+            screenshot: { type: "boolean", description: "Attach a screenshot of the viewport, what fits on one screen (default true; approximate when the user has not shared the tab)" },
+            full: { type: "boolean", description: "Attach the whole page instead, scrolled top to bottom, as labelled pages up to two screens tall each" },
           },
         },
       },
@@ -1676,8 +1677,10 @@ function besideResults(message, calls) {
     const parts = block.toolResult?.content;
     if (!parts?.some(c => c.image || c.document)) return block;
     const label = parts.find(c => c.json)?.json?.result?.path ?? calls.get(block.toolResult.toolUseId)?.name ?? "tool result";
-    for (const c of parts) if (c.image || c.document) moved.push({ text: label }, c);
-    return { toolResult: { ...block.toolResult, content: parts.filter(c => !c.image && !c.document) } };
+    // A file's own label (a full page's "page 2 of 4") is the text just before it, and moves with it.
+    const own = k => typeof parts[k - 1]?.text === "string" && !!(parts[k]?.image || parts[k]?.document);
+    parts.forEach((c, k) => (c.image || c.document) && moved.push({ text: own(k) ? `${label}, ${parts[k - 1].text}` : label }, c));
+    return { toolResult: { ...block.toolResult, content: parts.filter((c, k) => !c.image && !c.document && !own(k + 1)) } };
   });
   message.content.splice(message.content.findLastIndex(b => b.toolResult) + 1, 0, ...moved);
 }
@@ -2810,7 +2813,8 @@ async function getToolResults(toolUseContent, tools, context = {}) {
           const output = await fn(input, { ...context, toolUseId });
           if (!output?.__media) return { toolResult: { toolUseId, content: [{ json: { result: output } }] } };
           const { __media: media, ...result } = output;
-          return { toolResult: { toolUseId, content: [{ json: { result } }, ...media.map(mediaBlock)] } };
+          // A file with a label (a full page's "page 2 of 4") comes after it, so the model reads which one it sees.
+          return { toolResult: { toolUseId, content: [{ json: { result } }, ...media.flatMap(m => (m.label ? [{ text: m.label }, mediaBlock(m)] : [mediaBlock(m)]))] } };
         } catch (error) {
           console.error("Tool error:", error);
           return { toolResult: { toolUseId, content: [{ json: { result: error.stack || error.message || String(error) } }] } };
@@ -3254,17 +3258,18 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     if (await show(path)) await run();
   }
 
-  // screenshot: true forces one, false skips it, "auto" attaches one while the user shares the tab.
+  // screenshot: true forces one, false skips it, "auto" attaches one while the user shares the tab. full: the whole
+  // page instead, as a list of labelled pages (snapshot.js).
   // announce: tell the other workspaces on the project, for a run the engine asked for.
   // signal: a run its caller stopped doesn't start, or stops where it is.
   // tests: { files, path }, test files to run as `node --test` would (see testFiles), reported as path.
-  function run({ versionId = null, script = null, screenshot = false, viewport = null, announce = false, signal = null, tests = null } = {}) {
-    if (host) return hostRun({ versionId, script, screenshot, viewport, tests }, signal);
+  function run({ versionId = null, script = null, screenshot = false, full = false, viewport = null, announce = false, signal = null, tests = null } = {}) {
+    if (host) return hostRun({ versionId, script, screenshot, full, viewport, tests }, signal);
     if (viewport) setState("viewport", viewport);
     return enqueueRun(async () => {
       signal?.throwIfAborted();
       if (tests) return runTests(tests, signal);
-      const result = await runNow({ versionId, script, screenshot, signal });
+      const result = await runNow({ versionId, script, screenshot, full, signal });
       if (announce) channel.postMessage({ projectId: state.project.id, ran: true });
       return result;
     });
@@ -3286,7 +3291,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   const refresh = () => run().catch(e => e.closed || notify(e.message));
 
   // The runner answers with the report; the version keeps it, as the shown artifact's latest.
-  async function runNow({ versionId, script, screenshot, signal }) {
+  async function runNow({ versionId, script, screenshot, full, signal }) {
     const project = state.project;
     if (!project) throw new Error("No project is open.");
     const shown = shownPath(project);
@@ -3307,7 +3312,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
     if (missing.length) return { report: { version: version.id, path: version.path, ok: false, errors: missing, notes: ["Not run: the page loads files the workspace doesn't have."] } };
     setState({ running: true, ...(!scratch && { logs: [], preview: isHead ? null : { versionId: version.id, path: version.path, text: content } }) });
     try {
-      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, parked: scratch, signal });
+      const { report, image, thumb, runLog } = await runner.run({ version: { id: version.id, path: version.path }, doc, files, script, screenshot, full, parked: scratch, signal });
       if (!scratch) setState("runLog", runLog);
       if (isHead) {
         const stored = { ...report, thumb: thumb || version.report?.thumb || null };
@@ -4323,7 +4328,7 @@ async function writeFile({ path, content, screenshot } = {}, context = {}) {
   });
 }
 
-async function runApp({ path, version, viewport, script, screenshot = true } = {}, context = {}) {
+async function runApp({ path, version, viewport, script, screenshot = true, full = false } = {}, context = {}) {
   return attempt(async () => {
     const ws = await workspaceFor(context);
     if (viewport && viewport !== "fit" && !Object.hasOwn(VIEWPORTS, viewport)) viewport = null;
@@ -4334,8 +4339,8 @@ async function runApp({ path, version, viewport, script, screenshot = true } = {
     // A version names its own file, a variant's on its branch too; path picks the current one.
     const head = path && version == null && ws.state.project.heads[normalizePath(path)];
     if (path && version == null && !head) return { error: await missingFile(ws, normalizePath(path), context) };
-    const { report, image } = await ws.run({ versionId: version ?? head ?? null, script: script || null, screenshot, viewport, signal: context.signal });
-    return withMedia({ report }, image);
+    const { report, image } = await ws.run({ versionId: version ?? head ?? null, script: script || null, screenshot, full: full === true, viewport, signal: context.signal });
+    return withMedia({ report }, ...[image].flat());
   });
 }
 

@@ -284,8 +284,8 @@ async function run(config = options(process.argv.slice(2))) {
           },
         );
         console.log(report);
-        // The engine a page imports, and the prompts it imports, are covered by the same tests.
-        for (const module of ["engine.js", "prompts.js"]) {
+        // The engine a page imports, the prompts it imports, and its capture module are covered by the same tests.
+        for (const module of ["engine.js", "prompts.js", "snapshot.js"]) {
           const moduleEntry = coverage.find((item) =>
             isCoverageEntryForTarget(item, new URL(module, pageUrl)),
           );

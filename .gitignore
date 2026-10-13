@@ -10,3 +10,7 @@ docs/*
 probe*.mjs
 !docs/experiments/
 !docs/specs/
+
+# The E23 spike's images (spike/capture.mjs); its results.md and results.json are kept.
+spike/out/**/*.png
+spike/out/log.txt

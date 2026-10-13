@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sticky header, fixed footer</title>
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: #fff; color: #111; }
+  .bar { position: sticky; top: 0; z-index: 2; background: #1d4ed8; color: #fff; padding: 14px 20px; font-weight: 600; }
+  .foot { position: fixed; left: 0; right: 0; bottom: 0; background: #111827; color: #fde68a; padding: 12px 20px; z-index: 2; }
+  .toast { position: fixed; top: 70px; right: 16px; background: #fef3c7; border: 1px solid #f59e0b; padding: 8px 12px; border-radius: 6px; }
+  section { padding: 24px 20px; min-height: 420px; border-bottom: 1px solid #e5e7eb; }
+  section:nth-child(odd) { background: #f3f4f6; }
+  .sub { position: sticky; top: 52px; background: #dbeafe; padding: 6px 10px; margin: 0 -10px; }
+  .spacer { height: 60px; }
+</style>
+</head>
+<body>
+<div class="bar" data-check>Sticky header: should appear once, at the top</div>
+<div class="toast">Fixed toast, top right</div>
+<div id="sections"></div>
+<div class="spacer"></div>
+<div class="foot" data-check>Fixed footer: should appear once, at the bottom</div>
+<script>
+  const host = document.getElementById("sections");
+  for (let i = 1; i <= 10; i++) host.insertAdjacentHTML("beforeend", `<section><h2 class="${i === 4 ? "sub" : ""}">Section ${i}${i === 4 ? " (a sticky subheading)" : ""}</h2>${"<p>Body text for section " + i + ". ".repeat(1) + "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>"}<p>Row marker ${i}</p></section>`);
+</script>
+</body>
+</html>
