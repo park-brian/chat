@@ -25,6 +25,7 @@ every repeat), cost (input tokens in uncached equivalents), seconds, and task-sp
 | B1 | A rule in the system prompt is followed less than the same rule injected at the right moment | E3: plan file 0/3 with the prompt rule, 3/3 with an injection after 8 calls | tentative (n=3, one task) |
 | B2 | Models report in the vocabulary of the process they run; removing one trigger doesn't stop it | E6: leak 0-2/21 before the director, 15/21 with it; E6b: removing the strongest trigger left it at 11-12/21 | strong (the cause is the process, not one note) |
 | B9 | Asking the model to change wording rarely holds; checking the output and asking for a fix might | E4b (wording) 15 → 11; E6b (rule change) 11 → 11-12; E6c pending | tentative |
+| B10 | An affordance (a tool that makes the right action easy) changes behavior more than an instruction | E10: a way to run test files cut test-running confusion 11-16 → 3/21, claim failures to 0, leak 11-12 → 5/21, swe +4 | strong (tier-level, mechanism in transcripts) |
 | B3 | Tool error messages steer behavior | E4c: "No project is open yet. Create the app with write_file" preceded a 2,317-line app for a prose request | one transcript |
 | B4 | Making the model compute with code fixes counting errors | E1: arxiv 0.64 → 0.97, lodash 0.85 → 1.00 | moderate (two tasks, ×3) |
 | B5 | Unbounded context grows with page reads; a budget plus summaries bounds it | E3: 280k → 30-60k per request on the long report | strong (direct measurement) |
@@ -142,9 +143,15 @@ every repeat), cost (input tokens in uncached equivalents), seconds, and task-sp
   that there is no Node or shell and how tests run, then: reasoning about running tests falls below 3/21; test
   checks replace text checks in the contract; claims of test counts match reports (the "reports only results it
   got" check stops failing); swe's mean rises.
-- **Method:** build it, then swe ×3 against E6b's copies (same code otherwise); count reasoning mentions, check
-  kinds used, claim failures, thinking tokens before the first test run.
-- **Result:** pending.
+- **Method:** build it, then swe ×3 against E6b's copies (same code otherwise; the seeds now carry the app's
+  runner, a small confound); count reasoning mentions, run_app on test files, claim failures, leak.
+- **Result (b87941f):** swe 0.95 (E6b copies 0.92 and 0.90: +4, beyond tier noise); pass^k 2/7 (0/7). Reasoning
+  about running tests 3/21 (11-16). run_app on a test file in 21/21 runs. "Reports only test results it got"
+  failures 0 (several per round before). Leak 5/21 (11-12), not predicted.
+- **Analysis:** every prediction held. The leak fell without any change aimed at it: with real counts to report,
+  the final message talks about the tests rather than about the plan's items (a hypothesis, from reading replies).
+- **Learned (B10):** giving the model an affordance (a way to run the tests) changed behavior more than any
+  instruction we tried, including the four wording attempts on the leak.
 
 ### E11. Shell spike (design: docs/specs/2026-10-13-shell.md)
 
