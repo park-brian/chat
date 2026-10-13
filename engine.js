@@ -3655,6 +3655,7 @@ function createWorkspace(db, { headless = false, host = null, frames = null, bra
   function describeRootForAgent() {
     const r = state.root;
     if (!r) return null;
+    if (r.status !== "connected") return `This project is the folder "${r.name}" on the user's disk, but ${r.status === "permission" ? "this session may not read it until the user clicks Reconnect in the panel" : "this browser can't reach it"}: only the files below are here.`;
     if (r.kind === "folder") return `This project is the folder "${r.name}" on the user's disk: ${r.files} files${r.git ? ", a git repository" : ""}. Your writes go to the disk at once; the user's own edits there come back as changes.`;
     return `This project is the GitHub repository ${r.name} at ${r.base.slice(0, 7)} on ${r.from}: ${r.files} files. Your writes stay here until pushed to a branch (the default branch, ${r.defaultBranch}, only with the user's yes).`;
   }
