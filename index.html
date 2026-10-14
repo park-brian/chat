@@ -7967,6 +7967,8 @@ if (window.__HARNESS__?.test) (async () => {
           assert(asked.length === 1 && asked[0].id === "global.anthropic.claude-opus-5-5" && asked[0].text.includes("chapters/01.md, chapters/02.md, chapters/03.md"), `Opus reads the three parts, in order: ${JSON.stringify(asked)}`);
           assert(run.notes.some(n => n.startsWith("A reviewer read the parts against each other.") && n.includes("03.md says 41 years")), `its review comes back as a note: ${JSON.stringify(run.notes)}`);
           assert(run.store.messages.at(-1).content.some(c => c.text === "Fixed chapter 3."), "and the model goes on to fix it");
+          const reviewThread = (await db.getAll("threads")).find(t => t.parentThreadId === run.thread.id && t.subagentType === "review");
+          assert(reviewThread && (await db.getAllFromIndex("messages", "threadId", reviewThread.id)).some(m => m.modelId === "global.anthropic.claude-opus-5-5" && m.role === "assistant"), "the review has a thread of its own, so its tokens are counted");
           asked.length = 0;
           await turn();
           assert(asked.length === 0, "with the flag off, no reviewer");

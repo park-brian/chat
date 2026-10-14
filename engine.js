@@ -1585,8 +1585,9 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   const start = store.messages.length;
   let director = null, tz = null, step = 0, reviewed = false, reviews = 0, partHeads = { ...((await turnStart)?.heads ?? {}) };
   // The oracle's review (E28): the review sub-agent on a stronger model, given one request; its review text, or null.
+  // It runs in a thread of its own, so the user can open it and its tokens are counted with the run's.
   const reviewParts = (ws, prompt) => task({ type: "review", model: { opus: "Opus 5.5", sonnet: "Sonnet 5.5", haiku: "Haiku 5.5" }[flag("oracle.model", "opus")], prompt },
-    { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, modelClient: clientFor, tz })
+    { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, modelClient: clientFor, tz, toolUseId: `oracle-${crypto.randomUUID().slice(0, 8)}` })
     .then(r => r?.summary || null, () => null);
   // The director's notes ride after the results, in the message's metadata (envelope.js): the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
