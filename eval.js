@@ -12,7 +12,7 @@ import { startProxy } from "./proxy.js";
 import { startServer } from "./server.js";
 import TASKS from "./evals/tasks.js";
 import { judgedChecks, vote } from "./evals/judge.js";
-import { mannered } from "./evals/style.js";
+import { harnessTerms, mannered } from "./evals/style.js";
 import { simulate } from "./evals/user.js";
 import { steeredCounts } from "./envelope.js";
 
@@ -480,6 +480,10 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
     }
     const unjudged = verdict?.unjudged ?? [];
     checks.push(...saved);
+    // Every finished run: what the user reads since they last spoke has none of the harness's own words (E26).
+    const terms = harnessTerms(run.answer);
+    run.metrics.harnessTerms = Object.values(terms).reduce((a, b) => a + b, 0);
+    if (!error) checks.push({ ok: !run.metrics.harnessTerms, label: `speaks in the user's terms, not the harness's${run.metrics.harnessTerms ? ` (${Object.entries(terms).map(([k, v]) => `${k} ×${v}`).join(", ")})` : ""}` });
 
     const breaks = prefixBreaks(requests.map(r => r.body));
     run.metrics.prefixBreaks = breaks.length;

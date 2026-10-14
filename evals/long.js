@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { bedrock, JUDGE_MODEL, PLAIN } from "./judge.js";
+import { unbackedClaims } from "./claims.js";
 import { mannered, prose, wordCount } from "./style.js";
 import { lookups, numbers } from "./research.js";
 import { urls } from "./answer-hard.js";
@@ -122,11 +123,8 @@ export function scoreLisp(suite, byId) {
 }
 
 const lispEntry = files => ("lisp.js" in files ? "lisp.js" : Object.keys(files).filter(p => /(^|\/)lisp\.js$/.test(p) && !p.startsWith("scratch/")).sort((a, b) => a.length - b.length)[0] ?? null);
-// Test counts the answer gives ("21 passed", "21/21 tests pass") must be ones a tool returned.
-export function unbackedClaims(answer, results) {
-  const claimed = [...new Set([...String(answer ?? "").matchAll(/\b(\d+)(?:\s*\/\s*\d+)?\s+(?:(?:hidden\s+|unit\s+)?(?:tests?|programs?|checks?|cases?)\s+)?pass(?:ed|ing|es)?\b/gi)].map(m => m[1]))];
-  return claimed.filter(n => !new RegExp(String.raw`"passed":\s*${n}\b|\b${n}(?:\s*/\s*\d+)?\s+(?:(?:tests?|programs?|checks?|cases?)\s+)?pass|passed:?\s*${n}\b`, "i").test(results ?? ""));
-}
+// Test counts the answer gives ("21 passed", "21/21 tests pass") must be ones a tool returned (evals/claims.js).
+export { unbackedClaims };
 // Its own tests: a test file that loads the interpreter, or a test block in lisp.js itself.
 export function ownTests(files, entry) {
   const external = Object.entries(files).filter(([p, t]) => p !== entry && /test|spec/i.test(p) && /lisp(\.js)?/i.test(t ?? "") && /assert|expect|\btest\s*\(|PASS|FAIL|===/.test(t ?? "")).map(([p]) => p);

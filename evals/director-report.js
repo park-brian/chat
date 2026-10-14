@@ -4,9 +4,10 @@
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
-// E6's leak: contract words in the reply the user reads, code left out.
-export const LEAK = /\bitems? \d|\bthe check\b|\bthe harness\b|\bplan (?:items?|checks?)\b|\bcontract\b/i;
-const prose = t => t.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+import { harnessTerms } from "./style.js";
+
+// The leak: the harness's words in the reply the user reads (style.js; it agreed with blind labels on 20 of 21).
+const leaks = text => Object.keys(harnessTerms(text)).length > 0;
 
 // The last assistant message's own text: what the user reads as the answer.
 export function finalReply(messages = []) {
@@ -25,7 +26,7 @@ export function summarizeRuns(all) {
     runs: n, unfinished: all.length - n,
     hidden: mean(r => +!!check(r, /^fixes the issue/)?.ok),
     plain: mean(r => +(check(r, /^judge: States things literally/)?.ok ?? true)),
-    leak: results.filter(r => LEAK.test(prose(finalReply(r.messages)))).length,
+    leak: results.filter(r => leaks(finalReply(r.messages))).length,
     pass: mean(r => r.passed / r.total),
     calls: mean(r => r.metrics?.calls ?? 0),
     kTokIn: mean(r => (r.metrics?.inputTokens ?? 0) / 1000),

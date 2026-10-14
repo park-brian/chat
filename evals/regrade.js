@@ -1,9 +1,10 @@
 // Saved runs graded again with the current graders, so a grader change is tried on runs whose answers are known
 // before it judges new ones. The judge runs --repeat times per run (default 3), which also measures its own noise.
 // node evals/regrade.js <eval folder> [...] [--repeat n] [--votes n] [--criterion text] [--scripted]
+// --out file.json: every grade, { dir, criterion, old, grades }, for comparing with hand labels.
 // --votes: each repeat is the majority of n judge calls, as eval.js grades (default 1: one call).
 // --scripted also re-runs each task's scripted checks on the saved files (probes of pages are skipped).
-import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import TASKS from "./tasks.js";
@@ -42,7 +43,7 @@ async function main() {
   process.loadEnvFile(path.join(here, "..", ".env"));
   const args = process.argv.slice(2);
   const opt = name => { const i = args.indexOf(name); return i < 0 ? null : args.splice(i, 2)[1]; };
-  const repeat = Number(opt("--repeat") ?? 3), votes = Number(opt("--votes") ?? 1), only = opt("--criterion");
+  const repeat = Number(opt("--repeat") ?? 3), votes = Number(opt("--votes") ?? 1), only = opt("--criterion"), out = opt("--out");
   const scripted = args.includes("--scripted") && args.splice(args.indexOf("--scripted"), 1);
   const dirs = args.flatMap(d => readdirSync(d, { recursive: true }).filter(f => path.basename(f) === "result.json").map(f => path.join(d, path.dirname(f))));
   const rows = [];
@@ -69,6 +70,7 @@ async function main() {
       if (majority !== old.ok) console.log(`FLIP ${path.relative(process.cwd(), dir)}: ${old.ok ? "pass → fail" : "fail → pass"} (${grades.filter(g => g.pass).length}/${grades.length} pass) ${criterion.slice(0, 70)}\n     was: ${String(old.reason ?? "").slice(0, 200)}\n     now: ${grades.find(g => g.pass === majority)?.reason.slice(0, 200)}`);
     }
   }));
+  if (out) writeFileSync(out, JSON.stringify(rows, null, 1));
   console.log(`\n${rows.length} grades over ${dirs.length} runs, judge ×${repeat}${votes > 1 ? `, each the majority of ${votes}` : ""}`);
   for (const [criterion, t] of tally(rows)) console.log(`  ${criterion.slice(0, 80)}\n    saved pass ${t.oldPass}/${t.n} · now ${t.newPass}/${t.n} · agrees with saved ${t.same}/${t.n} · repeats agree ${t.stable}/${t.n}`);
 }

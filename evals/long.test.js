@@ -86,6 +86,9 @@ assert.deepEqual(unbackedClaims("All 42 tests passed.", '{"passed": 42, "failed"
 assert.deepEqual(unbackedClaims("42/42 tests pass.", "PASS: x\n42 passed, 0 failed"), []);
 assert.deepEqual(unbackedClaims("All 42 tests passed.", '{"passed": 40, "failed": 2}'), ["42"]);
 assert.deepEqual(unbackedClaims("It works.", ""), []);
+// node --test's own counts, and plan items, as in long-lisp-1 (E28).
+assert.deepEqual(unbackedClaims("All 22 tests pass under `node --test` (`# pass 22`). Items 1 and 3 pass.", "# tests 22\n# pass 22\n# fail 0"), []);
+assert.deepEqual(unbackedClaims("All 31 tests pass.", "# tests 22\n# pass 22"), ["31"]);
 {
   const checks = await gradeLisp(lispRun({ "lisp.js": reference }, "All 99 tests passed.", '{"passed": 12}'));
   ok(labels(checks).length === 2 && labels(checks).some(l => /own tests/.test(l)) && labels(checks).some(l => /claims 99/.test(l)), "no tests and an unbacked claim fail their two checks");

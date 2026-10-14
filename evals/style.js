@@ -28,3 +28,17 @@ export function mannered(text) {
   const words = wordCount(text);
   return { count, words, per1k: words ? +((count * 1000) / words).toFixed(1) : 0, hits };
 }
+
+// The harness's words in what the user reads: the director's process, which the user never sees (B2, E26: 9 of 21
+// swe replies, which the judge's plain-writing criterion passed as literal). Code is left out.
+export const HARNESS_TERMS = [
+  ["the harness", /\bthe harness\b/gi],
+  ["plan items or checks", /\bplan(?:'s)? (?:items?|checks?|tool)\b|\bthe plan's checks?\b/gi],
+  ["item N", /\bitems? \d+(?:\s*(?:,|and|&)\s*\d+)*(?:'s)?(?= (?:check|pass|passes|passed|fail|fails|failed|is done|are done|done))/gi],
+  ["the ledger", /\bthe ledger\b/gi],
+  ["red/green for checks", /\bred[- ](?:first|before|then[- ]green)\b|\b(?:checks?|items?) (?:is |are |was |were |go |goes |turned? )?(?:red|green)\b/gi],
+];
+export function harnessTerms(text) {
+  const body = prose(text);
+  return Object.fromEntries(HARNESS_TERMS.map(([name, re]) => [name, body.match(re)?.length ?? 0]).filter(([, n]) => n));
+}

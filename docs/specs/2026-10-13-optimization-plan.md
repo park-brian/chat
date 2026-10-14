@@ -101,6 +101,16 @@ The harness runs a project's tests when it opens and puts the result in the firs
 "ran code to reproduce" check: pre-run results are not the model's). Then, using E25c's numbers, tool docs on
 first use and the six primitives (E19), on Haiku and Gemini.
 
+### E30, measured (E25c, 2026-10-14)
+
+The fixed prefix of a swe request is about 12.7k tokens: system prompt 31.2k characters (about 7.8k tokens), tool
+specs 19.5k (about 4.9k). Largest system sections: Artifacts 5.3k characters plus the HTML skeleton 4.2k (a
+counter app with in-file tests, sent on every request, bug fixes included), Working 5.1k, plan 2.6k, Environment
+2.5k, task 2.2k, code 1.8k. The plan, task and code docs are in both the system prompt and the tool specs. Arms
+(flag `prefix`): `full` (today), `lean` (each tool's docs once, in its spec; the skeleton only when no project is
+open). Prediction: about 3k fewer tokens per request with swe, games and answer unchanged; games are where the
+skeleton could matter, so they are in the run.
+
 ## Gates and presets
 
 - A `quick` preset (inner, answer, swe, research ×1) catches crashes and large breaks only; it is not a
