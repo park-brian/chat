@@ -461,7 +461,7 @@ export async function gradeResearch(run, { send = bedrock, m = meter(), readPage
 
 // ---------------------------------------------------------------------------------------------------------------
 
-export default [
+const TASKS = [
   {
     id: "long-lisp",
     set: "long",
@@ -492,3 +492,24 @@ export default [
     },
   },
 ];
+
+// E28a: each plan in long/plans (evals/oracle.js) makes a variant of its task that starts with the plan in the
+// workspace, where it survives summaries, and a line in the request saying it is there.
+const PLANS = path.join(LONG_DIR, "plans");
+const planned = TASKS.flatMap(task => {
+  let names = [];
+  try { names = readdirSync(PLANS).filter(f => f.startsWith(task.id + ".") && f.endsWith(".md")); } catch {}
+  return names.map(name => {
+    const model = name.slice(task.id.length + 1, -3);
+    return {
+      ...task,
+      set: "long-plan",
+      id: `${task.id}+${model}-plan`,
+      turns: [{ seed: { path: "notes/plan.md", content: readFileSync(path.join(PLANS, name), "utf8") } }, `${task.turns[0]}
+
+A planner has written a plan for this work in notes/plan.md. Read it first and keep to it; where it conflicts with this request, the request wins.`],
+    };
+  });
+});
+
+export default [...TASKS, ...planned];

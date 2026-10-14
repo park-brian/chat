@@ -7927,14 +7927,14 @@ if (window.__HARNESS__?.test) (async () => {
         async function testSizingBuilding() {
           const GOAL = "This is long work, so the harness keeps a contract";
           const count = (notes, start) => notes.filter(n => n.startsWith(start)).length;
-          localStorage.setItem(FLAGS_KEY, JSON.stringify({ sizing: "building" }));
+          assert(count((await directedTurn({ script: [...calls(9), reply("Done.")] })).notes, GOAL) === 1, "no files when the turn began: building, so nine calls bring the goal note");
+          assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], heads: { "src/a.js": 1 } })).notes, GOAL) === 0, "files there and none new: a fix, however many calls");
+          localStorage.setItem(FLAGS_KEY, JSON.stringify({ sizing: "calls" }));
           try {
-            assert(count((await directedTurn({ script: [...calls(9), reply("Done.")] })).notes, GOAL) === 1, "no files when the turn began: building, so nine calls bring the goal note");
-            assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], heads: { "src/a.js": 1 } })).notes, GOAL) === 0, "files there and none new: a fix, however many calls");
+            assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], heads: { "src/a.js": 1 } })).notes, GOAL) === 1, "sizing=calls: calls alone decide");
           } finally {
             localStorage.removeItem(FLAGS_KEY);
           }
-          assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], heads: { "src/a.js": 1 } })).notes, GOAL) === 1, "by default, calls alone decide");
         }
 
         // Why: an ablation is a flag set for one eval run (eval.js --flags), not a worktree; each is a no-op at its default
@@ -8798,6 +8798,15 @@ if (window.__HARNESS__?.test) (async () => {
             assert((await p.run("git status", {}, turn2)).stdout.includes("nothing to commit, working tree clean"), "the next turn starts clean");
             assert((await p.run("git log --oneline", {}, turn2)).stdout.trim().split("\n").length === 2, "with a second baseline commit");
             assert(!Object.keys(p.ws.state.files).some(f => f.startsWith(".git/")), ".git stays out of the project's files");
+            // Models stash a fix to run the tests on the original, then pop it; and they write git -C /project.
+            await shellCommit(p.ws, "src/a.js", "export const a = 3;\n");
+            const stash = await p.run("git stash && cat src/a.js && git stash list", {}, turn2);
+            assert(stash.exitCode === 0 && stash.stdout.includes("Saved working directory and index state WIP on main") && stash.stdout.includes("export const a = 2;\n") && /stash@\{0\}/.test(stash.stdout), `git stash puts back HEAD's text: ${JSON.stringify(stash)}`);
+            assert(p.ws.state.files["src/a.js"] === "export const a = 2;\n", "and the project's file with it");
+            const pop = await p.run("cd /tmp && git -C /project stash pop && cat /project/src/a.js", {}, turn2);
+            assert(pop.exitCode === 0 && pop.stdout.includes("export const a = 3;\n") && p.ws.state.files["src/a.js"] === "export const a = 3;\n", `git -C dir stash pop brings the change back: ${JSON.stringify(pop)}`);
+            const none = await p.run("cd /project && git stash pop", {}, turn2);
+            assert(none.stderr.includes("No stash entries found."), `pop with nothing stashed says so: ${JSON.stringify(none)}`);
           } finally {
             p.done();
           }

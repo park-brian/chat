@@ -1339,9 +1339,10 @@ function planInPrompt(tools) {
 // they stand. tools: the names of the tools the run has. started: the day the conversation started.
 async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules(), started = null, turnStart = null } = {}) {
   const thread = threadId != null ? await db.get("threads", threadId) : null;
-  // The files the user's message found. sizing=building: a turn that edits files that were there is a fix, not long
-  // work, however many calls it takes (E25b: the contract on bug fixes cost 38% more calls and leaked into replies).
-  const sizing = flag("sizing", "calls"), startHeads = sizing === "building" ? (await turnStart)?.heads ?? null : null;
+  // The files the user's message found. A turn that edits files that were there is a fix, not long work, however
+  // many calls it takes (E25b, E27: on bug fixes the contract cost a third more calls and leaked into replies; games
+  // start with no files and keep it). sizing=calls is the old rule, by calls alone.
+  const sizing = flag("sizing", "building"), startHeads = sizing === "building" ? (await turnStart)?.heads ?? null : null;
   const contract = { ...emptyContract(), ...structuredClone(thread?.contract ?? {}) };
   const has = name => tools.includes(name);
   const reminded = new Set(), seen = new Set();

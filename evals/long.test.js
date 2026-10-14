@@ -18,11 +18,16 @@ const labels = checks => checks.filter(([pass]) => !pass).map(([, l]) => l);
 // Wiring: in tasks.js, in the long set, an hour to run.
 assert.ok(SETS.includes("long"));
 assert.deepEqual(options(["--tasks", "long"]).tasks.map(t => t.id), ["long-lisp", "long-novella", "long-research"]);
-for (const t of LONG) {
+for (const t of LONG.filter(t => t.set === "long")) {
   assert.ok(TASKS.includes(t), t.id + " is in tasks.js");
-  assert.equal(t.set, "long");
   assert.ok(t.timeout >= 45 * 60_000, t.id + " has a long timeout");
   assert.ok(t.turns.length === 1 && typeof t.turns[0] === "string");
+}
+// A planned variant (E28a): the plan seeded at notes/plan.md, then the same request with one line pointing to it.
+for (const t of LONG.filter(t => t.set !== "long")) {
+  const base = LONG.find(b => b.id === t.id.split("+")[0]);
+  assert.ok(t.set === "long-plan" && base && t.check === base.check, t.id + " is a variant of " + base?.id);
+  assert.ok(t.turns[0].seed.path === "notes/plan.md" && t.turns[1].startsWith(base.turns[0]) && t.turns[1].includes("notes/plan.md"));
 }
 
 // ---- long-lisp

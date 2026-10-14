@@ -14,7 +14,9 @@ function gitFs(vfs) {
       throw e;
     }
   };
-  const stat = s => ({ ...s, isFile: () => s.isFile, isDirectory: () => s.isDirectory, isSymbolicLink: () => s.isSymbolicLink, mode: (s.isDirectory ? 0o040000 : s.isSymbolicLink ? 0o120000 : 0o100000) | ((s.mode ?? 0o644) & 0o777), size: s.size ?? 0, mtimeMs: +s.mtime, ctimeMs: +s.mtime, uid: 1, gid: 1, dev: 1, ino: 1 });
+  // isomorphic-git takes a file as unchanged when its size and mtime in whole seconds match the index: two edits
+  // of one size in a second (a = 2, then a = 3) looked clean. The millisecond mtime as the inode tells them apart.
+  const stat = s => ({ ...s, isFile: () => s.isFile, isDirectory: () => s.isDirectory, isSymbolicLink: () => s.isSymbolicLink, mode: (s.isDirectory ? 0o040000 : s.isSymbolicLink ? 0o120000 : 0o100000) | ((s.mode ?? 0o644) & 0o777), size: s.size ?? 0, mtimeMs: +s.mtime, ctimeMs: +s.mtime, uid: 1, gid: 1, dev: 1, ino: (+s.mtime % 2147483647) || 1 });
   return { promises: {
     readFile: wrap(async (p, o) => ((typeof o === "string" ? o : o?.encoding) ? vfs.readFile(p) : vfs.readFileBuffer(p))),
     writeFile: wrap((p, d) => vfs.writeFile(p, typeof d === "string" ? d : new Uint8Array(d))),
@@ -91,6 +93,13 @@ export function gitCommand({ defineCommand, result, fetchVia, ROOT }) {
   return defineCommand("git", async (args, ctx) => {
     git ??= (await import(GIT)).default;
     const fs = gitFs(ctx.fs);
+    // Global options before the command: -C dir (models write git -C /project ...), -c name=value, --no-pager.
+    for (;;) {
+      if (args[0] === "-C" && args[1]) { ctx = { ...ctx, cwd: ctx.fs.resolvePath(ctx.cwd, args[1]) }; args = args.slice(2); }
+      else if (args[0] === "-c" && args[1]) args = args.slice(2);
+      else if (args[0] === "--no-pager" || args[0] === "-P") args = args.slice(1);
+      else break;
+    }
     const [cmd, ...rest] = args;
     const findRoot = async () => { try { return await git.findRoot({ fs, filepath: ctx.cwd }); } catch { return null; } };
     const env = k => ctx.env.get(k);
@@ -103,7 +112,7 @@ export function gitCommand({ defineCommand, result, fetchVia, ROOT }) {
       return result("", `fatal: unable to access '${url ?? "the remote"}': ${m}${hint}\n`, 128);
     };
     if (cmd === "--version" || cmd === "version") return result("git version 2.47.0 (isomorphic-git 1.44.2)\n");
-    if (!cmd || cmd === "help") return result("usage: git <command>\n\nThis shell has: init, clone, status, add, rm, commit, log, diff, show, branch, checkout, switch, restore, reset, merge, tag, remote, fetch, pull, push, config, rev-parse\n");
+    if (!cmd || cmd === "help") return result("usage: git <command>\n\nThis shell has: init, clone, status, add, rm, commit, log, diff, show, stash, branch, checkout, switch, restore, reset, merge, tag, remote, fetch, pull, push, config, rev-parse\n");
 
     if (cmd === "clone") {
       const [url, target] = positional(rest, ["--depth", "-b", "--branch"]);
@@ -275,6 +284,30 @@ export function gitCommand({ defineCommand, result, fetchVia, ROOT }) {
           const pairs = [];
           for (const f of new Set([...before.keys(), ...after.keys()])) if (before.get(f) !== after.get(f)) pairs.push([f, before.has(f) ? await blobText(before.get(f)) : null, after.has(f) ? await blobText(after.get(f)) : null]);
           return result(`commit ${oid}\nAuthor: ${commit.author.name} <${commit.author.email}>\n\n${commit.message.trim().split("\n").map(l => "    " + l).join("\n")}\n\n` + await patch(pairs, { stat: flag(rest, "--stat"), names: flag(rest, "--name-only") }));
+        }
+        // Models stash a fix to run the tests on the original code, then pop it back.
+        case "stash": {
+          const quiet = flag(rest, "-q", "--quiet");
+          const op = positional(rest, ["-m", "--message"])[0] ?? "push";
+          if (!["push", "save", "pop", "apply", "drop", "list", "clear"].includes(op)) return result("", `error: this shell's git stash has push, pop, apply, drop, list and clear, not '${op}'\n`, 1);
+          if (op === "list") {
+            const out = await git.stash({ ...g, op: "list" });
+            return result(Array.isArray(out) ? out.map(s => s + "\n").join("") : out ? out + "\n" : "");
+          }
+          if (op === "push" || op === "save") {
+            if (!(await matrix()).some(([, h, w, s]) => h !== w || w !== s)) return result("No local changes to save\n");
+            const branch = await git.currentBranch({ ...g }), oid = await head();
+            // git.stash takes its author from the config only.
+            const who = await author();
+            for (const [key, value] of [["user.name", who.name], ["user.email", who.email]]) if (!(await git.getConfig({ ...g, path: key }))) await git.setConfig({ ...g, path: key, value });
+            await git.stash({ ...g, op: "push", message: valueOf(rest, "-m", "--message") ?? "" });
+            return result(quiet ? "" : `Saved working directory and index state WIP on ${branch}: ${short(oid)} ${(await git.readCommit({ ...g, oid })).commit.message.split("\n")[0]}\n`);
+          }
+          const entries = await git.stash({ ...g, op: "list" }).catch(() => []);
+          if (op !== "clear" && !(Array.isArray(entries) ? entries.length : entries)) return result("", "No stash entries found.\n", 1);
+          try { await git.stash({ ...g, op }); }
+          catch (e) { return result("", `error: ${e?.message ?? e}\n`, 1); }
+          return result(quiet ? "" : op === "clear" ? "" : op === "drop" ? "Dropped refs/stash@{0}\n" : `Applied stash@{0}${op === "pop" ? " and dropped it" : ""}\n`);
         }
         case "branch": {
           const names = positional(rest);
