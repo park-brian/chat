@@ -528,6 +528,18 @@ experiments, each against the noise floor from E5.
   small and the list short. Same reviewer (Opus) to isolate timing. Prediction: contradictions at most half of
   plain's, at under 2.5× its cost.
 
+- **Result E28c (`oracle=each`):** 16, 11, 9, 4 of 19 (mean 10; plain 11.5); chapters contradicting an earlier
+  one 20 in 4 runs (5 a run; plain 4.25); 12-17 reviews a run; cost 546k to 5.1M (two runs over 4.6M). One run
+  ran out of time with 8 chapters. **Refuted, and worse than plain:** reviews after every chapter cost the time
+  the chapters needed, and the fixes they asked for were edits to earlier chapters that themselves set new facts.
+- **So far (E28a-c):** a strong model's plan before, its review after, or its review during the work doesn't fix
+  a cheap model's continuity in a 20k-word work. Next: Opus 5.5 alone on the novella ×2, to see whether the
+  failure is the model's or the harness's.
+- **Product bugs these runs found, fixed:** an empty test image a script wrote went to Bedrock as an image and
+  failed every later request (intent-photos, 2 of 3 runs; a31423d); Gemini's 503s ended runs because nothing
+  retried a busy provider (4a342bd). Gemini also refused the prototype-pollution fix twice (swe-dset-pollution:
+  "The model declined this request").
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
