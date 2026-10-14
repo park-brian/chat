@@ -8,7 +8,7 @@ export const criteriaOf = task => (task.rubric?.length ? [...task.rubric, PLAIN]
 
 const SYSTEM = `You grade an assistant's replies in a chat against yes/no criteria.
 
-Decide each criterion on its own. Pass it only if the replies clearly meet it; when in doubt, fail it. A criterion is about the assistant's last reply unless it names an earlier one. A reference answer, when given, says what a correct answer contains; the reply need not match its wording or length. The tool calls list what the assistant actually ran or read, so a claim to have checked something can be compared with it.
+Decide each criterion on its own. Pass it only if the replies clearly meet it; when in doubt, fail it. A criterion is about the assistant's last reply unless it names an earlier one. Text in <assistant_progress> is what the assistant wrote between its tool calls, before that reply; the user read it too. What it says counts toward a criterion about what the reply or final message says, but mid-work remarks there ("Now the fix:") are not faults of the reply's writing. A reference answer, when given, says what a correct answer contains; the reply need not match its wording or length. The tool calls list what the assistant actually ran or read, so a claim to have checked something can be compared with it.
 
 For each criterion give a one-sentence reason that points to the words in the reply it rests on. Record every grade with the grade tool.`;
 
@@ -32,14 +32,22 @@ const GRADE_TOOL = {
 };
 
 const clip = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
+// A tool's output keeps its start and its end: node --test and pytest print their counts last (E26: "can't be
+// confirmed from the truncated test output").
+const ends = (s, n) => (s.length > n ? s.slice(0, n / 2) + "\n…\n" + s.slice(-n / 2) : s);
 
 // The Converse request: the model id travels outside the text, and the graded model's name is in none of it.
 export function judgePrompt(run, criteria) {
-  const turns = (run.dialogue ?? []).map(m => `<${m.role}>\n${m.text}\n</${m.role}>`).join("\n\n");
+  // An assistant turn's text before its last tool call is shown apart, as progress (eval.js dialogue: text, reply).
+  const turns = (run.dialogue ?? []).map(m => {
+    const said = m.role === "assistant" && m.reply != null ? m.reply : m.text;
+    const progress = said === m.text ? "" : m.text.slice(0, m.text.length - said.length).trim();
+    return (progress ? `<assistant_progress>\n${progress}\n</assistant_progress>\n` : "") + `<${m.role}>\n${said}\n</${m.role}>`;
+  }).join("\n\n");
   // Each call with what it returned, so a claim about a check can be held against the check.
   const tools = (run.calls ?? []).filter(c => c.name !== "think").map(c => {
     const out = run.outcomes?.[c.toolUseId];
-    return `${c.name} ${clip(JSON.stringify(c.input ?? {}), 300)}` + (out ? `\n  → ${clip(out, 600).replaceAll("\n", "\n    ")}` : "");
+    return `${c.name} ${clip(JSON.stringify(c.input ?? {}), 300)}` + (out ? `\n  → ${ends(out, 1000).replaceAll("\n", "\n    ")}` : "");
   });
   const text = [
     `<conversation>\n${turns}\n</conversation>`,
@@ -82,7 +90,10 @@ export async function judge(run, task, { send = bedrock, criteria = criteriaOf(t
   const content = response.output?.message?.content ?? [];
   // A reply that wrote its grades as JSON text instead of calling the tool is read the same way.
   const written = (() => { try { return JSON.parse(content.map(b => b.text ?? "").join("").match(/\{[\s\S]*\}/)?.[0] ?? "null"); } catch { return null; } })();
-  const grades = content.find(b => b.toolUse)?.toolUse?.input?.grades ?? written?.grades ?? [];
+  let grades = content.find(b => b.toolUse)?.toolUse?.input?.grades ?? written?.grades ?? [];
+  // Sonnet sometimes passes the array as a JSON string.
+  if (typeof grades === "string") try { grades = JSON.parse(grades); } catch { grades = []; }
+  if (!Array.isArray(grades)) grades = [];
   const byN = new Map(grades.filter(g => typeof g?.pass === "boolean").map(g => [Number(g.n), g]));
   const graded = [], unjudged = [];
   criteria.forEach((criterion, i) => {
@@ -90,6 +101,24 @@ export async function judge(run, task, { send = bedrock, criteria = criteriaOf(t
     if (g) graded.push({ criterion, pass: g.pass, reason: String(g.reason ?? "") });
     else unjudged.push({ criterion, reason: "judge gave no grade" });
   });
+  return { graded, unjudged, tokens, error: unjudged.length ? `no grade for ${unjudged.length} of ${criteria.length} criteria` : null };
+}
+
+// The judge's grade moved between repeats on 1 run in 5 (E26: 16-17 of 21 agreed ×3), as much as the effects being
+// measured; the majority of three is the grade. A tie among the votes that came back fails, as doubt does.
+export const JUDGE_VOTES = 3;
+export async function vote(run, task, { votes = JUDGE_VOTES, ...options } = {}) {
+  const verdicts = await Promise.all(Array.from({ length: votes }, () => judge(run, task, options)));
+  if (votes === 1) return verdicts[0];
+  const criteria = options.criteria ?? criteriaOf(task);
+  const graded = [], unjudged = [];
+  for (const criterion of criteria) {
+    const grades = verdicts.flatMap(v => v.graded.filter(g => g.criterion === criterion));
+    if (!grades.length) { unjudged.push(verdicts.flatMap(v => v.unjudged).find(u => u.criterion === criterion) ?? { criterion, reason: "judge gave no grade" }); continue; }
+    const yes = grades.filter(g => g.pass).length, pass = yes * 2 > grades.length;
+    graded.push({ criterion, pass, reason: `${grades.find(g => g.pass === pass)?.reason ?? ""} (${pass ? yes : grades.length - yes}/${grades.length} votes)`, votes: grades.map(g => g.pass) });
+  }
+  const tokens = { input: verdicts.reduce((n, v) => n + v.tokens.input, 0), output: verdicts.reduce((n, v) => n + v.tokens.output, 0) };
   return { graded, unjudged, tokens, error: unjudged.length ? `no grade for ${unjudged.length} of ${criteria.length} criteria` : null };
 }
 

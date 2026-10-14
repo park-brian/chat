@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { bounded, dialogue, filePath, flagsText, MAX_UNCONFIRMED, meanLine, metrics, options, parseFlags, partialNote, passK, ruleIds, summarize, transcript } from "../eval.js";
 import TASKS, { numbers, pinsJsdelivr, replies } from "./tasks.js";
-import { criteriaOf, judge, judgedChecks, judgePrompt, JUDGE_MODEL, PLAIN } from "./judge.js";
+import { criteriaOf, judge, judgedChecks, judgePrompt, JUDGE_MODEL, PLAIN, vote } from "./judge.js";
 import { FLOURISHES, mannered, wordCount } from "./style.js";
 
 const dir = path.resolve("run");
@@ -113,7 +113,7 @@ const said = dialogue([
   msg("user", [{ toolResult: { toolUseId: "2", content: [{ text: "" }] } }]),
   msg("assistant", [{ text: "128 bits." }], "m"),
 ]);
-assert.deepEqual(said, [{ role: "user", text: "How long is IPv6?" }, { role: "assistant", text: "64 bits.", seeded: true }, { role: "user", text: "Sure?" }, { role: "assistant", text: "Checking.\n\n128 bits." }]);
+assert.deepEqual(said, [{ role: "user", text: "How long is IPv6?" }, { role: "assistant", text: "64 bits.", reply: "64 bits.", seeded: true }, { role: "user", text: "Sure?" }, { role: "assistant", text: "Checking.\n\n128 bits.", reply: "128 bits." }]);
 assert.deepEqual(replies({ dialogue: said }), ["64 bits.", "Checking.\n\n128 bits."]);
 
 // Flourishes per 1000 words, code left out.
@@ -165,6 +165,9 @@ assert.equal(prompt.toolConfig.tools[0].toolSpec.name, "grade");
 assert.ok(text.includes("<user>\nName a gray cat.\n</user>") && text.includes("<assistant>\nSmoke.\n</assistant>") && text.includes("<reference>\nSmoke.\n</reference>"));
 assert.ok(text.includes("1. Gives one name.\n2. " + PLAIN) && text.includes('web_search {"query":"cat names"}') && !text.includes("think"));
 assert.ok(!/haiku|claude|sonnet|gemini/i.test(text + prompt.system[0].text));
+// What was said before the last call is progress; the reply is graded as the reply.
+const worked = judgePrompt({ dialogue: [{ role: "user", text: "Fix it." }, { role: "assistant", text: "Both new tests fail as expected. Now the fix:\n\nThe bug is in emit.", reply: "The bug is in emit." }] }, [PLAIN]).messages[0].content[0].text;
+assert.ok(worked.includes("<assistant_progress>\nBoth new tests fail as expected. Now the fix:\n</assistant_progress>\n<assistant>\nThe bug is in emit.\n</assistant>"), worked);
 const reply = grades => ({ usage: { inputTokens: 900, outputTokens: 80 }, output: { message: { content: [{ toolUse: { name: "grade", input: { grades } } }] } } });
 let sent;
 const v = await judge(run, task, { send: async input => ((sent = input), reply([{ n: 1, pass: true, reason: "One name." }, { n: 2, pass: false, reason: "\"a quiet storm\"" }])) });
@@ -176,6 +179,15 @@ const partial = await judge(run, task, { send: async () => reply([{ n: 1, pass: 
 assert.deepEqual([partial.graded.length, partial.unjudged.map(u => u.criterion)], [1, [PLAIN]]);
 const typed = await judge(run, task, { send: async () => ({ output: { message: { content: [{ text: 'Grades: {"grades":[{"n":1,"pass":true,"reason":"a"},{"n":2,"pass":true,"reason":"b"}]}' }] } } }) });
 assert.deepEqual([typed.graded.map(g => g.pass), typed.tokens], [[true, true], { input: 0, output: 0 }]);
+// Three votes: the majority grades; a tie among those that came back fails.
+let n = 0;
+const ballots = [[true, true], [false, true], [true, false]];
+const voted = await vote(run, task, { send: async () => reply(ballots[n++].map((pass, i) => ({ n: i + 1, pass, reason: `vote ${n}` }))) });
+assert.deepEqual(voted.graded.map(g => [g.pass, g.votes]), [[true, [true, false, true]], [true, [true, true, false]]]);
+assert.ok(voted.graded[0].reason.endsWith("(2/3 votes)") && voted.tokens.input === 2700);
+n = 0;
+const split = await vote(run, task, { votes: 2, send: async () => reply([{ n: 1, pass: n++ === 0, reason: "r" }, { n: 2, pass: true, reason: "r" }]) });
+assert.deepEqual(split.graded.map(g => g.pass), [false, true]);
 // A judge that fails fails no criterion: they are unjudged, and say why.
 const down = await judge(run, task, { send: async () => { throw new Error("ExpiredTokenException: token expired\nstack"); } });
 assert.deepEqual([judgedChecks(down), down.unjudged.length, down.error], [[], 2, "ExpiredTokenException: token expired"]);

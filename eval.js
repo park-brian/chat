@@ -11,7 +11,7 @@ import { chromium } from "playwright";
 import { startProxy } from "./proxy.js";
 import { startServer } from "./server.js";
 import TASKS from "./evals/tasks.js";
-import { judge, judgedChecks } from "./evals/judge.js";
+import { judgedChecks, vote } from "./evals/judge.js";
 import { mannered } from "./evals/style.js";
 import { simulate } from "./evals/user.js";
 import { steeredCounts } from "./envelope.js";
@@ -131,6 +131,22 @@ const fail = message => { throw new Error(message); };
 // assistant wrote is marked where it wrote it ("[wrote: index.html]"), so a reader can tell what came before the build.
 const WRITES = ["write_file", "edit_file"];
 const wroteIn = m => (m.role === "assistant" && m.modelId !== "echo" ? m.content.filter(b => WRITES.includes(b.toolUse?.name) && typeof b.toolUse.input?.path === "string").map(b => b.toolUse.input.path) : []);
+// What the graders read of a conversation, for a live run and a saved one alike (evals/regrade.js).
+export function conversationView(messages) {
+  // The answer is everything said since the user last spoke: a harness note can move it off the final message.
+  const asked = messages.findLastIndex(m => m.role === "user" && m.content.some(b => b.text && !b.harness));
+  const said = messages.slice(asked + 1).filter(m => m.role === "assistant");
+  const resultText = b => b.toolResult.content.map(c => c.text ?? JSON.stringify(c.json ?? "")).join("\n");
+  return {
+    answer: said.flatMap(m => m.content.filter(b => b.text).map(b => b.text)).join("\n"),
+    calls: messages.filter(m => m.modelId !== "echo").flatMap(m => m.content.filter(b => b.toolUse).map(b => b.toolUse)),
+    // Each call's result by its id, so the judge can see what a claimed check returned.
+    outcomes: Object.fromEntries(messages.flatMap(m => m.content.filter(b => b.toolResult).map(b => [b.toolResult.toolUseId, resultText(b)]))),
+    results: messages.flatMap(m => m.content.filter(b => b.toolResult).map(resultText)).join("\n"),
+    dialogue: dialogue(messages),
+  };
+}
+
 // The files the assistant wrote, in the order it first wrote them; scratch/ is its bench and left out.
 export const written = messages => [...new Set(messages.flatMap(wroteIn))].filter(p => !/^\/?scratch\//.test(p));
 export function dialogue(messages, { writes = false } = {}) {
@@ -144,12 +160,16 @@ export function dialogue(messages, { writes = false } = {}) {
       try { seeding = typeof JSON.parse(text) === "object"; } catch { seeding = false; }
       if (!seeding) out.push({ role: "user", text });
     } else if (text && !seeding && !text.startsWith('Echo: received "')) {
+      // text is all the turn said; reply is what it said after its last tool call, the answer the user is left with.
       const last = out.at(-1);
-      if (last?.role === "assistant") last.text += "\n\n" + text;
-      else out.push({ role: "assistant", text, ...(m.modelId === "echo" && { seeded: true }) });
+      if (last?.role === "assistant") { last.text += "\n\n" + text; last.reply = last.toolAfter ? text : last.reply + "\n\n" + text; }
+      else out.push({ role: "assistant", text, reply: text, ...(m.modelId === "echo" && { seeded: true }) });
     }
+    // A message's text comes before its own calls, so a call here starts a new reply.
+    const last = out.at(-1);
+    if (m.role === "assistant" && last?.role === "assistant" && !seeding) last.toolAfter = m.content.some(b => b.toolUse);
   }
-  return out;
+  return out.map(({ toolAfter, ...m }) => m);
 }
 
 // Everything the app stored, read straight from IndexedDB. Bytes become base64 so they survive the trip out.
@@ -407,9 +427,6 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
     const heads = new Map(Object.entries(project?.heads ?? {}).map(([p, id]) => [p, byId.get(id)]).filter(([, v]) => v));
     const files = Object.fromEntries([...heads].map(([p, v]) => [p, v.text]));
     const shown = [...heads.values()].filter(v => v.report && !v.path.startsWith("scratch/")).sort((a, b) => b.id - a.id)[0];
-    // The answer is everything said since the user last spoke: a harness note can move it off the final message.
-    const asked = messages.findLastIndex(m => m.role === "user" && m.content.some(b => b.text && !b.harness));
-    const said = messages.slice(asked + 1).filter(m => m.role === "assistant");
 
     // Paths come from the model: one that would leave files/, or that can't be written, is skipped and recorded.
     await mkdir(path.join(dir, "files"), { recursive: true });
@@ -435,16 +452,11 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
       finally { await bounded(probePage.close(), "Closing the probe").catch(() => {}); }
     };
     const run = {
-      answer: said.flatMap(m => m.content.filter(b => b.text).map(b => b.text)).join("\n"),
+      ...conversationView(messages),
       answers,
       files,
       report: shown?.report ?? null,
-      calls: messages.filter(m => m.modelId !== "echo").flatMap(m => m.content.filter(b => b.toolUse).map(b => b.toolUse)),
-      // Each call's result by its id, so the judge can see what a claimed check returned.
-      outcomes: Object.fromEntries(messages.flatMap(m => m.content.filter(b => b.toolResult).map(b => [b.toolResult.toolUseId, b.toolResult.content.map(c => c.text ?? JSON.stringify(c.json ?? "")).join("\n")]))),
-      results: messages.flatMap(m => m.content.filter(b => b.toolResult).flatMap(b => b.toolResult.content.map(c => c.text ?? JSON.stringify(c.json ?? "")))).join("\n"),
       metrics: metrics(messages, subagents, ms, subagents.filter(m => forkThreads.has(m.threadId))),
-      dialogue: dialogue(messages),
       probe,
       user,
     };
@@ -461,7 +473,7 @@ async function runOne({ browser, base, proxyUrl, task, model: [modelName, modelI
     const checks = error ? [{ ok: false, label: "finished: " + error }] : await own();
     // The judge grades a finished run only; its tokens are counted apart from the model's. With a simulated user it
     // also sees where each file was written, to tell asking first from building first.
-    const verdict = !error && task.rubric ? await judge(task.user ? { ...run, dialogue: dialogue(messages, { writes: true }) } : run, task) : null;
+    const verdict = !error && task.rubric ? await vote(task.user ? { ...run, dialogue: dialogue(messages, { writes: true }) } : run, task) : null;
     if (verdict) {
       checks.push(...judgedChecks(verdict));
       Object.assign(run.metrics, { judgeInputTokens: verdict.tokens.input, judgeOutputTokens: verdict.tokens.output });

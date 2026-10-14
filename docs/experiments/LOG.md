@@ -27,6 +27,7 @@ every repeat), cost (input tokens in uncached equivalents), seconds, and task-sp
 | B9 | Asking the model to change wording rarely holds; checking the output and asking for a fix might | E4b (wording) 15 → 11; E6b (rule change) 11 → 11-12; E6c pending | tentative |
 | B11 | For Haiku 5.5, effort medium is better than high on agentic work, not just cheaper | E24 games 1.00 vs 0.94 at a third to half the time; swe 0.94 vs 0.92 at -40% time, no timeouts vs 3 | strong (two tiers, tier-level) |
 | B10 | An affordance (a tool that makes the right action easy) changes behavior more than an instruction | E10: a way to run test files cut test-running confusion 11-16 → 3/21, claim failures to 0, leak 11-12 → 5/21, swe +4 | strong (tier-level, mechanism in transcripts) |
+| B12 | On edits to existing code the director's contract costs more than it gives | E25b: goal note off: calls -38%, tokens -30%, leak 13/21 → 1/19, code checks unchanged | strong (one tier, ×3, mechanism in transcripts) |
 | B3 | Tool error messages steer behavior | E4c: "No project is open yet. Create the app with write_file" preceded a 2,317-line app for a prose request | one transcript |
 | B4 | Making the model compute with code fixes counting errors | E1: arxiv 0.64 → 0.97, lodash 0.85 → 1.00 | moderate (two tasks, ×3) |
 | B5 | Unbounded context grows with page reads; a budget plus summaries bounds it | E3: 280k → 30-60k per request on the long report | strong (direct measurement) |
@@ -408,6 +409,66 @@ experiments, each against the noise floor from E5.
   to the new repository (404), so the run used the gh login's token, passed in the environment and not stored.
 - **Next:** the same flow from the app in a browser (connect in the UI, an agent's change, push, PR), and the
   swe tier as GitHub projects.
+
+### E25. Where swe's points go, and the director on small fixes (plan: docs/specs/2026-10-13-optimization-plan.md)
+
+- **Reading the misses (medium run 10-07-41, all 21 transcripts, checked by an independent review):** hidden and
+  own tests pass in all 21. PLAIN failed 6 times: 4 real leaks of contract words ("I won't revert the fix just to
+  make the checks red"), 2 judge errors (a mid-work line graded as the reply; "fell through" called figurative).
+  Two "reports only test results it got" misses were a grader bug: "Plan items 1 and 2 pass" read as "2 passed".
+  Fixed in evals/swe.js and in the engine's own claim check (COUNT_CLAIM), with the two sentences as tests.
+- **E25b, prediction (before the run):** `rule.goal=off` cuts calls on long runs by 5+ and the leak to 0-1/21
+  with code checks unchanged; `rule.red=off` cuts the leak to 0-1/21 with calls unchanged.
+- **Method:** swe ×3 per arm, Haiku 5.5 medium, three arms in parallel on the same commit. Leak by E6's regex on
+  the last assistant message (evals/director-report.js), independent of the judge's PLAIN grade.
+
+| arm | graded | pass | hidden | PLAIN | leak | calls | k tokens in | goal note in |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| base | 21 | 0.95 | 1.00 | 0.90 | 13/21 | 14.1 | 235 | 17 |
+| rule.goal=off | 19 (+2 unfinished) | 0.96 | 1.00 | 0.95 | 1/19 | 8.7 | 164 | 0 |
+| rule.red=off | 20 (+1 unfinished) | 0.95 | 1.00 | 0.85 | 6/20 | 11.9 | 224 | 12 |
+
+- **Result:** the goal note's prediction held: -5.4 calls (-38%), -30% input tokens, leak 13 → 1, code unchanged,
+  PLAIN up 5. The red rule's was refuted: 6/20 leak, calls -2. The goal note is the source: once it fires, the
+  model builds a contract for a fix that is already done, and every later note is about that contract. Turning
+  off red removes one of those notes, not the contract. The three unfinished runs (mri-alias-default, the eval's
+  600 s page wait) are an eval hang, not a score; none of these pages loaded the code changed during the run.
+- **Learned (B12):** on edits to existing code, the contract costs more than it gives: a third more calls and
+  most of the leak, for no change in what gets fixed. The size threshold (8 calls) can't tell a careful fix from
+  long work.
+- **Also found, from transcripts (user: "we may need to make git available to the shell"):** git and node were
+  there, but a plain project had no repository: models ran `git diff`, `git status`, `git show HEAD:file` to see
+  their own changes and got "no git history" (5 runs in the last 3 swe evals). Now the shell commits the files
+  as the user's message found them at a turn's first command (a project of the chat's own only; a folder or
+  GitHub project has its own repository), and `git show rev:path` works. isomorphic-git's index cached the stat
+  of the scratch tree; a file of the same size looked unchanged until the index was reset against the working copy.
+- **Next (E27):** `sizing=building`: the goal note needs 8 calls and a turn that builds (no files when it began,
+  or 3+ new files). Prediction: swe like `rule.goal=off` (leak ≤ 2/21, calls ≤ 10); games unchanged (they start
+  with no files, so the director runs as before).
+
+### E26. The judge, measured against itself (evals/regrade.js)
+
+- **Question:** how much of a judged score is the judge? Re-judging saved runs ×3 changes nothing but the judge's
+  own sampling (Sonnet 5.5 refuses temperature).
+- **Method:** the medium swe run (21 runs, 4 criteria), `node evals/regrade.js <folder> --repeat 3`: for each
+  criterion, how often all three repeats agree, and how often their majority agrees with the saved grade.
+- **Result, before any change:** repeats agreed on 20, 21, 16 and 17 of 21 (cause, file, how checked, PLAIN).
+  The judge moved on 1 run in 5 for the two criteria that decide most misses: as large as the effects measured.
+- **Two input bugs found by reading the flips:**
+  - Tool outputs reached the judge cut to their first 600 characters, and node --test prints its counts last:
+    "can't be confirmed from the truncated test output". Now the start and the end are kept (1000 characters).
+    "How checked" went from 16 to 21 of 21 repeats agreeing, and the fails it now gives are real over-claims
+    ("both failed before the fix" when the run shows one failure).
+  - The whole turn's text was graded as the reply, so a mid-work line ("Both new tests fail as expected. Now the
+    fix:") failed PLAIN. The judge now sees text before the last tool call as `<assistant_progress>`: it counts
+    for what the reply says, not against its writing. A first version graded the reply alone and failed a cause
+    the model had stated earlier in the turn; the user reads that text too, so it counts.
+- **Also:** Sonnet sometimes passes `grades` as a JSON string, which crashed the judge; it is parsed now.
+- **After the fixes:** repeats agree on 20, 21, 20 and 20 of 21. eval.js now grades by the majority of three votes
+  (judge.js `vote`), which costs about 15k judge tokens a run.
+- **Learned:** the judge's noise was mostly the inputs it was given, not its sampling. Re-grading saved runs
+  turns a grader change into something tested before it is trusted. Scores judged before E26 are not comparable
+  with later ones: E25 and E27 used the old judge in all their arms.
 
 ## Ideas, as testable hypotheses
 
