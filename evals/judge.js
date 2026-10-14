@@ -104,9 +104,10 @@ export async function judge(run, task, { send = bedrock, criteria = criteriaOf(t
   return { graded, unjudged, tokens, error: unjudged.length ? `no grade for ${unjudged.length} of ${criteria.length} criteria` : null };
 }
 
-// The judge's grade moved between repeats on 1 run in 5 (E26: 16-17 of 21 agreed ×3), as much as the effects being
-// measured; the majority of three is the grade. A tie among the votes that came back fails, as doubt does.
-export const JUDGE_VOTES = 3;
+// The judge's grade moved between repeats on 1 run in 5 (E26: 16-17 of 21 agreed ×3) until its inputs were fixed;
+// after, 20-21 of 21 agreed, so one Sonnet call grades (the user, 2026-10-14: use Opus and Sonnet sparingly).
+// votes: n takes the majority of n; a tie among the votes that came back fails, as doubt does.
+export const JUDGE_VOTES = 1;
 export async function vote(run, task, { votes = JUDGE_VOTES, ...options } = {}) {
   const verdicts = await Promise.all(Array.from({ length: votes }, () => judge(run, task, options)));
   if (votes === 1) return verdicts[0];

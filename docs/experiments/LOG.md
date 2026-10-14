@@ -28,6 +28,7 @@ every repeat), cost (input tokens in uncached equivalents), seconds, and task-sp
 | B11 | For Haiku 5.5, effort medium is better than high on agentic work, not just cheaper | E24 games 1.00 vs 0.94 at a third to half the time; swe 0.94 vs 0.92 at -40% time, no timeouts vs 3 | strong (two tiers, tier-level) |
 | B10 | An affordance (a tool that makes the right action easy) changes behavior more than an instruction | E10: a way to run test files cut test-running confusion 11-16 → 3/21, claim failures to 0, leak 11-12 → 5/21, swe +4 | strong (tier-level, mechanism in transcripts) |
 | B12 | On edits to existing code the director's contract costs more than it gives | E25b: goal note off: calls -38%, tokens -30%, leak 13/21 → 1/19, code checks unchanged | strong (one tier, ×3, mechanism in transcripts) |
+| B13 | Long-work continuity is the writer model's limit; the harness's plans and reviews don't move it | E28a-d: Haiku 4.25 contradicting chapters a run with or without plans/reviews (2.7-5); Sonnet 0.5, Opus 1 | strong (four arms, A/A measured) |
 | B3 | Tool error messages steer behavior | E4c: "No project is open yet. Create the app with write_file" preceded a 2,317-line app for a prose request | one transcript |
 | B4 | Making the model compute with code fixes counting errors | E1: arxiv 0.64 → 0.97, lodash 0.85 → 1.00 | moderate (two tasks, ×3) |
 | B5 | Unbounded context grows with page reads; a budget plus summaries bounds it | E3: 280k → 30-60k per request on the long report | strong (direct measurement) |
@@ -539,6 +540,26 @@ experiments, each against the noise floor from E5.
   failed every later request (intent-photos, 2 of 3 runs; a31423d); Gemini's 503s ended runs because nothing
   retried a busy provider (4a342bd). Gemini also refused the prototype-pollution fix twice (swe-dset-pollution:
   "The model declined this request").
+
+### E28d. Whose limit is it? The novella by model (evals/dollars.js, first-party list prices)
+
+| writer | runs | checks of 19 | contradicting chapters a run | $ a run |
+| --- | --- | --- | --- | --- |
+| Haiku 5.5 medium | 4 | 13, 11, 8, 14 (11.5) | 4.25 | 0.08-0.12 |
+| Haiku 5.5 high | 3 | 14, 13, 12 (13.0) | 2.7 | 0.21-0.77 |
+| Haiku + Opus reviewer at the end | 4 | 12.25 | 3.25 | 0.09-0.22 + the review (uncounted, see below) |
+| Sonnet 5.5 medium | 2 | 17, 18 | 0.5 | 0.90-1.23 |
+| Opus 5.5 medium | 2 | 17, 17 | 1 | 3.58-5.24 |
+
+- **Learned (B13):** the novella's continuity is the writer's limit, not the harness's. Sonnet and Opus keep a
+  20k-word story consistent; Haiku drifts whatever the harness adds before, during or after. Sonnet matches Opus
+  at a quarter of the price. For Haiku, high effort helps here (+1.5 checks, a third fewer contradictions, about
+  3× the cost): on long creative work, unlike agentic coding (B11), medium isn't enough.
+- **Accounting bug found:** the oracle's review sub-agent ran without a thread, so its messages were never saved
+  and E28b/c's costs leave out every Opus review. Fixed (9a656fa): it has a thread, shown in the UI and counted.
+- **The user (2026-10-14): use Opus and Sonnet sparingly.** At list prices they are 40× and 20× Haiku per token.
+  The judge goes back to one Sonnet vote a run (its inputs were the noise, E26); no more Opus or Sonnet arms
+  without a question only they answer.
 
 ## Ideas, as testable hypotheses
 

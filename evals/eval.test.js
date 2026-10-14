@@ -182,7 +182,7 @@ assert.deepEqual([typed.graded.map(g => g.pass), typed.tokens], [[true, true], {
 // Three votes: the majority grades; a tie among those that came back fails.
 let n = 0;
 const ballots = [[true, true], [false, true], [true, false]];
-const voted = await vote(run, task, { send: async () => reply(ballots[n++].map((pass, i) => ({ n: i + 1, pass, reason: `vote ${n}` }))) });
+const voted = await vote(run, task, { votes: 3, send: async () => reply(ballots[n++].map((pass, i) => ({ n: i + 1, pass, reason: `vote ${n}` }))) });
 assert.deepEqual(voted.graded.map(g => [g.pass, g.votes]), [[true, [true, false, true]], [true, [true, true, false]]]);
 assert.ok(voted.graded[0].reason.endsWith("(2/3 votes)") && voted.tokens.input === 2700);
 n = 0;
