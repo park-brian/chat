@@ -7782,7 +7782,7 @@ if (window.__HARNESS__?.test) (async () => {
           const found = await source("astro builds 300 pages in 9 s");
           assert(found.result === "pass" && found.evidence === "found in read_url https://astro.build/docs", `source: a quote matches across case and spacing, and says where: ${JSON.stringify(found)}`);
           assert((await source("12 s")).result === "fail" && (await source("a plan-only quote")).result === "fail", "a number no result holds fails, and the plan's own results don't count");
-          for (const kind of ["compute", "consistency", "judge", "user"]) {
+          for (const kind of ["compute", "judge", "user"]) {
             const stub = await runCheck({ kind, text: "x" }, {});
             assert(stub.result === "not run" && stub.evidence.startsWith("not run by the harness yet"), `${kind} is not run yet, and says so: ${JSON.stringify(stub)}`);
           }
@@ -7982,6 +7982,31 @@ if (window.__HARNESS__?.test) (async () => {
           finally { localStorage.removeItem(FLAGS_KEY); }
           assert(asked.length === 1 && asked[0].text.includes("New or changed: chapters/02.md. Before them: chapters/01.md."), `one review, of the second part against the first: ${JSON.stringify(asked)}`);
           assert(run.notes.some(n => n.startsWith("A reviewer read chapters/02.md against the parts before it.")), `and it comes back as a note: ${JSON.stringify(run.notes)}`);
+        }
+
+        // Why: Haiku wrote a story bible into the notes store, cited a project path that didn't exist, and never read it again (E31)
+        async function testWorkingDocs() {
+          const ws = await headlessProject({ "chapters/01.md": "Tomas kept the light 41 years.", "notes/facts.md": "Tomas kept the Ness light 34 years." });
+          const asked = [];
+          const checker = async id => ({ send: async input => (asked.push({ id, text: input.messages[0].content[0].text }), createMockClient([{ blocks: mockTextBlock("CONTRADICTS\n- \"41 years\" breaks: kept the light 34 years\nNew facts: none") }]).send(input)) });
+          const planned = { goal: "A novella", done: "Twelve chapters", docs: [{ path: "/project/notes/facts.md", keeps: "every fixed fact" }, { path: "/memories/bible.md", keeps: "the bible" }], add: { title: "Chapter 1", check: { kind: "consistency", file: "chapters/01.md", against: "notes/facts.md" } } };
+          localStorage.setItem(FLAGS_KEY, JSON.stringify({ docs: "on" }));
+          let run;
+          try {
+            run = await directedTurn({ script: [{ blocks: mockToolUseBlock("plan", planned, "p1"), stopReason: "tool_use" }, reply("Planned.")], workspace: ws, modelClient: checker });
+            const spec = getConverseCommand({ modelId: "echo", systemPrompt: "P", tools: [planTool], messages: [{ role: "user", content: [{ text: "hi" }] }] });
+            assert("docs" in spec.toolConfig.tools[0].toolSpec.inputSchema.json.properties && spec.system[0].text.includes("Working docs: long work keeps its own notes"), "with the flag, the plan takes docs and says how");
+          } finally {
+            localStorage.removeItem(FLAGS_KEY);
+          }
+          const result = JSON.stringify(run.store.messages.flatMap(m => m.content).filter(c => c.toolResult));
+          assert(eq(run.thread.contract.docs, [{ path: "notes/facts.md", keeps: "every fixed fact" }]), `a project doc is kept, its /project/ prefix dropped: ${JSON.stringify(run.thread.contract.docs)}`);
+          assert(result.includes("Not kept as docs: memories/bible.md"), `a doc in the notes store is refused, with why: ${result.slice(0, 400)}`);
+          assert(asked.length === 1 && asked[0].id === "global.anthropic.claude-haiku-5-5" && asked[0].text.includes("Tomas kept the Ness light 34 years.") && asked[0].text.includes("41 years"), `Haiku reads the part against the doc: ${JSON.stringify(asked)}`);
+          assert(result.includes("breaks: kept the light 34 years"), "and the contradiction is the check's evidence");
+          assert(run.notes.some(n => n.startsWith("Your working docs as they stand, for item 1") && n.includes("Tomas kept the Ness light 34 years.")), `the docs come back when the item starts: ${JSON.stringify(run.notes)}`);
+          const plain = getConverseCommand({ modelId: "echo", systemPrompt: "P", tools: [planTool], messages: [{ role: "user", content: [{ text: "hi" }] }] });
+          assert(!("docs" in plain.toolConfig.tools[0].toolSpec.inputSchema.json.properties) && !plain.system[0].text.includes("Working docs"), "without the flag, the plan is as before");
         }
 
         // Why: an ablation is a flag set for one eval run (eval.js --flags), not a worktree; each is a no-op at its default
@@ -9198,6 +9223,7 @@ if (window.__HARNESS__?.test) (async () => {
           testFeatureFlags,
           testSizingBuilding,
           testOracleDone,
+          testWorkingDocs,
           testAsyncSubagents,
           testClaimCheck,
           testReinjectAfterSummary,

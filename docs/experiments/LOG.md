@@ -561,6 +561,19 @@ experiments, each against the noise floor from E5.
   The judge goes back to one Sonnet vote a run (its inputs were the noise, E26); no more Opus or Sonnet arms
   without a question only they answer.
 
+### E31. Working docs in the plan (design: docs/specs/2026-10-14-working-docs.md)
+
+- **What the novella transcripts showed:** Haiku did write a story bible in its first step, but with the editor
+  tool, into the notes store outside the project; it cited a project path that didn't exist, never opened it
+  again, never updated it, and after each summary the harness handed back only the goal and current item. Every
+  item's check was a word count.
+- **Change (flag `docs=on`):** the plan takes `docs: [{ path, keeps }]` (project files only; a /memories/ path is
+  refused with why); the docs' text comes back when an item starts and after a summary; an item done while a doc
+  didn't change is said once; a new check kind `consistency` has Haiku read a part against a doc (about 5k
+  tokens). Off by default; the schema and docs are as before without the flag.
+- **Prediction (before the run):** novella ×3: contradicting chapters at most 2 a run (plain 4.25), checks at
+  least 13.5 of 19 (plain 11.5), under 2× the cost. Research ×2 and Lisp ×1: no loss.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.

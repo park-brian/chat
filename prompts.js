@@ -507,6 +507,21 @@ export const GENERAL_PROMPT = `You are a worker agent. Do the task you are given
 Return what the caller needs to go on: the answer, its evidence (URLs, exact quotes, numbers), and what you could not
 do. Save long material to /work/{folder}/ with the editor and return the paths.`;
 
+// docs=on (E31): working docs, kept by the model and checked by the harness.
+export const PLAN_DOCS = `Working docs: long work keeps its own notes, as project files you write and update as you go, named with the goal:
+{ "docs": [{ "path": "notes/facts.md", "keeps": "every fixed name, age, date, place, who was where and who knows what" }] }
+- long writing: notes/outline.md (each part's events, written before the parts) and notes/facts.md (updated after each part)
+- experiments: docs/log.md (each run's question, the prediction before it, the result, the lesson)
+- a large change to code: notes/decisions.md (each decision and why)
+The docs come back to you when an item starts and after a summary. A part can be checked against them:
+- consistency: { "kind": "consistency", "file": "chapters/03.md", "against": "notes/facts.md" } a reader finds nothing in the file that contradicts the doc
+Keep working docs in the project, not in /memories/, which is for later chats.`;
+export const GOAL_DOCS_NOTE = "This is long work. Before more work, set it out with plan({ goal, assumptions, done, docs }): the goal in the user's words, what done means, and the working docs you will keep up to date as you go (for long writing, notes/outline.md and notes/facts.md; for experiments, docs/log.md).";
+export const NO_DOCS_NOTE = "The plan keeps no working docs. Long work drifts when what was decided lives only in the conversation, which gets summarized: add them with plan({ docs: [{ path, keeps }] }), for example notes/facts.md keeping every fixed name, date, place and who knows what, and check each part against it.";
+export const CONSISTENCY_CHECK = `You check one part of a longer work against the notes that keep its facts. Read the facts, then the part.
+
+Answer on the first line with one word: CONSISTENT if nothing in the part contradicts the facts, CONTRADICTS if something does. Then list each contradiction: the words in the part, the fact it breaks, in one line each. After that, list in one line each any new fixed fact the part sets that the notes lack (a name, an age, a date or time, a place, who knows what), under "New facts:". Nothing else.`;
+
 // oracle=done (E28b): the request to the reviewer that reads a work in parts, and the note its review comes back in.
 export const PARTS_REVIEW = `These files are one work in parts, in this order: {parts}. Read every part with view_file, in order, and keep a list of the facts each one sets (names, ages, numbers, dates and times, places, who was where, who knows what).
 

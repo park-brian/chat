@@ -5,7 +5,7 @@
 // #region 1. IMPORTS & DEFINITIONS
 import {
   DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FETCH_DIRECT, FETCH_PROXIED, FORK_BRIEF, FRONTEND_SKILL,
-  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PART_REVIEW, PART_REVIEW_NOTE, PARTS_REVIEW, PARTS_REVIEW_NOTE, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
+  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_DOCS, GOAL_DOCS_NOTE, NO_DOCS_NOTE, CONSISTENCY_CHECK, PART_REVIEW, PART_REVIEW_NOTE, PARTS_REVIEW, PARTS_REVIEW_NOTE, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
   SUMMARY_PROMPT, TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
 import {
@@ -70,7 +70,9 @@ function systemPrompt(persona, { tools = [], memories = null, modelId = null, st
   const changes = flag("envelope", "xml") === "xml" ? "<changes> block" : "<workspace> block";
   const guide = TOOL_DOCUMENTATION.split(/\n(?=### )/).filter(part => !part.startsWith("### ") || tools.includes(part.match(/^### (\w+)/)[1]))
     // subagents=async: the task section says how results come back.
-    .map(part => part.startsWith("### task") && flag("subagents") === "async" ? part.trimEnd() + "\n" + TASK_ASYNC : part);
+    .map(part => part.startsWith("### task") && flag("subagents") === "async" ? part.trimEnd() + "\n" + TASK_ASYNC : part)
+    // docs=on: the plan section says how working docs are kept and checked (E31).
+    .map(part => part.startsWith("### plan") && flag("docs") === "on" ? part.trimEnd() + "\n" + PLAN_DOCS : part);
   const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && fill(HARNESS_DOCUMENTATION, { changes });
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
@@ -115,7 +117,7 @@ const PATH_PROPERTY = { type: "string", description: "File path, e.g. index.html
 const SCREENSHOT_PROPERTY = { type: "boolean", description: "true forces a screenshot, false skips it. By default one is attached when the user lets you see the page and it changed." };
 // The harness runs test, probe, file, source and command checks itself; the other kinds are named so a plan can hold them.
 const CHECK_KINDS = ["test", "probe", "file", "source", "command", "compute", "consistency", "judge", "user"];
-const HARNESS_CHECKS = ["test", "probe", "file", "source", "command"];
+const HARNESS_CHECKS = ["test", "probe", "file", "source", "command", "consistency"];
 const CHECK_SCHEMA = {
   type: "object",
   description: "How the harness tells the item is done",
@@ -131,6 +133,7 @@ const CHECK_SCHEMA = {
     contains: { type: "string", description: "file: text it must contain" },
     matches: { type: "string", description: "file: a regular expression it must match" },
     min_words: { type: "integer", description: "file: at least this many words" },
+    against: { type: "string", description: "consistency: the working doc the file is read against" },
     max_words: { type: "integer", description: "file: at most this many words" },
     text: { type: "string", description: "source: a quote or number that must appear in a tool result in this chat. Other kinds: what to check" },
   },
@@ -269,6 +272,8 @@ const TOOLS = [
             note: { type: "string", description: "A fact learned, or a decision and its reason" },
             source: { type: "string", description: "With note: the URL or file it came from" },
             ask: { type: "string", description: "A question only the user can answer" },
+            // docs=on (E31): the working docs the plan keeps; dropped from the schema otherwise (getConverseCommand).
+            docs: { type: "array", description: "The project files you keep up to date as you work, each { path, keeps }: what it records", items: { type: "object", properties: { path: { type: "string" }, keeps: { type: "string" } }, required: ["path", "keeps"] } },
           },
         },
       },
@@ -1033,7 +1038,7 @@ const STALL_STEPS = 6; // steps with no check turning green before the director 
 const NOTES_AT = 0.8; // share of the way to a summary at which the model is told to write its notes
 const LEDGER_KEPT = 300;
 
-const emptyContract = () => ({ goal: "", done: "", assumptions: [], items: [], ledger: [], notes: [], questions: [] });
+const emptyContract = () => ({ goal: "", done: "", assumptions: [], items: [], ledger: [], notes: [], questions: [], docs: [] });
 const clip = (text, n) => (text = String(text ?? ""), text.length > n ? text.slice(0, n - 1) + "…" : text);
 const andList = xs => xs.length < 2 ? String(xs[0] ?? "") : `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}`;
 const itemsLabel = ids => `${ids.length > 1 ? "Items" : "Item"} ${andList(ids)}`;
@@ -1062,6 +1067,7 @@ function describeCheck(c) {
       return `${c.file} ${andList(parts)}`;
     }
     case "source": return `"${clip(c.text, 80)}" appears in a tool result`;
+    case "consistency": return `${c.file} contradicts nothing in ${c.against}`;
     case "command": return `\`${clip(c.run, 100)}\` exits ${c.exit ?? 0}${c.stdout != null ? ` with "${clip(c.stdout, 60)}" in its output` : ""}`;
     default: return `${c.kind}: ${clip(c.text ?? "", 80)}`;
   }
@@ -1074,10 +1080,11 @@ function toCheck(c) {
   if (c.kind === "probe" && !String(c.script ?? "").trim()) return { error: "has a probe check without a script" };
   if (c.kind === "file" && !c.file) return { error: "has a file check without a file" };
   if (c.kind === "source" && !String(c.text ?? "").trim()) return { error: "has a source check without the text to find" };
+  if (c.kind === "consistency" && (!c.file || !c.against)) return { error: 'has a consistency check without both files: { "kind": "consistency", "file": "chapters/03.md", "against": "notes/facts.md" }' };
   if (c.kind === "command" && !String(c.run ?? "").trim()) return { error: 'has a command check without the command: { "kind": "command", "run": "npm test", "exit": 0 }' };
   if (c.kind === "command" && c.exit != null && !Number.isInteger(+c.exit)) return { error: "has a command check whose exit isn't a number" };
   if (c.matches) try { new RegExp(c.matches, "m"); } catch (e) { return { error: `has a pattern that doesn't parse: ${e.message}` }; }
-  const fields = ["kind", "file", "name", "script", "exists", "contains", "matches", "min_words", "max_words", "text", "run", "exit", "stdout"];
+  const fields = ["kind", "file", "name", "script", "exists", "contains", "matches", "min_words", "max_words", "text", "run", "exit", "stdout", "against"];
   return { check: Object.fromEntries(fields.filter(k => c[k] != null).map(k => [k, k === "file" ? normalizePath(c[k]) : k === "exit" ? +c[k] : c[k]])) };
 }
 
@@ -1150,11 +1157,12 @@ async function probeCheck(c, ws, signal) {
 
 // { result: pass | fail | "not run", evidence }. A check that throws fails, with the reason as its evidence.
 // host and threadId: for a command check, the tab that runs the shell, and the run whose shell it is.
-async function runCheck(check, { ws = null, messages = [], fresh = [], signal = null, host = null, threadId = null } = {}) {
+async function runCheck(check, { ws = null, messages = [], fresh = [], signal = null, host = null, threadId = null, modelClient = defaultModelClient } = {}) {
   try {
     switch (check.kind) {
       case "file": return fileCheck(check, ws?.readFile ? await ws.readFile(check.file) : null);
       case "source": return sourceCheck(check, messages);
+      case "consistency": return await consistencyCheck(check, ws, signal, modelClient);
       case "test": return await testCheck(check, ws, fresh, signal);
       case "probe": return await probeCheck(check, ws, signal);
       case "command": return await shellTool.runCommandCheck(check, { ws, host, threadId, signal });
@@ -1166,6 +1174,30 @@ async function runCheck(check, { ws = null, messages = [], fresh = [], signal = 
   }
 }
 
+// A part of a work read against the doc that keeps its facts (E31), by Haiku: about 5k tokens a check, where Opus
+// rereading every part (E28c) cost up to $0.75 a run. The reply's first word is the verdict.
+const CHECKER_MODEL = "global.anthropic.claude-haiku-5-5";
+const defaultModelClient = id => modelClient(id);
+async function consistencyCheck(check, ws, signal, clientFor) {
+  const read = async path => (typeof ws?.state?.files?.[path] === "string" ? ws.state.files[path] : ws?.readFile ? await ws.readFile(path).catch(() => null) : null);
+  const [part, facts] = [await read(check.file), await read(check.against)];
+  if (typeof part !== "string") return fail(`${check.file} doesn't exist`);
+  if (typeof facts !== "string" || !facts.trim()) return fail(`${check.against} is missing or empty: write the facts there first`);
+  const input = {
+    modelId: CHECKER_MODEL,
+    system: [{ text: CONSISTENCY_CHECK }],
+    messages: [{ role: "user", content: [{ text: `<facts path="${check.against}">\n${facts}\n</facts>\n\n<part path="${check.file}">\n${part}\n</part>` }] }],
+    inferenceConfig: { maxTokens: 4000 },
+    additionalModelRequestFields: reasoningFields(modelInfo(CHECKER_MODEL), "low"),
+  };
+  const output = await watchedSend(await clientFor(CHECKER_MODEL), input, signal);
+  let text = "";
+  for await (const e of output.stream) text += e.contentBlockDelta?.delta?.text ?? "";
+  text = text.trim();
+  if (/^CONSISTENT\b/i.test(text)) return pass(`${check.file} agrees with ${check.against}${/\n/.test(text) ? `; ${clip(text.split("\n").slice(1).join(" ").trim(), 300)}` : ""}`);
+  return fail(`${check.file} against ${check.against}: ${clip(text.replace(/^CONTRADICTS\W*/i, ""), 700)}`);
+}
+
 // A command check of a GitHub project's CI (gh pr checks, gh run ...): it reads the pushed commit, not the files.
 const isCICheck = check => check.kind === "command" && /^\s*gh\s+(pr\s+checks|run)\b/.test(check.run ?? "");
 
@@ -1173,6 +1205,7 @@ const isCICheck = check => check.kind === "command" && /^\s*gh\s+(pr\s+checks|ru
 function watches(check, path) {
   if (isPlanFile(path)) return false;
   if (check.kind === "file") return check.file === path;
+  if (check.kind === "consistency") return check.file === path || check.against === path;
   if (check.kind === "test" || check.kind === "probe" || check.kind === "command") return !isScratch(path) || check.file === path;
   return false;
 }
@@ -1280,9 +1313,14 @@ const ITEMS_NOTE = "The goal is set and the plan has no items. Add the steps wit
 const DIRECTOR_RULES = [
   { id: "polished", at: "step", every: "turn", note: s => polishedTake(s.messages, s.start) },
   // Past the size threshold with no goal. An agent without the plan tool is told to keep a plan file instead.
-  { id: "goal", at: "step", every: "turn", note: s => s.has("plan") ? s.sized && !s.contract.goal && GOAL_NOTE
+  { id: "goal", at: "step", every: "turn", note: s => s.has("plan") ? s.sized && !s.contract.goal && (flag("docs") === "on" ? GOAL_DOCS_NOTE : GOAL_NOTE)
     : s.has("write_file") && s.ws && unplannedTask(s.messages, s.start, s.files, s.shown) },
   { id: "items", at: "step", every: "turn", note: s => s.contract.goal && !s.contract.items.length && ITEMS_NOTE },
+  // Working docs (E31): asked for once when the goal is set without them; shown when a new item starts; a doc an
+  // item didn't touch is said once.
+  { id: "nodocs", at: "step", every: "turn", note: s => flag("docs") === "on" && s.sized && s.contract.goal && !s.contract.docs.length && NO_DOCS_NOTE },
+  { id: "docs", at: "step", every: "event", note: s => s.events.docs && `Your working docs as they stand, for item ${s.current.id}; bring them up to date with what it sets:\n${s.events.docs}` },
+  { id: "stale", at: "step", every: "event", note: s => s.events.stale.map(({ item, docs }) => `Item ${item.id}'s check passes, and ${andList(docs.map(d => d.path))} ${docs.length > 1 ? "haven't" : "hasn't"} changed since it began. Add what it set (${clip(docs[0].keeps, 120)}) before the next item.`) },
   { id: "red", at: "step", every: "event", note: s => s.events.red.map(i => `Item ${i.id}'s check already passes before any work, so it can't show the item gets done. Change it with plan({ edit: ${i.id}, check }) to one that fails now and passes once the item is done.`) },
   { id: "regressed", at: "step", every: "event", note: s => s.events.regressed.map(({ item, evidence }) => `Item ${item.id}'s check passed before and fails now (${evidence}), so the item is open again. A change since it passed broke it: fix that before going on.`) },
   { id: "done", at: "step", every: "event", note: s => s.events.done.length && doneNote(s.events.done, s.contract) },
@@ -1299,7 +1337,7 @@ const DIRECTOR_RULES = [
   // Only after work: a turn that called no tool is an answer, and its words about tests are about tests in general.
   { id: "claim", at: "stop", every: "turn", note: s => s.calls && contradictedClaim(s.messages) },
   { id: "open", at: "stop", every: "turn", note: s => s.calls && openItemsNote(s.contract, s.asked) },
-  { id: "summary", at: "summary", every: "event", note: s => resummaryNote(s.contract) },
+  { id: "summary", at: "summary", every: "event", note: s => [resummaryNote(s.contract), s.contract.docs?.length && `Your working docs:\n${s.docsNow()}`].filter(Boolean).join("\n") },
 ];
 // director=off: the six reminders as the loop had them before the director (5f2e583), each once a turn. The plan
 // tool is withheld too (getConverseCommand), so no contract starts and no contract rule speaks.
@@ -1337,7 +1375,7 @@ function planInPrompt(tools) {
 
 // One per run (a turn): the thread's contract, the rules, and what they have said. messages: the run's messages as
 // they stand. tools: the names of the tools the run has. started: the day the conversation started.
-async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules(), started = null, turnStart = null } = {}) {
+async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules(), started = null, turnStart = null, modelClient: clientFor = defaultModelClient } = {}) {
   const thread = threadId != null ? await db.get("threads", threadId) : null;
   // The files the user's message found. A turn that edits files that were there is a fix, not long work, however
   // many calls it takes (E25b, E27: on bug fixes the contract cost a third more calls and leaked into replies; games
@@ -1347,6 +1385,14 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
   const has = name => tools.includes(name);
   const reminded = new Set(), seen = new Set();
   let pending = [], idle = 0, asked = false, dirty = false, workspace = null, host = null;
+  // Working docs: each item's doc versions when it became current, and the item the docs were last shown for.
+  const docMarks = {};
+  let docsShownFor = null;
+  const docsText = () => contract.docs.map(d => {
+    const text = workspace?.state?.files?.[d.path];
+    const body = typeof text !== "string" ? "(not written yet)" : text.length > 2500 ? `${text.slice(0, 1250)}\n…\n${text.slice(-1250)}` : text;
+    return `<doc path="${d.path}" keeps="${d.keeps.replaceAll('"', "'")}">\n${body}\n</doc>`;
+  }).join("\n");
   const sources = new Set();
   let queue = Promise.resolve();
   const serial = fn => { const p = queue.then(fn); queue = p.catch(() => {}); return p; };
@@ -1422,12 +1468,20 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       if (!input || typeof input !== "object" || Array.isArray(input)) return { error: "plan takes an object: { goal }, { add }, { edit }, { note } or { ask }." };
       workspace = context.workspace ?? workspace;
       host = context.host ?? host;
-      const env = { ws: workspace, messages: messages(), signal: context.signal, host, threadId };
+      const env = { ws: workspace, messages: messages(), signal: context.signal, host, threadId, modelClient: clientFor };
       const said = [];
       const statusGiven = "status" in input || [input.add].flat().some(a => a && "status" in a) || (input.check && "status" in input.check);
       if (statusGiven) said.push("Status is the harness's: an item is done when its check passes, so the status given was ignored.");
       for (const key of ["goal", "done"]) if (typeof input[key] === "string" && input[key].trim()) { contract[key] = input[key].trim(); dirty = true; }
       if (input.assumptions != null) { contract.assumptions = [input.assumptions].flat().map(String).map(a => a.trim()).filter(Boolean); dirty = true; }
+      // Working docs (E31): project files the model keeps; the notes store is for later chats, not this work.
+      if (input.docs != null) {
+        const docs = [input.docs].flat().filter(d => d && typeof d === "object").map(d => ({ path: normalizePath(String(d.path ?? "")).replace(/^project\//, ""), keeps: String(d.keeps ?? "").trim() }));
+        const refused = docs.filter(d => !d.path || /^(memories|skills|work)\//.test(d.path));
+        if (refused.length) said.push(`Not kept as docs: ${andList(refused.map(d => d.path || "a doc without a path"))}. Working docs are project files (notes/facts.md), where the harness shows and checks them.`);
+        contract.docs = docs.filter(d => !refused.includes(d) && d.keeps);
+        dirty = true;
+      }
       for (const add of [input.add ?? []].flat()) {
         const title = String(add?.title ?? "").trim();
         const { check, error } = toCheck(add?.check);
@@ -1472,13 +1526,13 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
     const calls = messages.slice(startAt).flatMap(m => m.content ?? []).filter(c => c?.toolUse && c.toolUse.name !== "think").length;
     const usage = messages.findLast(m => m.role === "assistant" && m.usage)?.usage ?? {};
     return {
-      messages, start: startAt, calls, contract, has, idle, asked: asked && contract.questions.some(q => q.answer == null), current: currentItem(contract),
+      messages, start: startAt, calls, contract, has, idle, asked: asked && contract.questions.some(q => q.answer == null), current: currentItem(contract), docsNow: docsText,
       // By tool calls: a long request can still be a small fix or a question. sizing=building also needs the turn to
       // build: no files when it began, or 3 or more new ones since.
       sized: calls >= PLAN_AFTER && (sizing !== "building" || building()),
       used: (usage.inputTokens || 0) + (usage.cacheReadInputTokens || 0) + (usage.cacheWriteInputTokens || 0),
       summaryAt: modelInfo(modelId).context * COMPACT_AT,
-      events: { red: [], done: [], regressed: [], failed: [], same: [] },
+      events: { red: [], done: [], regressed: [], failed: [], same: [], stale: [], docs: null },
       ...extra,
     };
   };
@@ -1509,7 +1563,7 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       const results = (all.at(-1)?.content ?? []).map(resultOf).filter(r => r && typeof r === "object");
       // A tool's version, or the files a bash command changed.
       const changed = new Set(results.flatMap(r => [...(r.version != null && r.path ? [r.path] : []), ...(Array.isArray(r.files) ? r.files.map(f => f?.path).filter(Boolean) : [])]).map(normalizePath));
-      const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal, host, threadId };
+      const env = { ws: workspace, messages: all, fresh: results.map(r => r.report).filter(r => r?.path), signal, host, threadId, modelClient: clientFor };
       const s = stateFor(all, startAt, { ws: workspace, files: Object.keys(workspace?.state?.files ?? {}), shown: workspace?.shownPath?.() ?? null });
       s.events.red = pending.splice(0);
       // A push is what moves CI: a check of it (gh pr checks, gh run) runs again after one, not after an edit.
@@ -1529,6 +1583,20 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       });
       idle = s.events.done.length || learned || !contract.items.some(i => i.status !== "done" && runnable(i)) ? 0 : idle + 1;
       Object.assign(s, { idle, current: currentItem(contract) });
+      // Working docs (E31): an item done while a doc stayed as it was when the item began is said once; a new current
+      // item brings the docs' text into view.
+      if (contract.docs.length) {
+        const heads = workspace?.state?.project?.heads ?? {};
+        for (const item of s.events.done) {
+          const mark = docMarks[item.id], stale = mark ? contract.docs.filter(d => heads[d.path] === mark[d.path]) : [];
+          if (stale.length) s.events.stale.push({ item, docs: stale });
+        }
+        if (s.current && s.current.id !== docsShownFor) {
+          docsShownFor = s.current.id;
+          docMarks[s.current.id] = Object.fromEntries(contract.docs.map(d => [d.path, heads[d.path]]));
+          s.events.docs = docsText();
+        }
+      }
       await save();
       return fire("step", s, { step: n });
     });
@@ -1621,7 +1689,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     const started = thread?.started ?? localDate(thread?.createdAt ?? Date.now(), tz);
     if (thread && !thread.started) await db.put("threads", { ...(await db.get("threads", params.threadId)), started });
     setStore("started", started);
-    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume, started, turnStart });
+    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume, started, turnStart, modelClient: clientFor });
     let summary = thread?.summary ?? null;
     let memories = thread?.memories ?? null;
     if (memories == null && store.tools.some(t => t.toolSpec.name === "editor")) {
@@ -1809,11 +1877,17 @@ const REFUSALS = ["refusal", "guardrail_intervened", "content_filtered"];
 const REFUSAL_TEXT = "The model declined this request.";
 const declined = stopReason => REFUSALS.includes(stopReason);
 
+// The plan tool without its docs field (docs=off, the default until E31 says otherwise).
+const withoutDocs = spec => {
+  const { docs, ...properties } = spec.inputSchema.json.properties;
+  return { ...spec, inputSchema: { json: { ...spec.inputSchema.json, properties } } };
+};
+
 function getConverseCommand(config) {
   const model = modelInfo(config.modelId);
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
   // director=off: no plan tool, as before the director.
-  const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec }));
+  const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec: toolSpec.name === "plan" && flag("docs") !== "on" ? withoutDocs(toolSpec) : toolSpec }));
   // subagents=async: wait comes with task.
   if (flag("subagents") === "async" && tools.some(t => t.toolSpec.name === "task") && !tools.some(t => t.toolSpec.name === "wait")) tools.push({ toolSpec: WAIT_TOOL.toolSpec });
   const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId, started: config.started });
