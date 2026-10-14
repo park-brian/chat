@@ -470,6 +470,32 @@ experiments, each against the noise floor from E5.
   turns a grader change into something tested before it is trusted. Scores judged before E26 are not comparable
   with later ones: E25 and E27 used the old judge in all their arms.
 
+### E27. The goal note only for work that builds (sizing=building)
+
+- **Result:** swe ×3: `calls` leak 6/21, 11.5 calls, 223k tokens, pass 0.96; `building` leak 1/20, 9.9 calls,
+  185k, pass 0.98, goal note in 0 runs. Games (ambitious, arcade ×3): 1.00 in both arms, the goal note firing in
+  1 and 2 runs (they start with no files). Prediction held on both. **`building` is the default** (d3bbbc8).
+- **Also from these transcripts:** with a repository to look at, models used `git diff`, `git show`, `git status`
+  and tried `git stash` (5 times, silently failing: the shell had no stash) to run the tests on the original
+  code, and once `git -C /project`. Both now work. Testing them found that isomorphic-git compares mtimes in whole
+  seconds, so a same-size edit within a second looked clean; the shell now reports the millisecond mtime as the
+  inode.
+
+### E28. The oracle: a strong model plans, Haiku executes (user, 2026-10-13)
+
+- **What the long tier fails on (two recent runs read):** the novella (0.44, 0.56) loses on continuity: facts
+  drift between chapters (Tomas kept the light 34 years, then 41; a wound moves; a man reached only by telephone
+  sits at the table), threads opened early stay open (6-8 of 10 resolved), events repeat. Research (0.73, 0.87)
+  loses on organisation and on links next to figures. Lisp is at the ceiling (0.95, 1.00).
+- **E28a design:** Opus 5.5 (medium effort) writes one plan per task, saved in evals/long/plans (goal, done
+  criteria, fixed facts, order, traps, when to stop); the `+opus-plan` variant starts with it at notes/plan.md
+  and one line in the request pointing to it. Arms: plain ×3 twice (an A/A for the long tier's noise floor,
+  never measured) and planned ×3, all three tasks, Haiku 5.5 medium, current main.
+- **Predictions (before the run):** novella planned beats both plain copies by more than their difference, with
+  fewer chapters that contradict an earlier fact and more threads resolved; research planned gains on the
+  organisation criterion; Lisp unchanged at ≥ 0.95. The plan costs about 5k Opus output tokens per task, under
+  1% of a novella run.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.

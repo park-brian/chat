@@ -80,8 +80,8 @@ const messages = [
   msg("assistant", [{ text: "Done." }], "m"),
 ];
 assert.deepEqual(written(messages), ["index.html"]);
-assert.deepEqual(dialogue(messages), [{ role: "user", text: "make me a habit tracker" }, { role: "assistant", text: "Weekly targets, dark theme, saved in localStorage.\n\nDone." }]);
-assert.deepEqual(dialogue(messages, { writes: true }), [{ role: "user", text: "make me a habit tracker" }, { role: "assistant", text: "Weekly targets, dark theme, saved in localStorage.\n[wrote: index.html]\n\n[wrote: scratch/try.js, index.html]\n\nDone." }]);
+assert.deepEqual(dialogue(messages), [{ role: "user", text: "make me a habit tracker" }, { role: "assistant", text: "Weekly targets, dark theme, saved in localStorage.\n\nDone.", reply: "Done." }]);
+assert.deepEqual(dialogue(messages, { writes: true }), [{ role: "user", text: "make me a habit tracker" }, { role: "assistant", text: "Weekly targets, dark theme, saved in localStorage.\n[wrote: index.html]\n\n[wrote: scratch/try.js, index.html]\n\nDone.", reply: "Done." }]);
 
 // The judge can be shown the final files a task names.
 const jp = judgePrompt({ dialogue: [], calls: [], finalFiles: [["stats.js", "export function summarize() {}"]] }, ["c"]).messages[0].content[0].text;
