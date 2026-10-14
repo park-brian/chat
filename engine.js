@@ -72,7 +72,7 @@ function systemPrompt(persona, { tools = [], memories = null, modelId = null, st
     // subagents=async: the task section says how results come back.
     .map(part => part.startsWith("### task") && flag("subagents") === "async" ? part.trimEnd() + "\n" + TASK_ASYNC : part)
     // docs=on: the plan section says how working docs are kept and checked (E31).
-    .map(part => part.startsWith("### plan") && flag("docs") === "on" ? part.trimEnd() + "\n" + PLAN_DOCS : part);
+    .map(part => part.startsWith("### plan") && docsOn() ? part.trimEnd() + "\n" + PLAN_DOCS : part);
   const artifacts = tools.some(name => WORKSPACE_TOOL_NAMES.includes(name)) && fill(HARNESS_DOCUMENTATION, { changes });
   const delegating = artifacts && tools.includes("task") && DELEGATING;
   const network = relayUrl() && fill(NETWORK, { relay: relayUrl(), tcpipe: CDN.tcpipe });
@@ -1257,6 +1257,19 @@ function relevantNotes(contract, item, most = 5) {
 // Why: "17 passed" with no report saying so was the commonest failure on swe. "Items 1 and 3 pass" counts nothing.
 const COUNT_CLAIM = /(?<!\b(?:(?:items?|steps?|parts?|phases?|checks?)\s?(?:\d+\s*(?:,|and|&|or)\s*)*|version\s?|v\s?|of\s?))\b(\d+)(?:\s*(?:\/|of)\s*\d+)?\s+(?:[a-z-]+\s+)?(?:(?:tests?|checks?|specs?)\s+)?(?:(?:all|now)\s+)?pass(?:ed|ing|es)?\b/i;
 const ALL_CLAIM = /(?<!\bnot\s)\b(?:all|every)\s+(?:of\s+)?(?:the\s+)?(?:\d+\s+)?(?:[a-z-]+\s+)?(?:tests?|checks?)\s+(?:now\s+)?pass|(?<!\bnot\s(?:all\s)?(?:the\s)?)\btests?\s+(?:all\s+|now\s+)*pass(?:es|ed|ing)?\b/i;
+// A stop whose reply says the work asked for isn't done yet, or null. Why: a novella run stopped after 3 of 12
+// chapters, saying "Chapters 4 to 12 are still to write" (E31; E28a had one at 1 of 18).
+const UNFINISHED = /\b(?:(?:is|are) still (?:to (?:write|do|come)|left)|still to (?:write|do|be written|be done)|remain(?:s|ing)? to (?:write|do|be written)|I (?:will|'ll) (?:write|do|finish|continue|add)\b[^.\n]{0,80}\b(?:next|once|later|then|after)\b)/i;
+function unfinishedReply(messages) {
+  const last = messages.at(-1);
+  if (last?.role !== "assistant") return null;
+  const said = (last.content ?? []).filter(c => typeof c?.text === "string").map(c => c.text).join("\n");
+  const m = UNFINISHED.exec(said);
+  if (!m) return null;
+  const sentence = said.slice(Math.max(0, said.lastIndexOf(".", m.index) + 1), said.indexOf(".", m.index + m[0].length) + 1 || undefined).trim();
+  return `Your reply says the work isn't finished ("${clip(sentence, 140)}"). The user asked for all of it: go on until it is done, and stop before then only to ask what only they can answer.`;
+}
+
 function contradictedClaim(messages) {
   const last = messages.at(-1);
   if (last?.role !== "assistant") return null;
@@ -1313,13 +1326,14 @@ const ITEMS_NOTE = "The goal is set and the plan has no items. Add the steps wit
 const DIRECTOR_RULES = [
   { id: "polished", at: "step", every: "turn", note: s => polishedTake(s.messages, s.start) },
   // Past the size threshold with no goal. An agent without the plan tool is told to keep a plan file instead.
-  { id: "goal", at: "step", every: "turn", note: s => s.has("plan") ? s.sized && !s.contract.goal && (flag("docs") === "on" ? GOAL_DOCS_NOTE : GOAL_NOTE)
+  { id: "goal", at: "step", every: "turn", note: s => s.has("plan") ? s.sized && !s.contract.goal && (docsOn() ? GOAL_DOCS_NOTE : GOAL_NOTE)
     : s.has("write_file") && s.ws && unplannedTask(s.messages, s.start, s.files, s.shown) },
   { id: "items", at: "step", every: "turn", note: s => s.contract.goal && !s.contract.items.length && ITEMS_NOTE },
   // Working docs (E31): asked for once when the goal is set without them; shown when a new item starts; a doc an
   // item didn't touch is said once.
-  { id: "nodocs", at: "step", every: "turn", note: s => flag("docs") === "on" && s.sized && s.contract.goal && !s.contract.docs.length && NO_DOCS_NOTE },
+  { id: "nodocs", at: "step", every: "turn", note: s => docsOn() && s.sized && s.contract.goal && !s.contract.docs.length && NO_DOCS_NOTE },
   { id: "docs", at: "step", every: "event", note: s => s.events.docs && `Your working docs as they stand, for item ${s.current.id}; bring them up to date with what it sets:\n${s.events.docs}` },
+  { id: "contradicted", at: "step", every: "event", note: s => s.events.contradicted.map(c => `${c.evidence.replace(/\.?$/, ".")} Fix ${c.path} where it breaks the doc (or the doc, where the doc is what's wrong) before the next part.`) },
   { id: "stale", at: "step", every: "event", note: s => s.events.stale.map(({ item, docs }) => `Item ${item.id}'s check passes, and ${andList(docs.map(d => d.path))} ${docs.length > 1 ? "haven't" : "hasn't"} changed since it began. Add what it set (${clip(docs[0].keeps, 120)}) before the next item.`) },
   { id: "red", at: "step", every: "event", note: s => s.events.red.map(i => `Item ${i.id}'s check already passes before any work, so it can't show the item gets done. Change it with plan({ edit: ${i.id}, check }) to one that fails now and passes once the item is done.`) },
   { id: "regressed", at: "step", every: "event", note: s => s.events.regressed.map(({ item, evidence }) => `Item ${item.id}'s check passed before and fails now (${evidence}), so the item is open again. A change since it passed broke it: fix that before going on.`) },
@@ -1336,6 +1350,7 @@ const DIRECTOR_RULES = [
   { id: "unadopted", at: "stop", every: "turn", note: s => unadoptedVariants(s.messages, s.start) },
   // Only after work: a turn that called no tool is an answer, and its words about tests are about tests in general.
   { id: "claim", at: "stop", every: "turn", note: s => s.calls && contradictedClaim(s.messages) },
+  { id: "unfinished", at: "stop", every: "turn", note: s => s.calls && unfinishedReply(s.messages) },
   { id: "open", at: "stop", every: "turn", note: s => s.calls && openItemsNote(s.contract, s.asked) },
   { id: "summary", at: "summary", every: "event", note: s => [resummaryNote(s.contract), s.contract.docs?.length && `Your working docs:\n${s.docsNow()}`].filter(Boolean).join("\n") },
 ];
@@ -1532,7 +1547,7 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
       sized: calls >= PLAN_AFTER && (sizing !== "building" || building()),
       used: (usage.inputTokens || 0) + (usage.cacheReadInputTokens || 0) + (usage.cacheWriteInputTokens || 0),
       summaryAt: modelInfo(modelId).context * COMPACT_AT,
-      events: { red: [], done: [], regressed: [], failed: [], same: [], stale: [], docs: null },
+      events: { red: [], done: [], regressed: [], failed: [], same: [], stale: [], docs: null, contradicted: [] },
       ...extra,
     };
   };
@@ -1595,6 +1610,14 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
           docsShownFor = s.current.id;
           docMarks[s.current.id] = Object.fromEntries(contract.docs.map(d => [d.path, heads[d.path]]));
           s.events.docs = docsText();
+        }
+        // docs=check (E31b): each part a step wrote is read against each doc by Haiku, as the model didn't add the check.
+        if (flag("docs") === "check") {
+          const docPaths = new Set(contract.docs.map(d => d.path));
+          for (const path of [...changed].filter(p => isProsePart(p) && !docPaths.has(p))) for (const d of contract.docs) {
+            const r = await runCheck({ kind: "consistency", file: path, against: d.path }, env);
+            if (r.result === "fail" && !/missing or empty|doesn't exist/.test(r.evidence)) s.events.contradicted.push({ path, doc: d.path, evidence: r.evidence });
+          }
         }
       }
       await save();
@@ -1878,6 +1901,8 @@ const REFUSAL_TEXT = "The model declined this request.";
 const declined = stopReason => REFUSALS.includes(stopReason);
 
 // The plan tool without its docs field (docs=off, the default until E31 says otherwise).
+// docs=on: working docs in the plan; docs=check: and the harness reads each part against them (E31b).
+const docsOn = () => ["on", "check"].includes(flag("docs"));
 const withoutDocs = spec => {
   const { docs, ...properties } = spec.inputSchema.json.properties;
   return { ...spec, inputSchema: { json: { ...spec.inputSchema.json, properties } } };
@@ -1887,7 +1912,7 @@ function getConverseCommand(config) {
   const model = modelInfo(config.modelId);
   const cachePoint = model.cache ? [{ cachePoint: { type: "default" } }] : [];
   // director=off: no plan tool, as before the director.
-  const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec: toolSpec.name === "plan" && flag("docs") !== "on" ? withoutDocs(toolSpec) : toolSpec }));
+  const tools = config.tools.filter(t => t.toolSpec.name !== "plan" || flag("director") !== "off").map(({ toolSpec }) => ({ toolSpec: toolSpec.name === "plan" && !docsOn() ? withoutDocs(toolSpec) : toolSpec }));
   // subagents=async: wait comes with task.
   if (flag("subagents") === "async" && tools.some(t => t.toolSpec.name === "task") && !tools.some(t => t.toolSpec.name === "wait")) tools.push({ toolSpec: WAIT_TOOL.toolSpec });
   const system = systemPrompt(config.systemPrompt, { tools: tools.map(t => t.toolSpec.name), memories: config.memories, modelId: config.modelId, started: config.started });

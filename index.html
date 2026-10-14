@@ -8007,6 +8007,27 @@ if (window.__HARNESS__?.test) (async () => {
           assert(run.notes.some(n => n.startsWith("Your working docs as they stand, for item 1") && n.includes("Tomas kept the Ness light 34 years.")), `the docs come back when the item starts: ${JSON.stringify(run.notes)}`);
           const plain = getConverseCommand({ modelId: "echo", systemPrompt: "P", tools: [planTool], messages: [{ role: "user", content: [{ text: "hi" }] }] });
           assert(!("docs" in plain.toolConfig.tools[0].toolSpec.inputSchema.json.properties) && !plain.system[0].text.includes("Working docs"), "without the flag, the plan is as before");
+
+          // docs=check (E31b): the harness reads each new part against the docs, without the model asking.
+          const ws2 = await headlessProject({ "notes/facts.md": "Tomas kept the Ness light 34 years." });
+          const write = fakeTool("write", async () => { await ws2.exclusive(() => ws2.commit("chapters/02.md", "He kept it 41 years.", { source: "agent" })); return { version: 1, path: "chapters/02.md" }; });
+          asked.length = 0;
+          localStorage.setItem(FLAGS_KEY, JSON.stringify({ docs: "check" }));
+          try {
+            run = await directedTurn({ script: [{ blocks: mockToolUseBlock("plan", { goal: "A novella", docs: [{ path: "notes/facts.md", keeps: "facts" }] }, "p2"), stopReason: "tool_use" }, ...calls(1, "write"), reply("Chapter 2 written.")], tools: [write, planTool], workspace: ws2, modelClient: checker });
+          } finally {
+            localStorage.removeItem(FLAGS_KEY);
+          }
+          assert(asked.length === 1 && asked[0].text.includes("He kept it 41 years."), `the written part is read against the doc: ${JSON.stringify(asked)}`);
+          assert(run.notes.some(n => n.startsWith("chapters/02.md against notes/facts.md:") && n.includes("Fix chapters/02.md")), `and what breaks it comes back: ${JSON.stringify(run.notes)}`);
+        }
+
+        // Why: a novella run stopped after 3 of 12 chapters, saying the rest were "still to write" (E31)
+        async function testUnfinishedStop() {
+          const run = await directedTurn({ script: [...calls(1), reply("Chapters 1 to 3 are written. Chapters 4 to 12 are still to write."), reply("All twelve are written.")] });
+          assert(run.notes.length === 1 && run.notes[0].startsWith('Your reply says the work isn\'t finished ("Chapters 4 to 12 are still to write.")'), `a reply that says work is left is sent on: ${JSON.stringify(run.notes)}`);
+          const done = await directedTurn({ script: [...calls(1), reply("Fixed in src/a.js; 21 tests pass. Not checked: whether upstream has the same bug.")] });
+          assert(!done.notes.some(n => n.startsWith("Your reply says the work")), `a finished reply that names what it didn't check is not: ${JSON.stringify(done.notes)}`);
         }
 
         // Why: an ablation is a flag set for one eval run (eval.js --flags), not a worktree; each is a no-op at its default
@@ -9224,6 +9245,7 @@ if (window.__HARNESS__?.test) (async () => {
           testSizingBuilding,
           testOracleDone,
           testWorkingDocs,
+          testUnfinishedStop,
           testAsyncSubagents,
           testClaimCheck,
           testReinjectAfterSummary,

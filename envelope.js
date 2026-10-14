@@ -21,7 +21,7 @@ export const RULE_PRIORITY = {
   summary: 100, summarize: 100, "last-turn": 95, date: 90, subagent: 85, docs: 84, review: 83, regressed: 80, stale: 76, budget: 75, same: 70, red: 65,
   failed: 60, done: 55, goal: 50, unplanned: 50, items: 45, stalled: 40, polished: 30,
   // At the stop, in the order the loop read them before priorities.
-  silent: 90, failing: 80, untested: 70, unadopted: 60, claim: 50, open: 40,
+  silent: 90, unfinished: 85, failing: 80, untested: 70, unadopted: 60, claim: 50, open: 40, contradicted: 82,
 };
 
 export const note = (rule, text, priority = RULE_PRIORITY[rule] ?? 50) => ({ rule, text: String(text ?? ""), priority });

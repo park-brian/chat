@@ -574,6 +574,18 @@ experiments, each against the noise floor from E5.
 - **Prediction (before the run):** novella ×3: contradicting chapters at most 2 a run (plain 4.25), checks at
   least 13.5 of 19 (plain 11.5), under 2× the cost. Research ×2 and Lisp ×1: no loss.
 
+- **Result E31 (`docs=on`):** novella 10, 10, 4 of 19; 22 contradicting chapters in 3 runs (plain 4.25 a run).
+  **Refuted.** Two runs declared notes/outline.md and notes/facts.md, were shown them 6-9 times, and were told 6
+  and 2 times that an item ended with facts.md unchanged. The facts doc was good ("Power off about 23:00",
+  "Tomas on his right side… cap on bottom step"), and later chapters still broke those very facts. No run added a
+  consistency check: every item's check was a word count. The third run stopped after 3 of 12 chapters, saying
+  "Chapters 4 to 12 are still to write": four calls (each bash wrote several chapters), so no goal note, no items,
+  no stop rule. Research 12 and 10 of 16, Lisp 20-21 of 21: no harm there.
+- **Learned:** keeping the docs and seeing them doesn't make Haiku hold to them while writing 1,500 words; the
+  check has to happen, and the model won't add it. Next (E31b): `docs=check`, where the harness reads each part
+  a step writes against each doc (Haiku) and returns what breaks; and a stop rule for a reply that says the work
+  asked for isn't done, on for every run.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
