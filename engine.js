@@ -2042,7 +2042,29 @@ const modelClient = modelId => getConverseClient(providerOf(modelId));
 
 // A model that sends nothing this long has stalled: the turn ends with an error, not a spinner that never stops.
 const STALL_MS = 5 * 60_000;
-async function watchedSend(client, input, signal, ms = STALL_MS) {
+// A provider that is busy or briefly down answers again soon: the request goes again before anything of the reply has
+// arrived, after these waits. Why: Gemini's 503s ("high demand") ended 2 of 21 swe runs with an error (E29).
+const RETRY_MS = [2_000, 8_000, 30_000];
+const TRANSIENT = /\b(?:429|500|502|503|504|529)\b|UNAVAILABLE|overloaded|high demand|throttl|too many requests|ServiceUnavailable|InternalServerException|ModelNotReady|ECONNRESET|Failed to fetch|NetworkError/i;
+const pause = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = setTimeout(resolve, ms);
+  signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+});
+async function watchedSend(client, input, signal, ms = STALL_MS, delays = RETRY_MS) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const output = await watchedOnce(client, input, signal, ms);
+      // The first event shows whether the provider took the request; after it, an error is the reply's own.
+      const events = output.stream[Symbol.asyncIterator]();
+      const first = await events.next();
+      return { ...output, stream: (async function* () { if (!first.done) yield first.value; for (let n; !(n = await events.next()).done; ) yield n.value; })() };
+    } catch (e) {
+      if (signal?.aborted || attempt >= delays.length || !TRANSIENT.test(String(e?.message ?? e) + " " + (e?.name ?? ""))) throw e;
+      await pause(delays[attempt], signal);
+    }
+  }
+}
+async function watchedOnce(client, input, signal, ms) {
   const stall = new AbortController();
   const stalled = new Promise((_, reject) => { stall.signal.onabort = () => reject(stall.signal.reason); });
   stalled.catch(() => {});

@@ -7604,6 +7604,19 @@ if (window.__HARNESS__?.test) (async () => {
           assert(quiet.message === "The model sent nothing for 0.1 seconds.", `a quiet stream ends with an error that says so: ${quiet.message}`);
           const silent = await watchedSend({ send: () => new Promise(() => {}) }, {}, null, 100).catch(e => e);
           assert(silent.message?.startsWith("The model sent nothing"), "so does a request that never answers");
+          // Why: Gemini's 503s ended swe runs with an error (E29); a busy provider is asked again, a bad request isn't
+          let tries = 0;
+          const busy = (failures, error) => ({ send: async () => { if (tries++ < failures) throw new Error(error); return { stream: stream(1) }; } });
+          assert((await read(await watchedSend(busy(2, '{"code":503,"status":"UNAVAILABLE"}'), {}, null, 1000, [1, 1, 1]))).length === 2 && tries === 3, `a 503 is retried until it answers: ${tries}`);
+          tries = 0;
+          const failsInStream = { send: async () => ({ stream: (async function* () { if (tries++ < 1) throw new Error("ThrottlingException: Too many tokens"); yield { a: 1 }; })() }) };
+          assert((await read(await watchedSend(failsInStream, {}, null, 1000, [1]))).length === 1 && tries === 2, "so is a throttle before the first event");
+          tries = 0;
+          const invalid = await watchedSend(busy(5, "ValidationException: bad image"), {}, null, 1000, [1, 1, 1]).catch(e => e);
+          assert(invalid.message === "ValidationException: bad image" && tries === 1, `a bad request fails at once: ${tries}`);
+          tries = 0;
+          const gone = await watchedSend(busy(9, "503 UNAVAILABLE"), {}, null, 1000, [1, 1]).catch(e => e);
+          assert(gone.message === "503 UNAVAILABLE" && tries === 3, "and the retries end");
           const user = new AbortController();
           const stopped = watchedSend({ send: (_, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason))) }, {}, user.signal, 1000).catch(e => e);
           user.abort();
