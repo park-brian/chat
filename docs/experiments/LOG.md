@@ -496,6 +496,21 @@ experiments, each against the noise floor from E5.
   organisation criterion; Lisp unchanged at ≥ 0.95. The plan costs about 5k Opus output tokens per task, under
   1% of a novella run.
 
+- **Result E28a (evals/long-report.js):** novella, checks passed of 18: plain-a 1 (a run that saved no chapters),
+  10, 7; plain-b 12, 10, 12; planned 9, 11, 13. Chapters contradicting an earlier one: 26 (a, 3 runs), 15 (b), 13
+  (planned). Threads and ending: no difference. Research: 12-14 of 15 in all arms; planned loses "kept a plan in
+  PLAN.md" by construction (its plan is at notes/plan.md). Lisp: 19-20 of 20 everywhere, planned at about twice
+  the cost. **Refuted:** the planned arm is inside the spread between the two identical plain arms, which is
+  itself large (the long tier's A/A: novella means 6.0 and 11.3 of 18). The contradictions are details invented
+  while writing (where a wound is, who arrived when), which a plan made before writing can't fix.
+- **Also found:** long.js's claim check had its own copy without node's `# pass N` (3 Lisp "fails"); now one
+  checker for every tier (evals/claims.js). The judge's plain-writing grade passed 7 of 9 replies that a blind
+  labeller failed for harness words ("plan checks", "the ledger", "item 3"); a scripted check (style.js
+  harnessTerms) agreed with the labeller on 20 of 21 and is now a check on every run.
+- **Next (E28b):** the oracle at the end instead of the start: when the model stops after writing a long work in
+  parts, the harness has a strong reviewer read the parts against each other (contradictions, open threads,
+  repeats) and hands its findings back for one round of fixes.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
