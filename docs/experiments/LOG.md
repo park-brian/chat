@@ -586,6 +586,18 @@ experiments, each against the noise floor from E5.
   a step writes against each doc (Haiku) and returns what breaks; and a stop rule for a reply that says the work
   asked for isn't done, on for every run.
 
+- **Result E31b (`docs=check`):** 12, 11, 10 of 19 (mean 11); 14 contradicting chapters in 3 runs (4.7 a run);
+  $0.14-0.22. Fresh plain arm, same code: 12, 13 (third still running), 3.5 a run, $0.07-0.10. **Refuted.** The
+  harness's Haiku reader flagged 17-40 contradictions a run, some the same ones the grader later found (chapter 3
+  in run 2), and the final chapters still had them: told what broke the doc, Haiku didn't fix it, or fixed it and
+  broke something else. The stop rule fired once (a run that would have stopped early) and the plain arm lost
+  nothing with it.
+- **Learned (B13, now from six arms):** for Haiku on a 20k-word work, no harness support moves continuity: a
+  plan up front, docs kept and shown, a strong reviewer at the end or after each part, or a cheap reader of each
+  part against the docs. The model can keep the docs; it can't hold to them while writing, nor repair from a list.
+  The primitives stay (working docs, consistency checks, the unfinished-stop rule) because they are what the
+  user asked for and what a stronger writer can use; `docs` stays off by default until a task shows a gain.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
