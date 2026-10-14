@@ -44,7 +44,7 @@ const LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
 // Feature flags, so an ablation needs no code change: the app reads them from localStorage "harness-flags" (engine.js
 // flag()). Each is a no-op at its default; rule.<id>=off silences one rule of engine.js's rule tables.
-export const FLAGS = { director: ["on", "off"], effort: LEVELS, "plan.where": ["inject", "prompt"], noProjectError: ["new", "old"], context: "tokens", subagents: ["blocking", "async"], envelope: ["xml", "plain"], metadata: ["minimal", "rich"] };
+export const FLAGS = { director: ["on", "off"], effort: LEVELS, "plan.where": ["inject", "prompt"], noProjectError: ["new", "old"], context: "tokens", subagents: ["blocking", "async"], envelope: ["xml", "plain"], metadata: ["minimal", "rich"], sizing: ["calls", "building"] };
 // The rule ids, read from engine.js's tables ({ id: "...", at: ... }), so a new rule needs no change here.
 export const ruleIds = (source = readFileSync(path.join(root, "engine.js"), "utf8")) => [...new Set([...source.matchAll(/\{ id: "([\w-]+)", at: "/g)].map(m => m[1]))];
 export function parseFlags(text, rules = null) {

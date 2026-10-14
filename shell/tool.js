@@ -8,6 +8,7 @@ import { isBinaryPath } from "../projects.js";
 import { SHELL_GIT_NOTE, mentionsGit, projectGitChain, runProjectGit } from "./project-git.js";
 
 export const SHELL_ROOT = "/project";
+export const BASELINE_MESSAGE = "The files when the user's message arrived";
 // A folder or GitHub project's files not yet in the journal go to the shell too, within these.
 const ROOT_FILES = 5000, ROOT_BYTES = 50e6;
 const DEFAULT_TIMEOUT = 60, PYTHON_TIMEOUT = 300, MAX_TIMEOUT = 600, CHECK_TIMEOUT = 300;
@@ -46,9 +47,20 @@ export function createShellTool({ workspaceFor, runApp }) {
   // A chat's run on a project, or on a variant's branch of it; a fork has one of its own.
   const keyOf = (context, ws) => [context.threadId ?? "-", ws.branch ?? "", context.shell?.session ?? ""].join(":");
   const session = key => {
-    if (!sessions.has(key)) sessions.set(key, { shellId: null, known: new Map(), cwd: SHELL_ROOT, env: null });
+    if (!sessions.has(key)) sessions.set(key, { shellId: null, known: new Map(), cwd: SHELL_ROOT, env: null, turn: null });
     return sessions.get(key);
   };
+
+  // The text files at a set of heads (a user message's): the tree of the turn's baseline commit.
+  async function textsAt(ws, heads) {
+    const out = {};
+    for (const [path, id] of Object.entries(heads ?? {})) {
+      if (isBinaryPath(path)) continue;
+      const text = await ws.readVersion(id).then(v => v.text, () => null);
+      if (typeof text === "string") out[path] = text;
+    }
+    return out;
+  }
 
   const textFiles = (heads, files) => Object.fromEntries(Object.keys(heads).filter(p => typeof files[p] === "string").map(p => [p, files[p]]));
   function deltaOf(known, heads, files) {
@@ -82,7 +94,11 @@ export function createShellTool({ workspaceFor, runApp }) {
     await ws.exclusive(() => {}); // the files as other workspaces left them
     const journal = { ...ws.state.project.heads };
     let heads = journal, files = ws.state.files;
-    const base = { op: "exec", key, projectId: ws.state.project.id, threadId: context.threadId ?? null, command, cwd: cwd ?? s.cwd, env: s.env, timeoutMs };
+    // On a project of the chat's own, each turn's first command commits the files as the user's message found them,
+    // so git diff and git status show the turn's changes. A folder or GitHub project has a repository of its own.
+    const turn = !ws.root && !ws.branch && commit !== false && !owns ? await context.turnStart : null;
+    const baseline = turn && s.turn !== turn.id ? { message: BASELINE_MESSAGE, files: await textsAt(ws, turn.heads) } : null;
+    const base = { op: "exec", key, projectId: ws.state.project.id, threadId: context.threadId ?? null, command, cwd: cwd ?? s.cwd, env: s.env, timeoutMs, ...(baseline && { baseline }) };
     const send = async full => {
       // A root's files the journal doesn't hold: read once per shell, and known by the shell as "root" after.
       if (ws.root && !ws.branch) {
@@ -102,6 +118,7 @@ export function createShellTool({ workspaceFor, runApp }) {
       throw e;
     }
     s.shellId = reply.shellId ?? null;
+    if (baseline && !reply.killed) s.turn = turn.id;
     // What was sent is what the shell has.
     s.known = new Map(Object.entries(heads));
     if (reply.killed) return { ...reply, saved: [], skipped: [] };

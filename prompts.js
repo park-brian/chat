@@ -320,6 +320,8 @@ Commands: coreutils (ls, cat, grep, rg, sed, awk, find, xargs, sort, uniq, wc, d
 - npm install/test/run/ls/init -y, npx (npx tsc for TypeScript); packages come from the npm registry
 - python3, pip install, pytest: Pyodide (CPython in WebAssembly), loaded on first use (several seconds)
 - git: init, add, commit, status, diff, log, branch, checkout, reset; clone and push only through the local proxy
+  (on a project of this chat's own, HEAD is the files as the user's latest message found them: git diff and git status show
+  this turn's changes, git show HEAD:path the text before them)
   (on a folder or GitHub project, git and gh pr create work on its own repository: push makes a branch there)
   (on a GitHub project, gh pr checks --watch and gh run watch wait for CI, gh run view --log-failed shows what failed;
   CI is the strongest check of a pushed change)

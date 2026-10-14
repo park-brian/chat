@@ -5,32 +5,70 @@ const DIFF = "https://esm.sh/diff@8.0.4";
 const td = new TextDecoder();
 const SKIP = /(^|\/)(node_modules|__pycache__|\.pytest_cache)(\/|$)/;
 
+// isomorphic-git's fs over the shell's.
+function gitFs(vfs) {
+  const wrap = fn => async (...a) => {
+    try { return await fn(...a); } catch (e) {
+      const m = String(e?.message ?? e);
+      e.code ??= /ENOENT|no such file/i.test(m) ? "ENOENT" : /EEXIST|exists/i.test(m) ? "EEXIST" : /ENOTDIR|not a directory/i.test(m) ? "ENOTDIR" : /ENOTEMPTY|not empty/i.test(m) ? "ENOTEMPTY" : /EISDIR|is a directory/i.test(m) ? "EISDIR" : undefined;
+      throw e;
+    }
+  };
+  const stat = s => ({ ...s, isFile: () => s.isFile, isDirectory: () => s.isDirectory, isSymbolicLink: () => s.isSymbolicLink, mode: (s.isDirectory ? 0o040000 : s.isSymbolicLink ? 0o120000 : 0o100000) | ((s.mode ?? 0o644) & 0o777), size: s.size ?? 0, mtimeMs: +s.mtime, ctimeMs: +s.mtime, uid: 1, gid: 1, dev: 1, ino: 1 });
+  return { promises: {
+    readFile: wrap(async (p, o) => ((typeof o === "string" ? o : o?.encoding) ? vfs.readFile(p) : vfs.readFileBuffer(p))),
+    writeFile: wrap((p, d) => vfs.writeFile(p, typeof d === "string" ? d : new Uint8Array(d))),
+    unlink: wrap(p => vfs.rm(p)),
+    readdir: wrap(p => vfs.readdir(p)),
+    mkdir: wrap(async p => { if (await vfs.exists(p)) throw Object.assign(new Error("EEXIST"), { code: "EEXIST" }); return vfs.mkdir(p); }),
+    rmdir: wrap(p => vfs.rm(p, { recursive: true })),
+    stat: wrap(async p => stat(await vfs.stat(p))),
+    lstat: wrap(async p => stat(await vfs.lstat(p))),
+    readlink: wrap(p => vfs.readlink(p)),
+    symlink: wrap((t, p) => vfs.symlink(t, p)),
+    chmod: wrap((p, m) => vfs.chmod(p, m)),
+  } };
+}
+
+// The project as it was when the user's message arrived, committed with that tree and index, so git diff and git
+// status show what changed since. The working files are untouched: the tree is built in a scratch directory. A
+// repository the agent made itself (no marker) is left alone. Returns the commit's oid, or null for none.
+export async function baselineCommit(vfs, root, { files, message }) {
+  const git = (await import(GIT)).default;
+  const fs = gitFs(vfs), gitdir = root + "/.git", marker = gitdir + "/chat-baseline";
+  if (await vfs.exists(gitdir)) { if (!(await vfs.exists(marker))) return null; }
+  else { await git.init({ fs, dir: root, defaultBranch: "main" }); await vfs.writeFile(marker, "made by the chat\n"); }
+  const scratch = "/tmp/.baseline-" + Date.now();
+  try {
+    await vfs.mkdir(scratch, { recursive: true });
+    for (const [rel, text] of Object.entries(files)) {
+      const p = scratch + "/" + rel;
+      await vfs.mkdir(p.slice(0, p.lastIndexOf("/")), { recursive: true });
+      await vfs.writeFile(p, text);
+    }
+    const g = { fs, dir: scratch, gitdir };
+    let changed = false;
+    for (const [filepath, headState, workState, stageState] of await git.statusMatrix(g)) {
+      if (workState === 0) { if (stageState !== 0) await git.remove({ ...g, filepath }); }
+      else await git.add({ ...g, filepath });
+      if (headState !== 1 || workState !== 1 || stageState !== 1) changed = true;
+    }
+    const head = await git.resolveRef({ ...g, ref: "HEAD" }).catch(() => null);
+    if (!changed && head) return null;
+    if (!Object.keys(files).length && !head) return null;
+    const oid = await git.commit({ ...g, message, author: { name: "chat", email: "chat@localhost" } });
+    // The index took its stat cache from the scratch files: reset it against the working copy, so a file whose
+    // size and time match by chance is still read.
+    for (const filepath of Object.keys(files)) await git.resetIndex({ fs, dir: root, gitdir, filepath });
+    return oid;
+  } finally {
+    await vfs.rm(scratch, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 export function gitCommand({ defineCommand, result, fetchVia, ROOT }) {
   let git = null, jsdiff = null;
 
-  function gitFs(vfs) {
-    const wrap = fn => async (...a) => {
-      try { return await fn(...a); } catch (e) {
-        const m = String(e?.message ?? e);
-        e.code ??= /ENOENT|no such file/i.test(m) ? "ENOENT" : /EEXIST|exists/i.test(m) ? "EEXIST" : /ENOTDIR|not a directory/i.test(m) ? "ENOTDIR" : /ENOTEMPTY|not empty/i.test(m) ? "ENOTEMPTY" : /EISDIR|is a directory/i.test(m) ? "EISDIR" : undefined;
-        throw e;
-      }
-    };
-    const stat = s => ({ ...s, isFile: () => s.isFile, isDirectory: () => s.isDirectory, isSymbolicLink: () => s.isSymbolicLink, mode: (s.isDirectory ? 0o040000 : s.isSymbolicLink ? 0o120000 : 0o100000) | ((s.mode ?? 0o644) & 0o777), size: s.size ?? 0, mtimeMs: +s.mtime, ctimeMs: +s.mtime, uid: 1, gid: 1, dev: 1, ino: 1 });
-    return { promises: {
-      readFile: wrap(async (p, o) => ((typeof o === "string" ? o : o?.encoding) ? vfs.readFile(p) : vfs.readFileBuffer(p))),
-      writeFile: wrap((p, d) => vfs.writeFile(p, typeof d === "string" ? d : new Uint8Array(d))),
-      unlink: wrap(p => vfs.rm(p)),
-      readdir: wrap(p => vfs.readdir(p)),
-      mkdir: wrap(async p => { if (await vfs.exists(p)) throw Object.assign(new Error("EEXIST"), { code: "EEXIST" }); return vfs.mkdir(p); }),
-      rmdir: wrap(p => vfs.rm(p, { recursive: true })),
-      stat: wrap(async p => stat(await vfs.stat(p))),
-      lstat: wrap(async p => stat(await vfs.lstat(p))),
-      readlink: wrap(p => vfs.readlink(p)),
-      symlink: wrap((t, p) => vfs.symlink(t, p)),
-      chmod: wrap((p, m) => vfs.chmod(p, m)),
-    } };
-  }
   const http = {
     async request({ url, method = "GET", headers = {}, body }) {
       let bytes;
@@ -224,7 +262,14 @@ export function gitCommand({ defineCommand, result, fetchVia, ROOT }) {
           return result(await patch(pairs.sort((a, b) => (a[0] < b[0] ? -1 : 1)), opts));
         }
         case "show": {
-          const oid = await rev(positional(rest)[0] ?? "HEAD");
+          const spec = positional(rest)[0] ?? "HEAD", colon = spec.indexOf(":");
+          // rev:path is the file's text at that commit (models reach for git show HEAD:file to see the original).
+          if (colon >= 0) {
+            const at = spec.slice(0, colon) || "HEAD", file = spec.slice(colon + 1).replace(/^\.\//, "");
+            const text = await readAt(await rev(at), file);
+            return text == null ? result("", `fatal: path '${file}' does not exist in '${at}'\n`, 128) : result(text);
+          }
+          const oid = await rev(spec);
           const { commit } = await git.readCommit({ ...g, oid });
           const after = await filesAt(oid), before = commit.parent[0] ? await filesAt(commit.parent[0]) : new Map();
           const pairs = [];

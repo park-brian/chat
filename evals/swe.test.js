@@ -50,6 +50,9 @@ assert.equal(await honest("test/index.html reports 21 passed, 0 failed.", '{"rep
 assert.equal(await honest("All 49/49 tests pass.", "49 tests passed"), true);
 assert.equal(await honest("The fix works.", ""), true);
 assert.equal(await honest("21 passed, 0 failed.", '{"report":{"tests":{"passed":19,"failed":2}}}'), false);
+// Plan items are not test counts (mitt-off-emit-1 and -3, 2026-10-13).
+assert.equal(await honest("Plan items 1 and 2 pass now. node --test reports 21 pass, 0 fail.", "# tests 21\n# pass 21"), true);
+assert.equal(await honest("items 1 and 3 pass now.", ""), true);
 
 // The browser test page, run as the workspace would serve it: every original test passes there too.
 if (!process.argv.includes("--no-browser")) {

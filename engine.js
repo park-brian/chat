@@ -1221,8 +1221,8 @@ function relevantNotes(contract, item, most = 5) {
 }
 
 // A test result the final reply claims and nothing in the chat shows, or null.
-// Why: "17 passed" with no report saying so was the commonest failure on swe.
-const COUNT_CLAIM = /(?<!\b(?:item|step|part|phase|version|v|of)\s?)\b(\d+)(?:\s*(?:\/|of)\s*\d+)?\s+(?:[a-z-]+\s+)?(?:(?:tests?|checks?|specs?)\s+)?(?:(?:all|now)\s+)?pass(?:ed|ing|es)?\b/i;
+// Why: "17 passed" with no report saying so was the commonest failure on swe. "Items 1 and 3 pass" counts nothing.
+const COUNT_CLAIM = /(?<!\b(?:(?:items?|steps?|parts?|phases?|checks?)\s?(?:\d+\s*(?:,|and|&|or)\s*)*|version\s?|v\s?|of\s?))\b(\d+)(?:\s*(?:\/|of)\s*\d+)?\s+(?:[a-z-]+\s+)?(?:(?:tests?|checks?|specs?)\s+)?(?:(?:all|now)\s+)?pass(?:ed|ing|es)?\b/i;
 const ALL_CLAIM = /(?<!\bnot\s)\b(?:all|every)\s+(?:of\s+)?(?:the\s+)?(?:\d+\s+)?(?:[a-z-]+\s+)?(?:tests?|checks?)\s+(?:now\s+)?pass|(?<!\bnot\s(?:all\s)?(?:the\s)?)\btests?\s+(?:all\s+|now\s+)*pass(?:es|ed|ing)?\b/i;
 function contradictedClaim(messages) {
   const last = messages.at(-1);
@@ -1337,8 +1337,11 @@ function planInPrompt(tools) {
 
 // One per run (a turn): the thread's contract, the rules, and what they have said. messages: the run's messages as
 // they stand. tools: the names of the tools the run has. started: the day the conversation started.
-async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules(), started = null } = {}) {
+async function createDirector({ db, threadId = null, agentId = null, tools = [], modelId = null, messages = () => [], start = 0, resume = false, rules = activeRules(), started = null, turnStart = null } = {}) {
   const thread = threadId != null ? await db.get("threads", threadId) : null;
+  // The files the user's message found. sizing=building: a turn that edits files that were there is a fix, not long
+  // work, however many calls it takes (E25b: the contract on bug fixes cost 38% more calls and leaked into replies).
+  const sizing = flag("sizing", "calls"), startHeads = sizing === "building" ? (await turnStart)?.heads ?? null : null;
   const contract = { ...emptyContract(), ...structuredClone(thread?.contract ?? {}) };
   const has = name => tools.includes(name);
   const reminded = new Set(), seen = new Set();
@@ -1459,13 +1462,19 @@ async function createDirector({ db, threadId = null, agentId = null, tools = [],
     });
   }
 
+  const building = () => {
+    if (!startHeads || !Object.keys(startHeads).length) return true;
+    const heads = workspace?.state?.project?.heads ?? {};
+    return Object.keys(heads).filter(p => !(p in startHeads) && !isPlanFile(p) && !isScratch(p)).length >= 3;
+  };
   const stateFor = (messages, startAt, extra = {}) => {
     const calls = messages.slice(startAt).flatMap(m => m.content ?? []).filter(c => c?.toolUse && c.toolUse.name !== "think").length;
     const usage = messages.findLast(m => m.role === "assistant" && m.usage)?.usage ?? {};
     return {
       messages, start: startAt, calls, contract, has, idle, asked: asked && contract.questions.some(q => q.answer == null), current: currentItem(contract),
-      // By tool calls only: a long request can still be a small fix or a question.
-      sized: calls >= PLAN_AFTER,
+      // By tool calls: a long request can still be a small fix or a question. sizing=building also needs the turn to
+      // build: no files when it began, or 3 or more new ones since.
+      sized: calls >= PLAN_AFTER && (sizing !== "building" || building()),
       used: (usage.inputTokens || 0) + (usage.cacheReadInputTokens || 0) + (usage.cacheWriteInputTokens || 0),
       summaryAt: modelInfo(modelId).context * COMPACT_AT,
       events: { red: [], done: [], regressed: [], failed: [], same: [] },
@@ -1569,13 +1578,15 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     return id;
   };
   let parentId = lastMessageId;
+  // The user's message this run answers, with the files it found: the shell commits those as the turn's baseline.
+  const turnStart = turnStartOf(db, lastMessageId).catch(() => null);
   let streaming = null;
   const start = store.messages.length;
   let director = null, tz = null, step = 0;
   // The director's notes ride after the results, in the message's metadata (envelope.js): the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
-    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director, tz, ...(background && { background }) };
+    const context = { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, conversation, cutOff, modelClient: clientFor, director, tz, turnStart, ...(background && { background }) };
     const results = await getToolResults(store.messages.at(-1).content, toolMap, context);
     // Sub-agents that finished meanwhile: through the director's channel, so they ride this step's notes, after the
     // results, never inside one.
@@ -1604,7 +1615,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
     const started = thread?.started ?? localDate(thread?.createdAt ?? Date.now(), tz);
     if (thread && !thread.started) await db.put("threads", { ...(await db.get("threads", params.threadId)), started });
     setStore("started", started);
-    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume, started });
+    director = await createDirector({ db, threadId: params.threadId, agentId: params.agentId, tools: Object.keys(toolMap), modelId: store.modelId, messages: () => unwrap(store.messages), start, resume, started, turnStart });
     let summary = thread?.summary ?? null;
     let memories = thread?.memories ?? null;
     if (memories == null && store.tools.some(t => t.toolSpec.name === "editor")) {
@@ -1708,6 +1719,18 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
 }
 
 // The heads of a chat's project as they stand, or null for a chat without one.
+// The nearest message up the branch that the user typed: { id, heads }, or null.
+async function turnStartOf(db, id) {
+  for (let n = 0; id != null && n < 10_000; n++) {
+    const m = await db.get("messages", id);
+    if (!m) return null;
+    const typed = m.role === "user" && (m.content ?? []).some(c => typeof c.text === "string" && !c.harness) && !(m.content ?? []).some(c => c.toolResult);
+    if (typed) return { id, heads: m.heads ?? null };
+    id = m.parentId;
+  }
+  return null;
+}
+
 async function projectHeads(db, threadId) {
   const projectId = threadId && (await db.get("threads", threadId))?.projectId;
   const project = projectId && (await db.get("projects", projectId));

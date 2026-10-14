@@ -7862,10 +7862,10 @@ if (window.__HARNESS__?.test) (async () => {
         // A turn through the loop with a contract on its thread, fake tools, and a scripted model.
         const fakeTool = (name, fn = () => ({ text: "probe ok" })) => ({ toolSpec: { name, description: "d", inputSchema: { json: { type: "object", properties: {} } } }, fn });
         const planTool = TOOLS.find(t => t.toolSpec.name === "plan");
-        async function directedTurn({ script, tools = [fakeTool("probe"), planTool], contract = null, text = "go", workspace = null, history = [] }) {
+        async function directedTurn({ script, tools = [fakeTool("probe"), planTool], contract = null, text = "go", workspace = null, history = [], heads = null }) {
           const threadId = await db.add("threads", { agentId: 1, name: "director", createdAt: Date.now(), ...(contract && { contract }) });
           const messages = [];
-          for (const m of [...history, { role: "user", content: [{ text }] }]) messages.push({ ...m, id: await db.add("messages", { ...m, threadId, agentId: 1 }) });
+          for (const m of [...history, { role: "user", content: [{ text }], ...(heads && { heads }) }]) messages.push({ ...m, id: await db.add("messages", { ...m, threadId, agentId: 1 }) });
           const [store, setStore] = createStore({ modelId: "echo", systemPrompt: "P", tools, messages });
           const sent = [];
           const mock = createMockClient(script);
@@ -7921,6 +7921,20 @@ if (window.__HARNESS__?.test) (async () => {
           // The rules are one table, each with when it is read and how often it speaks.
           assert(DIRECTOR_RULES.every(r => ["step", "stop", "summary"].includes(r.at) && ["turn", "event", "summary"].includes(r.every)), "every rule says when and how often");
           for (const id of ["polished", "goal", "silent", "failing", "untested", "unadopted"]) assert(DIRECTOR_RULES.some(r => r.id === id), `the old ${id} reminder is a rule`);
+        }
+
+        // Why: on bug fixes the contract cost 38% more calls and its words leaked into 13 of 21 replies (E25b)
+        async function testSizingBuilding() {
+          const GOAL = "This is long work, so the harness keeps a contract";
+          const count = (notes, start) => notes.filter(n => n.startsWith(start)).length;
+          localStorage.setItem(FLAGS_KEY, JSON.stringify({ sizing: "building" }));
+          try {
+            assert(count((await directedTurn({ script: [...calls(9), reply("Done.")] })).notes, GOAL) === 1, "no files when the turn began: building, so nine calls bring the goal note");
+            assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], heads: { "src/a.js": 1 } })).notes, GOAL) === 0, "files there and none new: a fix, however many calls");
+          } finally {
+            localStorage.removeItem(FLAGS_KEY);
+          }
+          assert(count((await directedTurn({ script: [...calls(9), reply("Done.")], heads: { "src/a.js": 1 } })).notes, GOAL) === 1, "by default, calls alone decide");
         }
 
         // Why: an ablation is a flag set for one eval run (eval.js --flags), not a worktree; each is a no-op at its default
@@ -8129,7 +8143,7 @@ if (window.__HARNESS__?.test) (async () => {
           assert(says("17 passed.")?.includes("no run report or tool result in this chat shows 17 passing"), "a count nothing shows");
           const node = [{ role: "assistant", content: [{ toolUse: { toolUseId: "c", name: "code", input: {} } }] }, { role: "user", content: [{ toolResult: { toolUseId: "c", content: [{ json: { result: { logs: ["# tests 17", "# pass 17"] } } }] } }] }];
           assert(says("17 passed.", node) === null, "a count a tool printed stands");
-          assert(says("Item 3 passed its check; version 2 passed review.") === null && says("Not all tests pass yet.", ran({ passed: 1, failed: 1 })) === null, "an item or a version is not a test count, and a negation is not a claim");
+          assert(says("Item 3 passed its check; version 2 passed review.") === null && says("Plan items 1 and 3 pass now.") === null && says("Items 1, 2 and 4 passed.") === null && says("Not all tests pass yet.", ran({ passed: 1, failed: 1 })) === null, "an item or a version is not a test count, and a negation is not a claim");
           assert(says("The tests pass.")?.includes("shows a test run"), "a pass with no run at all");
           assert((await directedTurn({ script: [reply("Jest reports that the tests pass when every expect holds.")], tools: [] })).notes.length === 0, "an answer about tests in general is not a claim");
           const run = await directedTurn({ script: [...calls(1), reply("All 5 tests pass."), reply("Corrected: nothing was run.")], tools: [fakeTool("probe")] });
@@ -8764,6 +8778,40 @@ if (window.__HARNESS__?.test) (async () => {
           }
         }
 
+        // Why: models tried git diff and git show HEAD:file to see their own changes and found no repository (E25)
+        async function testShellBaseline() {
+          const p = await shellProject({ "src/a.js": "export const a = 1;\n" });
+          try {
+            const heads = { ...p.ws.state.project.heads };
+            const turn1 = { turnStart: Promise.resolve({ id: 1, heads }) };
+            await shellCommit(p.ws, "src/a.js", "export const a = 2;\n");
+            await shellCommit(p.ws, "b.js", "new\n");
+            const status = await p.run("git status --short", {}, turn1);
+            assert(status.stdout === " M src/a.js\n?? b.js\n", `an edit made before the turn's first command shows as a change: ${JSON.stringify(status)}`);
+            const diff = await p.run("git diff", {}, turn1);
+            assert(diff.stdout.includes("-export const a = 1;") && diff.stdout.includes("+export const a = 2;"), `git diff shows the turn's change: ${diff.stdout}`);
+            const log = await p.run("git log --oneline", {}, turn1);
+            assert(/^[0-9a-f]{7} The files when the user's message arrived\n$/.test(log.stdout), `one baseline commit per turn: ${JSON.stringify(log.stdout)}`);
+            const show = await p.run("git show HEAD:src/a.js", {}, turn1);
+            assert(show.exitCode === 0 && show.stdout === "export const a = 1;\n", `git show HEAD:file gives the turn's starting text: ${JSON.stringify(show)}`);
+            const turn2 = { turnStart: Promise.resolve({ id: 2, heads: { ...p.ws.state.project.heads } }) };
+            assert((await p.run("git status", {}, turn2)).stdout.includes("nothing to commit, working tree clean"), "the next turn starts clean");
+            assert((await p.run("git log --oneline", {}, turn2)).stdout.trim().split("\n").length === 2, "with a second baseline commit");
+            assert(!Object.keys(p.ws.state.files).some(f => f.startsWith(".git/")), ".git stays out of the project's files");
+          } finally {
+            p.done();
+          }
+          const own = await shellProject({ "x.txt": "x\n" });
+          try {
+            await own.run("git init");
+            const heads = { ...own.ws.state.project.heads };
+            const log = await own.run("git log --oneline", {}, { turnStart: Promise.resolve({ id: 1, heads }) });
+            assert(log.exitCode !== 0 && log.stderr.includes("does not have any commits yet"), `a repository the agent made is its own: ${JSON.stringify(log)}`);
+          } finally {
+            own.done();
+          }
+        }
+
         // An infinite loop: the shell's own limit ends it, or the tab terminates the Worker and starts a new shell.
         async function testShellLoops() {
           const p = await shellProject({ "keep.txt": "kept\n" });
@@ -9092,6 +9140,7 @@ if (window.__HARNESS__?.test) (async () => {
           testContractRerun,
           testDirectorRules,
           testFeatureFlags,
+          testSizingBuilding,
           testAsyncSubagents,
           testClaimCheck,
           testReinjectAfterSummary,
@@ -9120,6 +9169,7 @@ if (window.__HARNESS__?.test) (async () => {
           testShellNode,
           testShellSweSeeds,
           testShellGit,
+          testShellBaseline,
           testShellLoops,
           testShellOpen,
           testShellPython,

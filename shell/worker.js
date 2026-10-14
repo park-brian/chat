@@ -5,7 +5,7 @@
 // shell's own store (store.js). node runs in a nested Worker per program, Python in the tab's Pyodide Worker, and
 // curl, wget and git's network go through the tab's fetch, which keeps the app's proxy rules.
 import { archiveCommands } from "./archive.js";
-import { gitCommand } from "./git.js";
+import { baselineCommit, gitCommand } from "./git.js";
 import { npmCommands } from "./npm.js";
 import { openStore } from "./store.js";
 
@@ -467,8 +467,10 @@ async function applyDelta({ write = {}, remove = [] } = {}) {
   } finally { fs.quiet--; }
 }
 
-async function exec({ command, cwd = ROOT, env = null, delta = null, timeoutMs = 60_000 }) {
+async function exec({ command, cwd = ROOT, env = null, delta = null, timeoutMs = 60_000, baseline = null }) {
   await applyDelta(delta ?? {});
+  // A new turn on a project of the chat's own: git's HEAD becomes the files as the user's message found them.
+  if (baseline) await baselineCommit(fs, ROOT, baseline).catch(e => console.warn("baseline commit:", e));
   images = []; opens = [];
   deadline = Date.now() + timeoutMs;
   env = { ...DEFAULT_ENV, ...(env ?? {}) };

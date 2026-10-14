@@ -138,7 +138,7 @@ export function createShellHost({ fetch: fetchVia = fetch, dbName = "chat-shell"
     }
     const timeoutMs = args.timeoutMs ?? 60_000;
     sh.progress = progress;
-    const work = request(sh, "exec", { command: args.command, cwd: args.cwd, env: args.env, delta: args.delta, timeoutMs }).then(value => ({ value }), error => ({ error }));
+    const work = request(sh, "exec", { command: args.command, cwd: args.cwd, env: args.env, delta: args.delta, baseline: args.baseline ?? null, timeoutMs }).then(value => ({ value }), error => ({ error }));
     let timer, onAbort;
     const stopped = new Promise(resolve => {
       timer = setTimeout(() => resolve("timeout"), timeoutMs + GRACE_MS);
