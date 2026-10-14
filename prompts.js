@@ -507,6 +507,17 @@ export const GENERAL_PROMPT = `You are a worker agent. Do the task you are given
 Return what the caller needs to go on: the answer, its evidence (URLs, exact quotes, numbers), and what you could not
 do. Save long material to /work/{folder}/ with the editor and return the paths.`;
 
+// oracle=done (E28b): the request to the reviewer that reads a work in parts, and the note its review comes back in.
+export const PARTS_REVIEW = `These files are one work in parts, in this order: {parts}. Read every part with view_file, in order, and keep a list of the facts each one sets (names, ages, numbers, dates and times, places, who was where, who knows what).
+
+List, with the file and the exact words:
+- each fact in a later part that contradicts an earlier part;
+- each question or thread an early part opens that no later part answers;
+- each event that is told twice as if new.
+Nothing else: no style advice. If there are none of a kind, say so.`;
+export const PARTS_REVIEW_NOTE = `A reviewer read the parts against each other. Fix in the files what it found that is real, check the fix against the part it contradicted, then give the user your answer as before. Its review:
+{review}`;
+
 export const REVIEW_PROMPT = `You are a reviewer: fresh eyes on an artifact someone else built. You did not make it and owe it nothing.
 
 Find what stands between it and done: what breaks, what the request asked for that it lacks, what its audience would

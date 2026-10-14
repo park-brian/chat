@@ -7862,7 +7862,7 @@ if (window.__HARNESS__?.test) (async () => {
         // A turn through the loop with a contract on its thread, fake tools, and a scripted model.
         const fakeTool = (name, fn = () => ({ text: "probe ok" })) => ({ toolSpec: { name, description: "d", inputSchema: { json: { type: "object", properties: {} } } }, fn });
         const planTool = TOOLS.find(t => t.toolSpec.name === "plan");
-        async function directedTurn({ script, tools = [fakeTool("probe"), planTool], contract = null, text = "go", workspace = null, history = [], heads = null }) {
+        async function directedTurn({ script, tools = [fakeTool("probe"), planTool], contract = null, text = "go", workspace = null, history = [], heads = null, modelClient: clientFor = undefined }) {
           const threadId = await db.add("threads", { agentId: 1, name: "director", createdAt: Date.now(), ...(contract && { contract }) });
           const messages = [];
           for (const m of [...history, { role: "user", content: [{ text }], ...(heads && { heads }) }]) messages.push({ ...m, id: await db.add("messages", { ...m, threadId, agentId: 1 }) });
@@ -7870,7 +7870,7 @@ if (window.__HARNESS__?.test) (async () => {
           const sent = [];
           const mock = createMockClient(script);
           const client = { send: (input, o) => (sent.push(input), mock.send(input, o)) };
-          await runAgentWithBranching(store, setStore, client, messages.at(-1).id, { threadId, agentId: 1 }, db, { workspace });
+          await runAgentWithBranching(store, setStore, client, messages.at(-1).id, { threadId, agentId: 1 }, db, { workspace, ...(clientFor && { modelClient: clientFor }) });
           const notes = store.messages.flatMap(noteTexts);
           return { store, notes, sent, thread: await db.get("threads", threadId) };
         }
@@ -7935,6 +7935,23 @@ if (window.__HARNESS__?.test) (async () => {
           } finally {
             localStorage.removeItem(FLAGS_KEY);
           }
+        }
+
+        // Why: a plan made up front didn't stop the novella's chapters contradicting each other (E28a); a reader at the end might
+        async function testOracleDone() {
+          const chapters = { "chapters/01.md": "Tomas kept the light 34 years.", "chapters/02.md": "Isla walked up.", "chapters/03.md": "He kept it 41 years." };
+          const asked = [];
+          const reviewer = async id => ({ send: async input => (asked.push({ id, text: input.messages[0].content[0].text }), createMockClient([{ blocks: mockTextBlock("03.md says 41 years; 01.md says 34.") }]).send(input)) });
+          const turn = async () => directedTurn({ script: [reply("All twelve written."), reply("Fixed chapter 3.")], tools: [fakeTool("probe"), fakeTool("task")], workspace: await headlessProject(chapters), modelClient: reviewer });
+          localStorage.setItem(FLAGS_KEY, JSON.stringify({ oracle: "done" }));
+          let run;
+          try { run = await turn(); } finally { localStorage.removeItem(FLAGS_KEY); }
+          assert(asked.length === 1 && asked[0].id === "global.anthropic.claude-opus-5-5" && asked[0].text.includes("chapters/01.md, chapters/02.md, chapters/03.md"), `Opus reads the three parts, in order: ${JSON.stringify(asked)}`);
+          assert(run.notes.some(n => n.startsWith("A reviewer read the parts against each other.") && n.includes("03.md says 41 years")), `its review comes back as a note: ${JSON.stringify(run.notes)}`);
+          assert(run.store.messages.at(-1).content.some(c => c.text === "Fixed chapter 3."), "and the model goes on to fix it");
+          asked.length = 0;
+          await turn();
+          assert(asked.length === 0, "with the flag off, no reviewer");
         }
 
         // Why: an ablation is a flag set for one eval run (eval.js --flags), not a worktree; each is a no-op at its default
@@ -9150,6 +9167,7 @@ if (window.__HARNESS__?.test) (async () => {
           testDirectorRules,
           testFeatureFlags,
           testSizingBuilding,
+          testOracleDone,
           testAsyncSubagents,
           testClaimCheck,
           testReinjectAfterSummary,

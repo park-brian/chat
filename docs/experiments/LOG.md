@@ -511,6 +511,13 @@ experiments, each against the noise floor from E5.
   parts, the harness has a strong reviewer read the parts against each other (contradictions, open threads,
   repeats) and hands its findings back for one round of fixes.
 
+- **E28b design (flag `oracle=done`, `oracle.model=opus`):** when the model stops and the turn wrote 3+ prose
+  files (.md/.txt, plan and notes aside), the harness runs the review sub-agent on Opus 5.5 with one request: read
+  the parts in order, list contradictions with an earlier part, threads never answered, events told twice. Its
+  review comes back as a note for one round of fixes. Novella ×4 with and without, Haiku 5.5 medium.
+- **Prediction (before the run):** fewer chapters contradicting an earlier one (plain mean about 4-5 per run in
+  E28a) by at least half, and more threads resolved; the review and the fixes cost about 1.5× a plain run.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.

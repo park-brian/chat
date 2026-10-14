@@ -5,7 +5,7 @@
 // #region 1. IMPORTS & DEFINITIONS
 import {
   DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FETCH_DIRECT, FETCH_PROXIED, FORK_BRIEF, FRONTEND_SKILL,
-  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
+  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PARTS_REVIEW, PARTS_REVIEW_NOTE, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
   SUMMARY_PROMPT, TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
 import {
@@ -1583,7 +1583,7 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   const turnStart = turnStartOf(db, lastMessageId).catch(() => null);
   let streaming = null;
   const start = store.messages.length;
-  let director = null, tz = null, step = 0;
+  let director = null, tz = null, step = 0, reviewed = false;
   // The director's notes ride after the results, in the message's metadata (envelope.js): the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
@@ -1684,6 +1684,20 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
           parentId = await push({ role: "user", content: director.flush({ step }), parentId, createdAt: Date.now() });
           continue;
         }
+        // oracle=done (E28b): a long work written in parts this turn is read once by a stronger reviewer, part
+        // against part, before the turn ends; what it finds comes back for one round of fixes.
+        if (!reviewed && toolMap.task && flag("oracle") === "done") {
+          reviewed = true;
+          const ws = typeof workspace === "function" ? await workspace() : workspace;
+          const parts = await writtenParts(ws, (await turnStart)?.heads ?? {});
+          const review = parts && await task({ type: "review", model: { opus: "Opus 5.5", sonnet: "Sonnet 5.5", haiku: "Haiku 5.5" }[flag("oracle.model", "opus")], prompt: fill(PARTS_REVIEW, { parts: parts.join(", ") }) },
+            { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, modelClient: clientFor, tz }).catch(() => null);
+          if (review?.summary) {
+            director.deliver(note("review", fill(PARTS_REVIEW_NOTE, { review: review.summary })));
+            parentId = await push({ role: "user", content: director.flush({ step }), parentId, createdAt: Date.now() });
+            continue;
+          }
+        }
         // Each stop rule speaks once a turn; then the model's word stands.
         const notes = director.stop({ messages: unwrap(store.messages), start, step });
         if (!delivered(notes).length) break;
@@ -1720,6 +1734,14 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
 }
 
 // The heads of a chat's project as they stand, or null for a chat without one.
+// The prose files a turn wrote, when they are a work in parts (3 or more .md or .txt files new or changed since
+// the turn began, plan files and scratch aside), in path order; or null.
+async function writtenParts(ws, startHeads) {
+  const heads = ws?.state?.project?.heads ?? {};
+  const parts = Object.keys(heads).filter(p => /\.(md|txt)$/i.test(p) && heads[p] !== startHeads[p] && !isPlanFile(p) && !isScratch(p) && !/^notes\//.test(p)).sort();
+  return parts.length >= 3 ? parts : null;
+}
+
 // The nearest message up the branch that the user typed: { id, heads }, or null.
 async function turnStartOf(db, id) {
   for (let n = 0; id != null && n < 10_000; n++) {
