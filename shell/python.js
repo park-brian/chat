@@ -246,7 +246,10 @@ async function handle({ id, job, reinstall = [] }) {
       for (const b of backend.shown.toJs()) images.push({ format: "png", bytes: b instanceof Uint8Array ? b : new Uint8Array(b), name: `figure-${images.length + 1}` });
       backend.shown.clear();
     }
-    for (const [kind, p, bytes] of changed) if (kind === "f" && IMAGE.test(p) && bytes.length <= IMAGE_MAX) images.push({ format: p.split(".").pop().toLowerCase().replace("jpg", "jpeg"), bytes, name: p.split("/").pop().replace(/\.\w+$/, "") });
+    // An image a script wrote, if it is one: test fixtures named .jpg are often empty or text (E29: an empty one sent
+    // to Bedrock failed every request after it).
+    const real = bytes => (bytes[0] === 0x89 && bytes[1] === 0x50) || (bytes[0] === 0xff && bytes[1] === 0xd8) || (bytes[0] === 0x47 && bytes[1] === 0x49) || (bytes[0] === 0x52 && bytes[8] === 0x57);
+    for (const [kind, p, bytes] of changed) if (kind === "f" && IMAGE.test(p) && bytes.length > 8 && bytes.length <= IMAGE_MAX && real(bytes)) images.push({ format: p.split(".").pop().toLowerCase().replace("jpg", "jpeg"), bytes, name: p.split("/").pop().replace(/\.\w+$/, "") });
     liveId = null;
     postMessage({ id, code, stdout: out[1], stderr: out[2], changed, images: images.slice(0, 4), installed: [...installed], bootMs, ms: Math.round(performance.now() - t0) });
   } catch (e) {

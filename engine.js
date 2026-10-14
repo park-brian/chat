@@ -1836,6 +1836,7 @@ function prepareMessages(messages, { documents = true, beside = false, cache = f
       if (block?.harness) return { text: block.text };
       if (block?.toolUse && (block.toolUse.input == null || typeof block.toolUse.input !== "object")) return { toolUse: { ...block.toolUse, input: toolInput(block.toolUse.input) ?? {} } };
       if (block?.document && !documents) return unread(block.document.name);
+      if (block?.image && !isImage(block.image)) return { text: `[an empty or invalid ${block.image.format} image, left out]` };
       // Thinking can arrive as a signature alone; the API wants its text back, even empty.
       if (block?.reasoningContent?.reasoningText && block.reasoningContent.reasoningText.text == null)
         return { reasoningContent: { ...block.reasoningContent, reasoningText: { ...block.reasoningContent.reasoningText, text: "" } } };
@@ -1851,6 +1852,8 @@ function prepareMessages(messages, { documents = true, beside = false, cache = f
       // Old images and documents are the bulk of a request; the model can view them again.
       if (i <= oldImages) parts = parts.map(c => (c.image ? { text: "[image omitted]" } : c.document ? { text: `[${c.document.name} omitted]` } : c));
       if (!documents) parts = parts.map(c => (c.document ? unread(c.document.name) : c));
+      // Bedrock rejects the whole request for one image that isn't one, and every later request carries it.
+      if (parts.some(c => c.image && !isImage(c.image))) parts = parts.map(c => (c.image && !isImage(c.image) ? { text: `[an empty or invalid ${c.image.format} image, left out]` } : c));
       if (i <= oldResults) parts = parts.map(c => stubResult(c, calls.get(block.toolResult.toolUseId)));
       return parts === block.toolResult.content ? block : { toolResult: { ...block.toolResult, content: parts } };
     }),
@@ -4521,6 +4524,14 @@ async function workspaceFor(context, { create = false } = {}) {
 // Files a tool hands back as themselves, beside its JSON: an image the model sees, a PDF it reads. Each kind has the
 // largest size Bedrock takes; Claude and Gemini read both inside a tool result, Sol and Luna see images beside it.
 const MEDIA = { png: ["image", 3.75e6], jpeg: ["image", 3.75e6], gif: ["image", 3.75e6], webp: ["image", 3.75e6], pdf: ["document", 4.5e6] };
+// An image block whose bytes start as its format's do. An empty file named .jpg (a model's test photo, E29) is not one.
+const MAGIC = { png: [0x89, 0x50, 0x4e, 0x47], jpeg: [0xff, 0xd8, 0xff], gif: [0x47, 0x49, 0x46, 0x38], webp: [0x52, 0x49, 0x46, 0x46] };
+function isImage({ format, source } = {}) {
+  let bytes = source?.bytes;
+  if (typeof bytes === "string") try { bytes = Uint8Array.from(atob(bytes.slice(0, 24)), ch => ch.charCodeAt(0)); } catch { return false; }
+  const magic = MAGIC[format];
+  return !!bytes?.length && (!magic || magic.every((b, i) => bytes[i] === b));
+}
 const withMedia = (result, ...files) => (files = files.filter(Boolean)).length ? { ...result, __media: files } : result;
 // Bedrock allows a document name letters, digits, single spaces, hyphens, parentheses, and brackets.
 const documentName = name => (name || "document").replace(/[^A-Z0-9 \-()[\]]+/gi, "-").replace(/\s+/g, " ").trim().slice(0, 200) || "document";

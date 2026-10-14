@@ -5482,6 +5482,11 @@ ${marker}
             assert(toolResult.content[0].json.result.type === "application/pdf" && doc?.format === "pdf" && doc.name === "spec v1" && doc.source.bytes.length > 0, `a PDF goes back as a document: ${JSON.stringify(toolResult).slice(0, 200)}`);
             const [sent] = prepareMessages([{ role: "user", content: [{ toolResult }] }], { documents: false });
             assert(sent.content[0].toolResult.content[1].text === "[spec v1 omitted: this model can't read documents]", `a model without documents gets a note in its place: ${JSON.stringify(sent.content[0])}`);
+            // Why: an empty test photo a script wrote went to Bedrock as an image, and every request after it failed (E29)
+            const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+            const shots = { toolResult: { toolUseId: "x", content: [{ json: { result: {} } }, { image: { format: "jpeg", source: { bytes: new Uint8Array(0) } } }, { image: { format: "png", source: { bytes: new TextEncoder().encode("not a png") } } }, { image: { format: "png", source: { bytes: png } } }] } };
+            const [kept] = prepareMessages([{ role: "user", content: [shots] }]);
+            assert(JSON.stringify(kept.content[0].toolResult.content.slice(1).map(c => c.text ?? c.image.format)) === '["[an empty or invalid jpeg image, left out]","[an empty or invalid png image, left out]","png"]', `an image that isn't one becomes a note; a real one stays: ${JSON.stringify(kept.content[0].toolResult.content.slice(1))}`);
             const shotCall = { toolUse: { toolUseId: "s", name: "view_file", input: { path: "screenshots/plain.webp" } } };
             const { content: both } = await getToolResults([shotCall, { toolUse: { ...call.toolUse, toolUseId: "p2" } }], { view_file: input => viewFile(input, context) });
             const [moved] = prepareMessages([{ role: "user", content: [...both, { text: "after" }] }], { beside: true });
@@ -7327,7 +7332,7 @@ if (window.__HARNESS__?.test) (async () => {
           }
           assert(modelInfo("anthropic.claude-old").context === 200_000, "a window smaller than the budget wins");
           assert(DEFAULT_MODEL === "global.anthropic.claude-haiku-5-5", "new chats default to Haiku 5.5");
-          const image = { image: { format: "png", source: { bytes: new Uint8Array([1]) } } };
+          const image = { image: { format: "png", source: { bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]) } } };
           const request = modelId => getConverseCommand({ modelId, reasoningMode: "high", systemPrompt: "P", tools: TOOLS, messages: [{ role: "user", content: [{ text: "hi" }, image] }] });
           const opus = request("global.anthropic.claude-opus-5-5");
           assert(opus.additionalModelRequestFields.thinking.type === "adaptive" && opus.additionalModelRequestFields.output_config.effort === "high", "Claude 5 uses adaptive thinking at high effort");
@@ -7366,7 +7371,7 @@ if (window.__HARNESS__?.test) (async () => {
           const messages = [{ id: 1, role: "user", content: [{ text: "build it" }] }];
           for (let i = 0; i < 22; i++) {
             messages.push({ id: 100 + i, role: "assistant", content: [{ toolUse: { toolUseId: "t" + i, name: "view_file", input: { path: "a.html" } } }] });
-            messages.push({ id: 200 + i, role: "user", content: [{ toolResult: { toolUseId: "t" + i, content: [{ json: { result: { text: big } } }, { image: { format: "png", source: { bytes: new Uint8Array(1) } } }] } }] });
+            messages.push({ id: 200 + i, role: "user", content: [{ toolResult: { toolUseId: "t" + i, content: [{ json: { result: { text: big } } }, { image: { format: "png", source: { bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]) } } }] } }] });
           }
           const out = prepareMessages(messages);
           const results = out.filter(m => m.content[0]?.toolResult).map(m => m.content[0].toolResult.content);
