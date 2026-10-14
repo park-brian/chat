@@ -515,6 +515,12 @@ List, with the file and the exact words:
 - each question or thread an early part opens that no later part answers;
 - each event that is told twice as if new.
 Nothing else: no style advice. If there are none of a kind, say so.`;
+// oracle=each (E28c): one new or changed part against the parts before it.
+export const PART_REVIEW = `These files are one work in parts. New or changed: {fresh}. Before them: {earlier}. Read the parts before with view_file, keeping a list of the facts they set (names, ages, numbers, dates and times, places, who was where, who knows what), then read the new ones.
+
+List, with the file and the exact words, each fact in the new parts that contradicts a part before them, and each event they tell again as if new. Nothing else: no style advice, no plans for later parts. If there are none, say "None."`;
+export const PART_REVIEW_NOTE = `A reviewer read {fresh} against the parts before it. Fix in the files what it found that is real before writing more. Its review:
+{review}`;
 export const PARTS_REVIEW_NOTE = `A reviewer read the parts against each other. Fix in the files what it found that is real, check the fix against the part it contradicted, then give the user your answer as before. Its review:
 {review}`;
 

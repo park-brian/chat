@@ -118,6 +118,30 @@ skeleton could matter, so they are in the run.
 - Phase A runs first. Phase B before reading any judged score as a result. Phase D's baselines don't wait for
   Phase B (long is graded mostly by scripts). Commit after each phase with its log entry.
 
+## Status (2026-10-14)
+
+- **Phase A, done.**
+  - E25a: grader fixes, plus one claim checker for every tier (evals/claims.js).
+  - E25b: the goal note is the source of the leak.
+  - E25c: prefix measured.
+- **Phase B, done.** Re-grading saved runs (evals/regrade.js) showed the judge moving on 1 run in 5. Most of that
+  was its inputs:
+  - tool outputs were cut before node's counts;
+  - mid-work text was graded as the reply.
+
+  After those fixes, 20-21 of 21 repeats agree, and a majority of three votes grades. Blind labels showed PLAIN
+  doesn't catch harness words. A scripted check (harnessTerms) does, matching the labels on 20 of 21; it is a
+  check on every run.
+- **Phase C, done (E27).** `sizing=building` is the default. On swe the leak fell from 8/21 to 0/20 and calls by
+  14%; games were unchanged.
+- **From the user, done:** git in the shell, with a baseline commit per turn, stash and -C. Node was already
+  there.
+- **Phase D:**
+  - E28a (a plan up front) is refuted. The long tier's A/A spread is large: novella 6.0 against 11.3 of 18.
+  - E28b (a reviewer at the end) is running.
+- **Next:** E30 (prefix), Phase F (the harness runs a project's tests on open), Phase E (facts sheet, if E28b
+  points to state).
+
 ## Review (2026-10-13)
 
 An independent review of the first draft read all 21 transcripts and the code. It found: the leak's cause is the

@@ -5,7 +5,7 @@
 // #region 1. IMPORTS & DEFINITIONS
 import {
   DEFAULT_PROMPT, DELEGATING, ENVIRONMENT, EXPLORE_PROMPT, FETCH_DIRECT, FETCH_PROXIED, FORK_BRIEF, FRONTEND_SKILL,
-  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PARTS_REVIEW, PARTS_REVIEW_NOTE, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
+  GENERAL_PROMPT, HARNESS_DOCUMENTATION, NETWORK, PART_BRIEF, PART_REVIEW, PART_REVIEW_NOTE, PARTS_REVIEW, PARTS_REVIEW_NOTE, PLAN_PROMPT, REVIEW_PROMPT, SHELL_ABSENT, SHELL_PRESENT,
   SUMMARY_PROMPT, TASK_ASYNC, TOOL_DOCUMENTATION, VARIANT_BRIEF, WORKING,
 } from "./prompts.js";
 import {
@@ -1583,7 +1583,11 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
   const turnStart = turnStartOf(db, lastMessageId).catch(() => null);
   let streaming = null;
   const start = store.messages.length;
-  let director = null, tz = null, step = 0, reviewed = false;
+  let director = null, tz = null, step = 0, reviewed = false, reviews = 0, partHeads = { ...((await turnStart)?.heads ?? {}) };
+  // The oracle's review (E28): the review sub-agent on a stronger model, given one request; its review text, or null.
+  const reviewParts = (ws, prompt) => task({ type: "review", model: { opus: "Opus 5.5", sonnet: "Sonnet 5.5", haiku: "Haiku 5.5" }[flag("oracle.model", "opus")], prompt },
+    { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, modelClient: clientFor, tz })
+    .then(r => r?.summary || null, () => null);
   // The director's notes ride after the results, in the message's metadata (envelope.js): the tail of the next request.
   const runTools = async (callsId, conversation, cutOff) => {
     const ws = typeof workspace === "function" ? await workspace() : workspace;
@@ -1690,10 +1694,9 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
           reviewed = true;
           const ws = typeof workspace === "function" ? await workspace() : workspace;
           const parts = await writtenParts(ws, (await turnStart)?.heads ?? {});
-          const review = parts && await task({ type: "review", model: { opus: "Opus 5.5", sonnet: "Sonnet 5.5", haiku: "Haiku 5.5" }[flag("oracle.model", "opus")], prompt: fill(PARTS_REVIEW, { parts: parts.join(", ") }) },
-            { db, threadId: params.threadId, agentId: params.agentId, modelId: store.modelId, reasoningMode: store.reasoningMode, workspace: ws, host, signal, modelClient: clientFor, tz }).catch(() => null);
-          if (review?.summary) {
-            director.deliver(note("review", fill(PARTS_REVIEW_NOTE, { review: review.summary })));
+          const review = parts && await reviewParts(ws, fill(PARTS_REVIEW, { parts: parts.join(", ") }));
+          if (review) {
+            director.deliver(note("review", fill(PARTS_REVIEW_NOTE, { review })));
             parentId = await push({ role: "user", content: director.flush({ step }), parentId, createdAt: Date.now() });
             continue;
           }
@@ -1707,6 +1710,22 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
 
       // A fork continues this exact request, so it reads the cache the request just wrote.
       parentId = await runTools(savedId, { request, turn: unwrap(store.messages.at(-1).content) }, stopReason === "max_tokens");
+
+      // oracle=each (E28c): each prose part a step writes, in a work of two or more, is read against the parts before
+      // it while drift is small; the review rides the next step's notes.
+      if (toolMap.task && flag("oracle") === "each" && reviews < MAX_PART_REVIEWS) {
+        const ws = typeof workspace === "function" ? await workspace() : workspace;
+        const heads = ws?.state?.project?.heads ?? {};
+        const prose = Object.keys(heads).filter(isProsePart).sort();
+        const fresh = prose.filter(p => partHeads[p] !== heads[p]);
+        partHeads = { ...heads };
+        if (fresh.length && prose.length >= 2) {
+          reviews++;
+          const earlier = prose.filter(p => !fresh.includes(p) && p < fresh.at(-1));
+          const review = await reviewParts(ws, fill(PART_REVIEW, { fresh: fresh.join(", "), earlier: earlier.join(", ") || "none" }));
+          if (review) director.deliver(note("review", fill(PART_REVIEW_NOTE, { fresh: fresh.join(", "), review })));
+        }
+      }
     }
   } catch (error) {
     // Keep what streamed so far, minus unfinished tool calls, and say why the turn ended.
@@ -1736,9 +1755,11 @@ async function runAgentWithBranching(store, setStore, client, lastMessageId, par
 // The heads of a chat's project as they stand, or null for a chat without one.
 // The prose files a turn wrote, when they are a work in parts (3 or more .md or .txt files new or changed since
 // the turn began, plan files and scratch aside), in path order; or null.
+const isProsePart = p => /\.(md|txt)$/i.test(p) && !isPlanFile(p) && !isScratch(p) && !/^notes\//.test(p);
+const MAX_PART_REVIEWS = 16;
 async function writtenParts(ws, startHeads) {
   const heads = ws?.state?.project?.heads ?? {};
-  const parts = Object.keys(heads).filter(p => /\.(md|txt)$/i.test(p) && heads[p] !== startHeads[p] && !isPlanFile(p) && !isScratch(p) && !/^notes\//.test(p)).sort();
+  const parts = Object.keys(heads).filter(p => isProsePart(p) && heads[p] !== startHeads[p]).sort();
   return parts.length >= 3 ? parts : null;
 }
 

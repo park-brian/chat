@@ -7957,6 +7957,16 @@ if (window.__HARNESS__?.test) (async () => {
           asked.length = 0;
           await turn();
           assert(asked.length === 0, "with the flag off, no reviewer");
+
+          // oracle=each (E28c): each new part against the ones before it, as it is written.
+          const ws = await headlessProject({});
+          let n = 0;
+          const write = fakeTool("write", async () => { n++; await ws.exclusive(() => ws.commit(`chapters/0${n}.md`, `Chapter ${n}.`, { source: "agent" })); return { ok: true }; });
+          localStorage.setItem(FLAGS_KEY, JSON.stringify({ oracle: "each" }));
+          try { run = await directedTurn({ script: [...calls(1, "write"), ...calls(1, "write"), reply("Two chapters.")], tools: [write, fakeTool("task")], workspace: ws, modelClient: reviewer }); }
+          finally { localStorage.removeItem(FLAGS_KEY); }
+          assert(asked.length === 1 && asked[0].text.includes("New or changed: chapters/02.md. Before them: chapters/01.md."), `one review, of the second part against the first: ${JSON.stringify(asked)}`);
+          assert(run.notes.some(n => n.startsWith("A reviewer read chapters/02.md against the parts before it.")), `and it comes back as a note: ${JSON.stringify(run.notes)}`);
         }
 
         // Why: an ablation is a flag set for one eval run (eval.js --flags), not a worktree; each is a no-op at its default

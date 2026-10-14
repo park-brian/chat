@@ -518,6 +518,16 @@ experiments, each against the noise floor from E5.
 - **Prediction (before the run):** fewer chapters contradicting an earlier one (plain mean about 4-5 per run in
   E28a) by at least half, and more threads resolved; the review and the fixes cost about 1.5× a plain run.
 
+- **Result E28b:** novella of 19 checks (the harness-terms check is new): plain 13, 11, 8, 14 (mean 11.5);
+  oracle=done 12, 13, 14, 10 (12.25). Chapters contradicting an earlier one: 17 against 13 (-24%). Cost 1.6×
+  (466k-1037k against 374k-494k). **Prediction (halve the contradictions) refuted;** the gain is inside the
+  noise. The reviews were good (Opus quoted each contradiction with file and line, up to 10k characters), but in
+  one run it fired at the first stop, after 6 of 12 chapters, and never again; and faced with a long list Haiku
+  fixed "the most serious ones" and left the rest.
+- **Next (E28c, `oracle=each`):** review each new part against the earlier ones as it is written, when drift is
+  small and the list short. Same reviewer (Opus) to isolate timing. Prediction: contradictions at most half of
+  plain's, at under 2.5× its cost.
+
 ## Ideas, as testable hypotheses
 
 What a good harness for cheap models might do, each with how to test it.
